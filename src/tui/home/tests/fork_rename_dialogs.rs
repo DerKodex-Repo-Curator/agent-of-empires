@@ -1129,7 +1129,15 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
         }
     }
 
-    for claimant in ["none", "foreign", "redirected", "queued"] {
+    for claimant in [
+        "none",
+        "foreign",
+        "redirected",
+        "queued",
+        "shutdown-unchanged",
+        "shutdown-redirected",
+        "shutdown-adopted",
+    ] {
         let mut env = setup_creation_test_env();
         let entered = env._temp.path().join("native-entered");
         let release = env._temp.path().join("native-release");
@@ -1190,13 +1198,25 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
                     .unwrap();
                 Some(id)
             }
-            "redirected" => {
+            "redirected" | "shutdown-redirected" => {
                 env.storage
                     .update(|rows, _| {
                         rows.iter_mut()
                             .find(|row| row.id == stub_id)
                             .unwrap()
                             .project_path = target.to_str().unwrap().into();
+                        Ok(())
+                    })
+                    .unwrap();
+                Some(stub_id.clone())
+            }
+            "shutdown-adopted" => {
+                env.storage
+                    .update(|rows, _| {
+                        rows.iter_mut()
+                            .find(|row| row.id == stub_id)
+                            .unwrap()
+                            .status = Status::Running;
                         Ok(())
                     })
                     .unwrap();
@@ -1219,6 +1239,32 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
                 })
                 .unwrap();
             owner_id = Some(stub_id.clone());
+        }
+        if claimant.starts_with("shutdown-") {
+            env.view.cleanup_pending_creation();
+            env.view.save().unwrap();
+            let rows = env.storage.load().unwrap();
+            if claimant == "shutdown-unchanged" {
+                assert!(rows.iter().all(|row| row.id != stub_id));
+                assert!(!target.exists());
+            } else {
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == stub_id)
+                    .expect("peer claimant must survive shutdown");
+                if claimant == "shutdown-adopted" {
+                    assert_eq!(row.status, Status::Running);
+                    assert_eq!(row.project_path, env.project_dir.to_string_lossy());
+                    assert_eq!(
+                        env.view.get_instance(&stub_id).unwrap().status,
+                        Status::Running
+                    );
+                } else {
+                    assert_eq!(std::path::Path::new(&row.project_path), target);
+                    assert_eq!(std::fs::read(target.join("README.md")).unwrap(), b"test\n");
+                }
+            }
+            continue;
         }
         let created = drain_creation_result(&mut env.view);
         env.view.save().unwrap();

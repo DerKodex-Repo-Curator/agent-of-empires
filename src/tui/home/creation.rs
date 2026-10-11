@@ -712,23 +712,13 @@ impl HomeView {
         }
     }
 
-    /// Clean up a pending creation on shutdown, waiting briefly for the background thread
-    /// so worktrees and instances can be cleaned up. If it does not finish in time the hook
-    /// subprocess completes on its own and orphaned Creating stubs are cleaned up on the
-    /// next launch.
+    /// Cancel pending creation and drain rollback results until the shutdown deadline.
     pub fn cleanup_pending_creation(&mut self) {
         if !self.creation_poller.is_pending() {
             return;
         }
-        if let Some(cancel) = self.creation_cancel.take() {
-            cancel.cancel();
-        }
-        if let Some(stub_id) = self.creating_stub_id.take() {
-            self.remove_instance(&stub_id);
-            self.creating_hook_progress.remove(&stub_id);
-        }
+        self.cancel_creation();
 
-        // Every request is cancelled now, so each one rolls back unless it finished first.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while self.creation_poller.is_pending() {
             let Some(outcome) = self

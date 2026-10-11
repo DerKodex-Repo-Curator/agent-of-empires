@@ -1667,16 +1667,17 @@ impl HomeView {
                         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(
                             &effective_title,
                         );
+                        let path = std::path::Path::new(&current_instance.project_path);
+                        let destination =
+                            crate::session::worktree_edit::target_worktree_path(path, &leaf)
+                                .filter(|target| target != path);
                         crate::session::worktree_edit::ensure_worktree_unshared(
                             &ownership,
                             &current_profile,
                             &id,
                             std::path::Path::new(&current_instance.project_path),
                             info,
-                            crate::session::worktree_edit::worktree_move_required(
-                                std::path::Path::new(&current_instance.project_path),
-                                &leaf,
-                            ),
+                            destination.as_deref(),
                             crate::session::worktree_edit::worktree_branch_rename_required(
                                 info,
                                 &leaf,

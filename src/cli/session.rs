@@ -1770,7 +1770,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 &id,
                 std::path::Path::new(&inst.project_path),
                 info,
-                false,
+                None,
                 true,
             )?;
         }

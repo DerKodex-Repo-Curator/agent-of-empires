@@ -18,6 +18,43 @@ use serde::{Deserialize, Serialize};
 const CONTEXT: &str = "AOE_NATIVE_GIT_CONTEXT";
 const PRIVATE_PREFIX: &str = "AOE_NATIVE_GIT_";
 
+const LIVE_HOOKS: [&str; 4] = [
+    "post-index-change",
+    "reference-transaction",
+    "post-checkout",
+    "pre-auto-gc",
+];
+
+fn hooked_command(name: Option<&OsStr>) -> bool {
+    name.is_some_and(|name| {
+        matches!(
+            name.to_str(),
+            Some(
+                "checkout"
+                    | "worktree"
+                    | "fetch"
+                    | "reset"
+                    | "clone"
+                    | "maintenance"
+                    | "gc"
+                    | "commit"
+                    | "merge"
+                    | "rebase"
+                    | "am"
+                    | "cherry-pick"
+                    | "revert"
+                    | "read-tree"
+                    | "update-index"
+                    | "update-ref"
+                    | "pack-refs"
+                    | "repack"
+                    | "push"
+                    | "receive-pack"
+                    | "stash"
+            )
+        )
+    })
+}
 pub(crate) trait HookLease {
     fn runtime_dir(&self) -> &Path;
     fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()>;
@@ -50,11 +87,10 @@ struct HookCommand {
 struct Descriptor {
     scope: Scope,
     hooks: PathBuf,
-    original_hooks: Vec<u8>,
+    original_hooks: Option<Vec<u8>>,
     commands: Vec<HookCommand>,
     shell: PathBuf,
     parameters_present: bool,
-    oid_width: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -318,6 +354,171 @@ fn effective_cwd(prefix: &[OsString]) -> io::Result<PathBuf> {
     Ok(cwd)
 }
 
+fn clone_options(args: &[OsString]) -> io::Result<(Vec<&OsStr>, Option<&OsStr>)> {
+    let mut values = Vec::new();
+    let mut template = None;
+    let mut cursor = 0;
+    while let Some(arg) = args.get(cursor) {
+        let bytes = arg.as_bytes();
+        if bytes == b"--" {
+            break;
+        }
+        cursor += 1;
+        if let Some(long) = bytes.strip_prefix(b"--") {
+            let (name, inline) = split_once_byte(long, b'=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if name == b"no-config" {
+                values.clear();
+                continue;
+            }
+            if name == b"no-template" {
+                template = None;
+                continue;
+            }
+            let name = if !name.is_empty() && b"config".starts_with(name) {
+                b"config".as_slice()
+            } else if !name.is_empty() && b"template".starts_with(name) {
+                b"template".as_slice()
+            } else {
+                name
+            };
+            let takes_value = matches!(
+                name,
+                b"config"
+                    | b"jobs"
+                    | b"template"
+                    | b"reference"
+                    | b"reference-if-able"
+                    | b"origin"
+                    | b"branch"
+                    | b"revision"
+                    | b"upload-pack"
+                    | b"depth"
+                    | b"shallow-since"
+                    | b"shallow-exclude"
+                    | b"separate-git-dir"
+                    | b"ref-format"
+                    | b"server-option"
+                    | b"filter"
+                    | b"bundle-uri"
+            );
+            if takes_value {
+                let value = match inline {
+                    Some(value) => OsStr::from_bytes(value),
+                    None => {
+                        let value = args
+                            .get(cursor)
+                            .ok_or_else(|| invalid("Git clone option requires a value"))?;
+                        cursor += 1;
+                        value.as_os_str()
+                    }
+                };
+                if name == b"config" {
+                    values.push(value);
+                } else if name == b"template" {
+                    template = Some(value);
+                }
+            }
+        } else if let Some(short) = bytes.strip_prefix(b"-") {
+            for (index, flag) in short.iter().enumerate() {
+                if b"cjobu".contains(flag) {
+                    let value = if index + 1 < short.len() {
+                        OsStr::from_bytes(&short[index + 1..])
+                    } else {
+                        let value = args
+                            .get(cursor)
+                            .ok_or_else(|| invalid("Git clone option requires a value"))?;
+                        cursor += 1;
+                        value.as_os_str()
+                    };
+                    if *flag == b'c' {
+                        values.push(value);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok((values, template))
+}
+
+fn clone_config(
+    descriptor: &Descriptor,
+    prefix: &[OsString],
+    args: &[OsString],
+    node: &Path,
+) -> io::Result<Vec<u8>> {
+    let (values, template) = clone_options(args)?;
+    let bootstrap = node.join("clone-config");
+    let template = match template
+        .map(OsStr::to_owned)
+        .or_else(|| std::env::var_os("GIT_TEMPLATE_DIR"))
+    {
+        Some(template) => Some(template),
+        None => {
+            let mut command = original_command(descriptor, prefix)?;
+            let output = command
+                .arg("--git-dir")
+                .arg(&bootstrap)
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .args(["config", "--path", "--get", "init.templateDir"])
+                .output()?;
+            if output.status.success() {
+                Some(OsString::from_vec(trim_line(output.stdout)))
+            } else if output.status.code() == Some(1) {
+                None
+            } else {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+            }
+        }
+    };
+    let template_config = if let Some(template) = template.filter(|path| !path.is_empty()) {
+        match fs::read(effective_cwd(prefix)?.join(template).join("config")) {
+            Ok(config) => Some(config),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if !values.is_empty() || template_config.is_some() {
+        fs::create_dir(&bootstrap)?;
+        fs::create_dir(bootstrap.join("objects"))?;
+        fs::create_dir(bootstrap.join("refs"))?;
+        fs::write(bootstrap.join("HEAD"), b"ref: refs/heads/clone-bootstrap\n")?;
+        if let Some(config) = template_config {
+            fs::write(bootstrap.join("config"), config)?;
+        }
+        for value in values {
+            let (key, value) =
+                split_once_byte(value.as_bytes(), b'=').unwrap_or((value.as_bytes(), b"true"));
+            let mut command = original_command(descriptor, prefix)?;
+            command
+                .arg("--git-dir")
+                .arg(&bootstrap)
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .args([
+                    OsStr::new("config"),
+                    OsStr::new("--local"),
+                    OsStr::new("--add"),
+                    OsStr::from_bytes(key),
+                    OsStr::from_bytes(value),
+                ]);
+            checked_output(&mut command)?;
+        }
+    }
+    let mut command = original_command(descriptor, prefix)?;
+    command
+        .arg("--git-dir")
+        .arg(&bootstrap)
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["config", "--null", "--list"]);
+    checked_output(&mut command)
+}
+
 fn descriptor_for(
     mut descriptor: Descriptor,
     args: &[OsString],
@@ -329,7 +530,18 @@ fn descriptor_for(
         env_delta(&mut pristine, &descriptor)?
     };
     descriptor.parameters_present = parameters.is_some();
-    let config = probe(&descriptor, prefix, &["config", "--null", "--list"])?;
+    let node = descriptor.scope.root.join(format!(
+        "node-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir(&node)?;
+    let is_clone = args.get(prefix_len).is_some_and(|arg| arg == "clone");
+    let config = if is_clone {
+        clone_config(&descriptor, prefix, &args[prefix_len + 1..], &node)?
+    } else {
+        probe(&descriptor, prefix, &["config", "--null", "--list"])?
+    };
     let mut commands: BTreeMap<Vec<u8>, (Option<Vec<u8>>, bool)> = BTreeMap::new();
     for item in config
         .split(|byte| *byte == 0)
@@ -347,28 +559,27 @@ fn descriptor_for(
             }
         }
     }
-    let node = descriptor.scope.root.join(format!(
-        "node-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir(&node)?;
+
     descriptor.hooks = node.join("hooks");
     fs::create_dir(&descriptor.hooks)?;
-    let mut hooks = trim_line(probe(
-        &descriptor,
-        prefix,
-        &["rev-parse", "--git-path", "hooks"],
-    )?);
-    let is_worktree_add = args.get(prefix_len).is_some_and(|arg| arg == "worktree")
-        && args.get(prefix_len + 1).is_some_and(|arg| arg == "add");
-    if is_worktree_add && !Path::new(OsStr::from_bytes(&hooks)).is_absolute() {
-        hooks = effective_cwd(prefix)?
-            .join(OsStr::from_bytes(&hooks))
-            .into_os_string()
-            .into_vec();
-    }
-    descriptor.original_hooks = hooks;
+    descriptor.original_hooks = if is_clone {
+        None
+    } else {
+        let mut hooks = trim_line(probe(
+            &descriptor,
+            prefix,
+            &["rev-parse", "--git-path", "hooks"],
+        )?);
+        let worktree_add = args.get(prefix_len).is_some_and(|arg| arg == "worktree")
+            && args.get(prefix_len + 1).is_some_and(|arg| arg == "add");
+        if worktree_add && !Path::new(OsStr::from_bytes(&hooks)).is_absolute() {
+            hooks = effective_cwd(prefix)?
+                .join(OsStr::from_bytes(&hooks))
+                .into_os_string()
+                .into_vec();
+        }
+        Some(hooks)
+    };
     descriptor.commands.clear();
     let helper = helper_program(&descriptor.scope.root, descriptor.scope.fd)?;
     for (index, (name, (command, post_checkout))) in commands.into_iter().enumerate() {
@@ -387,38 +598,34 @@ fn descriptor_for(
             program,
         });
     }
-    let original_hooks = effective_cwd(prefix)?.join(OsStr::from_bytes(&descriptor.original_hooks));
-    match fs::read_dir(&original_hooks) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                if entry.file_type()?.is_dir() {
-                    continue;
-                }
-                let target = descriptor.hooks.join(name);
-                if executable(&entry.path())? {
-                    symlink(&helper, target)?;
-                } else {
-                    fs::write(&target, [])?;
-                    fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
+    if let Some(original_hooks) = &descriptor.original_hooks {
+        let original_hooks = effective_cwd(prefix)?.join(OsStr::from_bytes(original_hooks));
+        match fs::read_dir(&original_hooks) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if entry.file_type()?.is_dir()
+                        || name.to_str().is_some_and(|name| LIVE_HOOKS.contains(&name))
+                    {
+                        continue;
+                    }
+                    let target = descriptor.hooks.join(name);
+                    if executable(&entry.path())? {
+                        symlink(&helper, target)?;
+                    } else {
+                        fs::write(&target, [])?;
+                        fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
+                    }
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
     }
-    descriptor.oid_width = match trim_line(probe(
-        &descriptor,
-        prefix,
-        &["rev-parse", "--show-object-format"],
-    )?)
-    .as_slice()
-    {
-        b"sha1" => 40,
-        b"sha256" => 64,
-        _ => return Err(invalid("unsupported Git object format")),
-    };
+    for event in LIVE_HOOKS {
+        symlink(&helper, descriptor.hooks.join(event))?;
+    }
     descriptor.shell = match probe(&descriptor, prefix, &["var", "GIT_SHELL_PATH"]) {
         Ok(value) => PathBuf::from(OsString::from_vec(trim_line(value))),
         Err(_) => {
@@ -506,11 +713,10 @@ fn initialize(
             owner_group: unsafe { libc::getpgrp() },
         },
         hooks: PathBuf::new(),
-        original_hooks: Vec::new(),
+        original_hooks: None,
         commands: Vec::new(),
         shell: PathBuf::new(),
         parameters_present: std::env::var_os("GIT_CONFIG_PARAMETERS").is_some(),
-        oid_width: 0,
     };
     let path = root.path().join("scope.json");
     fs::write(&path, serde_json::to_vec(&descriptor).map_err(invalid)?)?;
@@ -539,12 +745,7 @@ fn run_inner(
     let (mut control, child_control) = UnixStream::pair()?;
     let (_root, descriptor, routing_path) = initialize(cwd, lease, child_control.as_raw_fd())?;
     let prefix_len = global_prefix(args)?;
-    let eligible = args.get(prefix_len).is_some_and(|arg| {
-        matches!(
-            arg.to_str(),
-            Some("checkout" | "worktree" | "fetch" | "reset")
-        )
-    });
+    let eligible = hooked_command(args.get(prefix_len).map(OsString::as_os_str));
     let mut command = if eligible {
         let (descriptor, prefix, path) = descriptor_for_in(cwd, descriptor, args)?;
         configured_git(&descriptor, args, prefix, &path)?
@@ -763,11 +964,12 @@ fn load_descriptor() -> io::Result<Descriptor> {
     serde_json::from_slice(&fs::read(path)?).map_err(invalid)
 }
 
-fn is_post_checkout(args: &[OsString], width: usize) -> bool {
+fn is_post_checkout(args: &[OsString]) -> bool {
     args.len() == 3
-        && [40, 64].contains(&width)
+        && [40, 64].contains(&args[0].as_bytes().len())
         && args[..2].iter().all(|arg| {
-            arg.as_bytes().len() == width && arg.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            arg.as_bytes().len() == args[0].as_bytes().len()
+                && arg.as_bytes().iter().all(u8::is_ascii_hexdigit)
         })
         && (args[2] == "0" || args[2] == "1")
 }
@@ -814,6 +1016,32 @@ fn hook_command(
     Ok(command)
 }
 
+fn warn_ignored_hook(descriptor: &Descriptor, original: &OsStr) -> io::Result<()> {
+    let enabled = |command: &mut Command| -> io::Result<bool> {
+        let output = command
+            .args(["config", "--type=bool", "--get", "advice.ignoredHook"])
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(invalid(String::from_utf8_lossy(&output.stderr)));
+        }
+        Ok(!output.status.success() || trim_line(output.stdout) != b"false")
+    };
+    if std::env::var_os("GIT_ADVICE").is_some() {
+        let mut command = original_command(descriptor, &[])?;
+        command.arg("--config-env=advice.ignoredHook=GIT_ADVICE");
+        if !enabled(&mut command)? {
+            return Ok(());
+        }
+    }
+    if !enabled(&mut original_command(descriptor, &[])?)? {
+        return Ok(());
+    }
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(b"hint: The '")?;
+    stderr.write_all(original.as_bytes())?;
+    stderr.write_all(b"' hook was ignored because it's not set as executable.\nhint: You can disable this warning with `git config advice.ignoredHook false`.\n")
+}
+
 fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
     let program = Path::new(&argv[0])
         .file_name()
@@ -825,14 +1053,30 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
         .find(|hook| OsStr::new(&hook.program) == program);
     let (original, post_checkout) = match configured {
         Some(hook) => (OsString::from_vec(hook.command.clone()), hook.post_checkout),
-        None => (
-            Path::new(OsStr::from_bytes(&descriptor.original_hooks))
-                .join(program)
-                .into_os_string(),
-            program == "post-checkout",
-        ),
+        None => {
+            let hooks = match &descriptor.original_hooks {
+                Some(hooks) => hooks.clone(),
+                None => trim_line(probe(
+                    descriptor,
+                    &[],
+                    &["rev-parse", "--git-path", "hooks"],
+                )?),
+            };
+            (
+                Path::new(OsStr::from_bytes(&hooks))
+                    .join(program)
+                    .into_os_string(),
+                program == "post-checkout",
+            )
+        }
     };
-    let checkout_ready = post_checkout && is_post_checkout(args, descriptor.oid_width);
+    if configured.is_none() && !executable(Path::new(&original))? {
+        if Path::new(&original).exists() {
+            warn_ignored_hook(descriptor, &original)?;
+        }
+        return Ok(0);
+    }
+    let checkout_ready = post_checkout && is_post_checkout(args);
     // SAFETY: this descriptor was deliberately inherited from the supervising Git process.
     let mut control = unsafe { UnixStream::from_raw_fd(descriptor.scope.fd) };
     inheritable(control.as_raw_fd(), false)?;
@@ -877,40 +1121,20 @@ fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
         io::stdout().write_all(b"\n")?;
         return Ok(0);
     }
-    let eligible = name.is_some_and(|name| {
-        matches!(
-            name.to_str(),
-            Some("checkout" | "worktree" | "fetch" | "reset")
-        )
-    });
-    let routing = name.is_some_and(|name| name == "submodule" || name == "submodule--helper");
-    if eligible || routing {
-        inheritable(descriptor.scope.fd, false)?;
-    }
+    let eligible = hooked_command(name);
+    let fd = descriptor.scope.fd;
+    inheritable(fd, false)?;
     let mut command = if eligible {
         let (descriptor, prefix, path) = descriptor_for(descriptor, args)?;
         configured_git(&descriptor, args, prefix, &path)?
-    } else if routing {
+    } else {
         let path = std::env::var_os(CONTEXT)
             .ok_or_else(|| invalid("native Git routing context is missing"))?;
         routing_git(&descriptor, args, Path::new(&path))?
-    } else {
-        original_command(&descriptor, args)?
     };
-    if eligible || routing {
-        inheritable(descriptor_fd(&command)?, true)?;
-    }
-    Err(command.exec())
-}
+    inheritable(fd, true)?;
 
-fn descriptor_fd(command: &Command) -> io::Result<RawFd> {
-    let path = command
-        .get_envs()
-        .find(|(key, _)| *key == CONTEXT)
-        .and_then(|(_, value)| value)
-        .ok_or_else(|| invalid("native routing command has no context"))?;
-    let descriptor: Descriptor = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
-    Ok(descriptor.scope.fd)
+    Err(command.exec())
 }
 
 /// Handle native Git helpers before initializing a binary's CLI or runtime.
@@ -1034,7 +1258,7 @@ mod tests {
                     })
                     .unwrap();
             } else {
-                if action == "commit" {
+                if matches!(action.as_str(), "commit" | "detached-commit") {
                     fs::write(cwd.join("tracked"), "callback").unwrap();
                     for args in [["add", "tracked"], ["commit", "-mcallback"]] {
                         assert!(Command::new("git").args(args).status().unwrap().success());
@@ -1115,6 +1339,8 @@ mod tests {
             ("post-checkout", "owner"),
             ("post-checkout", "adopt"),
             ("post-checkout", "commit"),
+            ("post-checkout", "detached-commit"),
+            ("post-checkout", "detached-rename"),
             ("post-checkout", "dirty"),
             ("post-checkout", "preexisting"),
             ("post-index-change", "rename"),
@@ -1132,7 +1358,22 @@ mod tests {
             let owner = crate::session::Storage::new_unwatched(&owner_name).unwrap();
             let peer = crate::session::Storage::new_unwatched(&peer_name).unwrap();
             let target = fixture.path().join(&case);
-            let branch = format!("topic-{case}");
+            let detached = action.starts_with("detached-");
+            let branch = if detached {
+                let repository = git2::Repository::open(&repo).unwrap();
+                let name = format!("origin/topic-{case}");
+                repository
+                    .reference(
+                        &format!("refs/remotes/{name}"),
+                        repository.head().unwrap().target().unwrap(),
+                        false,
+                        "fixture",
+                    )
+                    .unwrap();
+                name
+            } else {
+                format!("topic-{case}")
+            };
             let hook = repo.join(".git/hooks").join(hook_name);
             if action == "switch" {
                 let repository = git2::Repository::open(&repo).unwrap();
@@ -1148,7 +1389,10 @@ mod tests {
                 git.create_worktree(&branch, &target, true, Some("main"))
                     .unwrap();
             }
-            let profile = if matches!(action, "owner" | "commit" | "dirty") {
+            let profile = if matches!(
+                action,
+                "owner" | "commit" | "dirty" | "detached-commit" | "detached-rename"
+            ) {
                 &owner_name
             } else {
                 &peer_name
@@ -1172,7 +1416,7 @@ mod tests {
                 Some(&owner),
                 &git,
                 (&repo, &target, &branch),
-                action != "switch",
+                action != "switch" && !detached,
                 Some("main"),
                 None,
             );
@@ -1204,6 +1448,19 @@ mod tests {
                         .unwrap();
                     let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
                     assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
+                } else if action == "detached-commit" {
+                    let repository = git2::Repository::open(&target).unwrap();
+                    assert!(repository.head_detached().unwrap());
+                    let commit = repository.head().unwrap().peel_to_commit().unwrap();
+                    let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
+                    assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
+                } else if action == "detached-rename" {
+                    assert!(!target.exists());
+                    assert!(git
+                        .list_worktrees()
+                        .unwrap()
+                        .iter()
+                        .all(|worktree| worktree.path != target));
                 } else if action == "dirty" {
                     assert_eq!(fs::read(target.join("untracked")).unwrap(), b"callback");
                 } else if action == "preexisting" {
@@ -1226,6 +1483,71 @@ mod tests {
             }
         }
         fs::remove_file(previous_hook.unwrap()).unwrap();
+        for (case, active) in [
+            ("installed", true),
+            ("enabled", true),
+            ("removed", false),
+            ("disabled", false),
+        ] {
+            let owner =
+                crate::session::Storage::new_unwatched(&format!("owner-dynamic-{case}")).unwrap();
+            let peer_name = format!("peer-dynamic-{case}");
+            crate::session::Storage::new_unwatched(&peer_name).unwrap();
+            let checkout_hook = repo.join(".git/hooks/post-checkout");
+            let index_hook = repo.join(".git/hooks/post-index-change");
+            let quote = crate::session::environment::shell_escape;
+            let payload = format!("#!/bin/sh\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={peer_name} AOE_TEST_NATIVE_ACTION=rename\nexec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n", quote(&exe.to_string_lossy()));
+            if case != "installed" {
+                fs::write(&checkout_hook, &payload).unwrap();
+                fs::set_permissions(
+                    &checkout_hook,
+                    fs::Permissions::from_mode(if case == "enabled" { 0o600 } else { 0o700 }),
+                )
+                .unwrap();
+            }
+            let effect = match case {
+                "installed" => format!(
+                    "printf '%s' {} > {}; chmod 700 {}",
+                    crate::session::environment::shell_escape_script_word(&payload),
+                    quote(&checkout_hook.to_string_lossy()),
+                    quote(&checkout_hook.to_string_lossy())
+                ),
+                "enabled" => format!("chmod 700 {}", quote(&checkout_hook.to_string_lossy())),
+                "removed" => format!("rm -f {}", quote(&checkout_hook.to_string_lossy())),
+                _ => format!("chmod 600 {}", quote(&checkout_hook.to_string_lossy())),
+            };
+            fs::write(&index_hook, format!("#!/bin/sh\n{effect}\n")).unwrap();
+            fs::set_permissions(&index_hook, fs::Permissions::from_mode(0o700)).unwrap();
+            let target = fixture.path().join(format!("dynamic-{case}"));
+            let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+            let (warnings, _) = crate::session::native_hooks::create_worktree(
+                &mut ownership,
+                Some(&owner),
+                &git,
+                (&repo, &target, &format!("dynamic-{case}")),
+                true,
+                Some("main"),
+                None,
+            )
+            .unwrap();
+            drop(ownership);
+            assert_eq!(
+                crate::session::Storage::open_unwatched(&peer_name).is_ok(),
+                !active,
+                "{case}: {warnings:?}; payload={:?}",
+                fs::read_to_string(&checkout_hook)
+            );
+            assert_eq!(
+                crate::session::Storage::open_unwatched(&format!("{peer_name}-renamed")).is_ok(),
+                active,
+                "{case}: {warnings:?}"
+            );
+            assert_eq!(fs::read(target.join("tracked")).unwrap(), b"base\n");
+            fs::remove_file(index_hook).unwrap();
+            if checkout_hook.exists() {
+                fs::remove_file(checkout_hook).unwrap();
+            }
+        }
         {
             let repository = git2::Repository::open(&repo).unwrap();
             let tip = repository.head().unwrap().target().unwrap();
@@ -1377,6 +1699,61 @@ mod tests {
             .success());
         let owner = crate::session::Storage::new_unwatched("owner-submodule").unwrap();
         crate::session::Storage::new_unwatched("peer-submodule").unwrap();
+        crate::session::Storage::new_unwatched("peer-submodule-clone").unwrap();
+        let reference_hook = hooks.join("reference-transaction");
+        let clone_entered = fixture.path().join("submodule-clone-entered");
+        let quote = crate::session::environment::shell_escape;
+        fs::write(&reference_hook, format!("#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\ncase \"$GIT_DIR\" in */modules/module) [ ! -f {marker} ] || exit 0; : > {marker}\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE=peer-submodule-clone AOE_TEST_NATIVE_ACTION=rename\nexec {exe} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture;; esac\n", marker=quote(&clone_entered.to_string_lossy()),exe=quote(&exe.to_string_lossy()))).unwrap();
+        fs::set_permissions(&reference_hook, fs::Permissions::from_mode(0o700)).unwrap();
+        let configured_marker = fixture.path().join("configured-hook-supported");
+        assert!(Command::new("git")
+            .args([
+                OsStr::new("-c"),
+                OsStr::new("hook.probe.event=reference-transaction"),
+                OsStr::new("-c"),
+                OsStr::new(&format!(
+                    "hook.probe.command=printf yes > {}",
+                    quote(&configured_marker.to_string_lossy())
+                )),
+                OsStr::new("update-ref"),
+                OsStr::new("refs/aoe-hook-probe"),
+                OsStr::new("HEAD"),
+            ])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        let configured = configured_marker.exists();
+        let template = fixture.path().join("configured-template");
+        fs::create_dir(&template).unwrap();
+        let configured_entered = fixture.path().join("submodule-configured-entered");
+        if configured {
+            crate::session::Storage::new_unwatched("peer-submodule-configured").unwrap();
+            let command = format!("case \"$GIT_DIR:$1\" in */modules/module:prepared) [ ! -f {marker} ] || exit 0; : > {marker}; export AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE=peer-submodule-configured AOE_TEST_NATIVE_ACTION=rename; exec {exe} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture;; *) exit 0;; esac", marker=quote(&configured_entered.to_string_lossy()),exe=quote(&exe.to_string_lossy()));
+            let command = format!(
+                "sh -c {} --",
+                crate::session::environment::shell_escape_script_word(&command)
+            );
+            for (key, value) in [
+                ("hook.clone-fixture.event", "reference-transaction"),
+                ("hook.clone-fixture.command", command.as_str()),
+            ] {
+                assert!(Command::new("git")
+                    .args([
+                        OsStr::new("config"),
+                        OsStr::new("--file"),
+                        template.join("config").as_os_str(),
+                        OsStr::new(key),
+                        OsStr::new(value)
+                    ])
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        }
+        let _template_env = configured.then(|| {
+            crate::session::test_support::EnvGuard::set(&[("GIT_TEMPLATE_DIR", &template)])
+        });
         let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
         let target = fixture.path().join("submodule-checkout");
         let git = crate::git::GitWorktree::new(repo.clone()).unwrap();
@@ -1395,5 +1772,14 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(target.join("module/tracked")).unwrap(), b"base\n");
         assert!(crate::session::Storage::open_unwatched("peer-submodule-renamed").is_ok());
+        assert!(clone_entered.exists());
+        assert!(crate::session::Storage::open_unwatched("peer-submodule-clone-renamed").is_ok());
+        if configured {
+            assert!(configured_entered.exists());
+            assert!(
+                crate::session::Storage::open_unwatched("peer-submodule-configured-renamed")
+                    .is_ok()
+            );
+        }
     }
 }

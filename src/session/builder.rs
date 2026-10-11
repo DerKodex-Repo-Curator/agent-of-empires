@@ -271,6 +271,17 @@ impl CheckoutWitness {
         Ok(())
     }
 
+    fn detached_tip_changed(&self) -> bool {
+        self.branch.as_deref() == Some("HEAD")
+            && !git2::Repository::open(&self.checkout.path)
+                .and_then(|repo| {
+                    repo.head()?
+                        .peel_to_commit()
+                        .map(|commit| commit.id() == self.original_tip)
+                })
+                .unwrap_or(false)
+    }
+
     pub(crate) fn branch_unchanged(&self, main_repo: &Path, branch: &str) -> bool {
         git2::Repository::open(main_repo)
             .and_then(|repo| {
@@ -1340,6 +1351,9 @@ pub(crate) fn cleanup_created_worktree(
     if created.witness.verify().is_err() {
         return;
     }
+    if created.witness.detached_tip_changed() {
+        return;
+    }
     if protection.references_path(&created.path) {
         tracing::debug!(
             target: "session.create",
@@ -1419,11 +1433,12 @@ pub fn cleanup_unpublished_instance(
                 .into_iter()
                 .chain(created_workspace_worktrees.iter())
                 .any(|created| {
-                    created.owned_branch.as_deref().is_some_and(|branch| {
-                        !created
-                            .witness
-                            .branch_unchanged(&created.main_repo_path, branch)
-                    })
+                    created.witness.detached_tip_changed()
+                        || created.owned_branch.as_deref().is_some_and(|branch| {
+                            !created
+                                .witness
+                                .branch_unchanged(&created.main_repo_path, branch)
+                        })
                 })
         {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
@@ -2285,6 +2300,7 @@ mod tests {
 
     #[test]
     fn create_workspace_honors_per_repo_base_branch() {
+        let _home = crate::session::test_support::isolate_app_dir();
         let (parent_primary, _) = init_repo_with_branch("primary", "release");
         let (parent_extra, extra_release_tip) = init_repo_with_branch("extra", "release");
         let primary = parent_primary.path().join("primary");
@@ -2353,6 +2369,7 @@ mod tests {
 
     #[test]
     fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let _home = crate::session::test_support::isolate_app_dir();
         let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
         let primary = parent_primary.path().join("primary");
         let workspaces_root = tempfile::TempDir::new().unwrap();

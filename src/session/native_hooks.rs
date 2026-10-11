@@ -536,7 +536,9 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
             let repo = git2::Repository::open(&self.main_repo)?;
             let local = repo.find_branch(&self.branch, git2::BranchType::Local).ok();
             let detached = local.is_none() && repo.revparse_single(&self.branch).is_ok();
-            let tip = if owned_branch {
+            let tip = if detached {
+                Some(repo.revparse_single(&self.branch)?.peel_to_commit()?.id())
+            } else if owned_branch {
                 Some(
                     local
                         .context("native checkout branch is missing")?
