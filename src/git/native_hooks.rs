@@ -1042,8 +1042,8 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
                 );
                 if action == "adopt" {
                     assert_eq!(
-                        peer.load().unwrap()[0].project_path,
-                        target.to_str().unwrap()
+                        fs::canonicalize(&peer.load().unwrap()[0].project_path).unwrap(),
+                        fs::canonicalize(&target).unwrap()
                     );
                     assert!(target.join("tracked").exists());
                 } else if action == "commit" {
@@ -1103,8 +1103,8 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
             "a peer adoption between completed workers must cancel publication"
         );
         assert_eq!(
-            adopter.load().unwrap()[0].project_path,
-            target.to_str().unwrap()
+            fs::canonicalize(&adopter.load().unwrap()[0].project_path).unwrap(),
+            fs::canonicalize(&target).unwrap()
         );
         assert_eq!(fs::read(target.join("tracked")).unwrap(), b"base\n");
 
