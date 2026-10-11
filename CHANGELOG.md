@@ -4,15 +4,6 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## [Unreleased]
-
-### Bug Fixes
-
-- **worktree:** Serialize cross-profile ownership transitions through Git effects and durable publication. Preserve referenced worktrees and branches during purge, trash/restore, orphan cleanup, attachment, creation, reconciliation and rename, including external profile aliases and unreadable inventories. Release abandoned lifecycle reservations only for their original owner, keep creation prompts and sandbox pulls outside ownership leases, and publish retained startup failures as errors without deleting their resources (#4107).
-- **session:** Keep peer deletions authoritative after synchronous TUI creation and preserve compatible launch runtime during API publication.
-- **worktree:** Allow native index, reference, submodule clone/checkout and automatic maintenance hooks to reenter AoE. Respect hooks installed or changed during creation, revalidate ownership before resuming and preserve callback-owned resources and detached commits during rollback. Retire only unchanged TUI placeholders during cancellation and shutdown, and protect reserved restore destinations during rename.
-- **tests:** Keep native-hook regressions portable across temporary-directory aliases and isolate native Git controls in live-daemon fixtures.
-
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 
 
