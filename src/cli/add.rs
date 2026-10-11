@@ -235,6 +235,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
+    let mut native_created = Vec::new();
 
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
@@ -350,7 +351,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 args.create_branch,
                 &config.worktree.workspace_path_template,
                 init_submodules,
-                &mut ownership,
+                (&mut ownership, Some(&storage)),
             )?;
 
             for repo in &ws_result.workspace_info.repos {
@@ -362,6 +363,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
             path = ws_result.workspace_path;
             workspace_info_opt = Some(ws_result.workspace_info);
+            native_created = ws_result.created_worktrees;
 
             for w in &ws_result.warnings {
                 eprintln!("⚠ {}", w);
@@ -448,12 +450,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     None
                 };
-                let warnings = git_wt.create_worktree(
-                    branch,
-                    &worktree_path,
+                let (warnings, checkout) = crate::session::native_hooks::create_worktree(
+                    &mut ownership,
+                    Some(&storage),
+                    &git_wt,
+                    (&main_repo_path, &worktree_path, branch),
                     args.create_branch,
                     base.as_deref(),
                 )?;
+                native_created.push(builder::CreatedWorktree {
+                    path: worktree_path.clone(),
+                    main_repo_path: main_repo_path.clone(),
+                    owned_branch: args.create_branch.then(|| branch.to_string()),
+                    witness: checkout,
+                });
 
                 path = worktree_path;
 
@@ -490,7 +500,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let mut partial = Instance::new(&final_title, &path.to_string_lossy());
         partial.worktree_info = worktree_info_opt.clone();
         partial.workspace_info = workspace_info_opt.clone();
-        let witness = builder::CreationWitness::capture(&partial)?;
+        let mut witness = builder::CreationWitness::capture(&partial)?;
+        for created in &native_created {
+            witness.retain_created(created)?;
+        }
         drop(ownership.take());
         cleanup_partial_session(
             &path,
@@ -755,7 +768,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    let witness = builder::CreationWitness::capture(&instance)?;
+    let mut witness = builder::CreationWitness::capture(&instance)?;
+    for created in &native_created {
+        witness.retain_created(created)?;
+    }
     drop(ownership.take());
     let hook_result: Result<()> = (|| {
         let resolved_hooks: Option<repo_config::ResolvedHooks> = if args.scratch {

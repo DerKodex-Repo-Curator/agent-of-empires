@@ -41,8 +41,15 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
     })
 }
 
+fn main() -> Result<()> {
+    if let Some(result) = agent_of_empires::git::native_hooks::try_proxy_entry() {
+        std::process::exit(result?);
+    }
+    run_cli()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run_cli() -> Result<()> {
     // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
     {
         let mut a = std::env::args();

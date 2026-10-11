@@ -75,10 +75,16 @@ Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-
 
 An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.
 
+## Hooks that call AoE
+
+Native `post-checkout` hooks, including submodule checkout hooks, may call AoE commands. AoE releases its ownership and attach lifecycle leases around these callbacks, then revalidates the original profile and checkout identities and durable session claims before resuming. A callback that moves or removes the owner, replaces a checkout, or adopts a newly created resource cancels the outer operation without reversing the callback. Failed-creation cleanup retains claimed or dirty checkouts and branches with new commits.
+
 ## Warnings during create
 
 Two kinds of non-fatal failure surface through the same channel instead of aborting the session: a `⚠` line on stderr for `aoe add`, a **Worktree warnings** dialog in the TUI, and a toast plus `warnings: string[]` on the `POST /api/sessions` response for the web.
 
 **Post-checkout hooks.** Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge) that fire when `git worktree add` checks out the branch. If one fails, the worktree and its `.git` pointer already exist and are usable. Usually the hook needs network access or credentials the new worktree does not have yet: re-run it by hand once the environment is set up, or set `core.hooksPath` per checkout.
+
+Failures during submodule checkout remain fatal to creation; they are not converted into the top-level worktree warning.
 
 **Fetch failures.** aoe runs `git fetch <remote> <branch>` before checking out, and network errors, missing remotes, SSH key problems, and 10s timeouts surface as `git fetch <remote> <branch> failed for <repo>: <stderr>`. The session is still created, branching off whatever local ref exists, which may be stale. A multi-repo session emits one warning per failing repo.

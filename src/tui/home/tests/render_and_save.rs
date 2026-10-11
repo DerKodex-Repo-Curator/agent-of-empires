@@ -303,6 +303,33 @@ fn test_create_session_in_all_mode_is_findable() {
         view.get_instance(&session_id).unwrap().source_profile,
         "alpha"
     );
+    storage
+        .update(|rows, _| {
+            rows.retain(|row| row.id != session_id);
+            Ok(())
+        })
+        .unwrap();
+    assert!(!storage
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.id == session_id));
+    view.save().unwrap();
+    assert!(
+        !storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == session_id),
+        "saving must not resurrect a peer-deleted committed session"
+    );
+    assert!(view.get_instance(&session_id).is_none());
+    assert_ne!(view.selected_session.as_deref(), Some(session_id.as_str()));
+    assert!(storage
+        .load()
+        .unwrap()
+        .iter()
+        .any(|row| row.title == "Existing"));
 }
 
 #[test]

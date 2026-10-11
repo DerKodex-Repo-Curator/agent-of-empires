@@ -463,10 +463,25 @@ impl HomeView {
                 Some(session_id)
             }
             CreationResult::Error(error) => {
-                // Remove the stub and show the error in an info dialog
                 if let Some(id) = &stub_id {
+                    let profile = self
+                        .get_instance(id)
+                        .map(|instance| instance.source_profile.clone());
                     self.remove_instance(id);
-                    self.rebuild_group_trees();
+                    if let Some(profile) = profile {
+                        let instances = self.cloned_instances_for_profile(&profile);
+                        if let Some(tree) = self.group_trees.get_mut(&profile) {
+                            let mut groups = tree.get_all_groups();
+                            groups.retain(|group| !provisional_group_paths.contains(&group.path));
+                            *tree = GroupTree::new_with_groups(&instances, &groups);
+                        }
+                        if !provisional_group_paths.is_empty() {
+                            self.pending_group_deletions
+                                .entry(profile)
+                                .or_default()
+                                .extend(provisional_group_paths);
+                        }
+                    }
                     self.rebuild_flat_items();
                     self.update_selected();
                     // Hook failures carry multi-line output; size to fit so

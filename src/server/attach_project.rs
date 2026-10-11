@@ -51,8 +51,7 @@ pub(crate) async fn attach_project(
     repo_path: &Path,
     on_existing: ExistingBranch,
 ) -> Result<(AttachOutcome, WorkerOutcome), AttachError> {
-    // `instance_lock` alone stopped being the whole barrier once prompt submission moved to
-    // its own authority.
+    // Submission and instance admission are ordered before quiescence.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(id)
@@ -61,7 +60,7 @@ pub(crate) async fn attach_project(
         return Err(AttachError::NotFound);
     };
     let inst_lock = state.instance_lock(id).await;
-    // Held across the turn probe, the stop, the persist and the start.
+    // Release these gates before native callbacks can reenter this daemon.
     let _guard = inst_lock.lock().await;
 
     let (profile, was_running, original) = {
@@ -157,39 +156,47 @@ pub(crate) async fn attach_project(
         (plan, crate::session::attach_project::Quiesced::default())
     };
 
-    let outcome = {
-        let id_owned = id.to_string();
-        let admitted_instance = instance.clone();
-        match run_blocking(storage.clone(), move |storage| {
-            crate::session::attach_project::attach_planned(
-                storage,
-                &id_owned,
-                &admitted_instance,
-                plan,
-            )
-            .map_err(|e| format!("{e:#}"))
-        })
+    drop(_guard);
+    drop(_submission);
+    let id_owned = id.to_string();
+    let admitted_instance = instance.clone();
+    let (result, quiesced) = run_blocking(storage.clone(), move |storage| {
+        let mut quiesced = quiesced;
+        let result = crate::session::attach_project::attach_planned(
+            storage,
+            &id_owned,
+            &admitted_instance,
+            plan,
+            &mut quiesced,
+        )
+        .map_err(|error| format!("{error:#}"));
+        Ok((result, quiesced))
+    })
+    .await
+    .map_err(AttachError::Rejected)?;
+    let Some(_submission) = state
+        .session_service
+        .prompt_submission_for_session(id)
         .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // Put the session back.
-                restore_after_failure(
-                    state,
-                    &instance,
-                    storage.clone(),
-                    quiesced,
-                    was_running && restarts,
-                )
-                .await;
-                return Err(AttachError::Rejected(e));
-            }
+    else {
+        return Err(AttachError::NotFound);
+    };
+    let _guard = inst_lock.lock().await;
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            restore_after_failure(
+                state,
+                &instance,
+                storage.clone(),
+                quiesced,
+                was_running && restarts,
+            )
+            .await;
+            return Err(AttachError::Rejected(error));
         }
     };
-
-    // Persist landed, so mirror it into the live state before anything reads the instance
-    // again.
-    mirror_conversion(state, id, &outcome).await;
+    mirror_conversion(state, storage.clone(), &instance, &outcome, quiesced).await?;
 
     if !restarts {
         return Ok((outcome, WorkerOutcome::NotRunning));
@@ -273,16 +280,54 @@ async fn restore_after_failure(
     }
 }
 
-/// Mirror the persisted conversion into the live instance map.
-async fn mirror_conversion(state: &Arc<AppState>, id: &str, outcome: &AttachOutcome) {
+async fn mirror_conversion(
+    state: &Arc<AppState>,
+    storage: Arc<Storage>,
+    original: &crate::session::Instance,
+    outcome: &AttachOutcome,
+    quiesced: crate::session::attach_project::Quiesced,
+) -> Result<(), AttachError> {
     let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        inst.workspace_info = Some(outcome.workspace_info.clone());
-        if let Some(moved_to) = &outcome.moved_to {
-            inst.project_path = moved_to.clone();
-            inst.worktree_info = None;
-        }
+    let mut expected = original.clone();
+    expected.workspace_info = Some(outcome.workspace_info.clone());
+    if let Some(path) = &outcome.moved_to {
+        expected.project_path = path.clone();
+        expected.worktree_info = None;
     }
+    let generation = if quiesced.attach_generation == 0 {
+        original.lifecycle_generation
+    } else {
+        quiesced.attach_generation
+    };
+    let current = run_blocking(storage, move |storage| {
+        let root = crate::session::storage::acquire_ownership_read()
+            .map_err(|error| format!("{error:#}"))?;
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &expected.id)
+            .map_err(|error| format!("{error:#}"))?;
+        let row = storage
+            .load_strict_for_worktree_ownership()
+            .map_err(|error| format!("{error:#}"))?
+            .into_iter()
+            .find(|row| row.id == expected.id)
+            .ok_or("session disappeared after attach")?;
+        if !crate::session::attach_project::same_checkout(&row, &expected)
+            || row.lifecycle_generation != generation
+        {
+            return Err("session changed after attach".to_owned());
+        }
+        Ok(row)
+    })
+    .await
+    .map_err(AttachError::Rejected)?;
+    let inst = instances
+        .iter_mut()
+        .find(|inst| inst.id == current.id && inst.created_at == current.created_at)
+        .ok_or(AttachError::NotFound)?;
+    inst.workspace_info = current.workspace_info;
+    inst.project_path = current.project_path;
+    inst.worktree_info = current.worktree_info;
+    Ok(())
 }
 
 /// Start the session's worker again, in the workspace the conversion produced.

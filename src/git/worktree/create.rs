@@ -114,6 +114,17 @@ impl GitWorktree {
         create_branch: bool,
         base_branch: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.create_worktree_with_hooks(branch, path, create_branch, base_branch, None)
+    }
+
+    pub(crate) fn create_worktree_with_hooks(
+        &self,
+        branch: &str,
+        path: &Path,
+        create_branch: bool,
+        base_branch: Option<&str>,
+        mut lease: Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<Vec<String>> {
         let total_start = Instant::now();
         let mut warnings: Vec<String> = Vec::new();
         tracing::info!(target: "git.worktree",
@@ -145,7 +156,10 @@ impl GitWorktree {
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         }
 
-        self.add_worktree(branch, path, &mut warnings)?;
+        self.add_worktree(branch, path, &mut warnings, &mut lease)?;
+        if let Some(lease) = &mut lease {
+            lease.checkpoint()?;
+        }
 
         // Relative, so the checkout resolves when mounted elsewhere.
         let t = Instant::now();
@@ -155,7 +169,7 @@ impl GitWorktree {
 
         let t = Instant::now();
         let submodule_status = if self.init_submodules {
-            self.initialize_submodules(path)?
+            self.initialize_submodules(path, &mut lease)?
         } else {
             "disabled-by-config".to_string()
         };
@@ -283,12 +297,19 @@ impl GitWorktree {
 
     /// `git worktree add`. A post-checkout hook can fail after the checkout
     /// exists; that worktree is usable, so the failure becomes a warning.
-    fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    fn add_worktree(
+        &self,
+        branch: &str,
+        path: &Path,
+        warnings: &mut Vec<String>,
+        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<()> {
         let t = Instant::now();
-        let output = crate::git::command::run_git(
-            &self.repo_path,
-            ["worktree", "add", path_str(path)?, branch],
-        )?;
+        let args = ["worktree", "add", path_str(path)?, branch];
+        let output = match lease {
+            Some(lease) => crate::git::command::run_git_with_hooks(&self.repo_path, args, *lease)?,
+            None => crate::git::command::run_git(&self.repo_path, args)?,
+        };
         let add_elapsed = t.elapsed();
 
         if !output.status.success() {
@@ -331,7 +352,11 @@ impl GitWorktree {
         Ok(())
     }
 
-    fn initialize_submodules(&self, worktree_path: &Path) -> Result<String> {
+    fn initialize_submodules(
+        &self,
+        worktree_path: &Path,
+        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<String> {
         let gitmodules_path = worktree_path.join(".gitmodules");
         if !gitmodules_path.is_file() {
             return Ok("none".to_string());
@@ -353,7 +378,10 @@ impl GitWorktree {
         }
         args.extend(["submodule", "update", "--init", "--recursive"].map(String::from));
 
-        let output = crate::git::command::run_git(worktree_path, &args)?;
+        let output = match lease {
+            Some(lease) => crate::git::command::run_git_with_hooks(worktree_path, &args, *lease)?,
+            None => crate::git::command::run_git(worktree_path, &args)?,
+        };
         if output.status.success() {
             return Ok(format!("initialized count={}", submodule_count));
         }

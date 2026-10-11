@@ -7,6 +7,7 @@ pub mod cleanup;
 pub(crate) mod command;
 pub mod diff;
 pub mod error;
+pub mod native_hooks;
 mod remote;
 pub mod template;
 #[cfg(test)]

@@ -370,6 +370,10 @@ pub(crate) struct OwnershipGuard {
 }
 
 impl OwnershipGuard {
+    pub(crate) fn app_dir(&self) -> &Path {
+        &self.app_dir
+    }
+
     fn verify(&self) -> Result<()> {
         anyhow::ensure!(
             paths_share_filesystem_identity(&self.app_dir, &get_app_dir()?)?,

@@ -911,10 +911,7 @@ fn queued_creation_cannot_publish_into_a_replacement_profile() {
     assert_eq!(rows[0].id, peer_id);
 }
 
-/// The async CreationPoller result must replace a `Creating` stub even when an intervening
-/// save already persisted it, keep the finalized row's group, and treat the committed row as
-/// authoritative rather than a provisional pending add, so a later peer deletion is not
-/// resurrected by `save`.
+/// A committed async creation stays deleted after a peer removes its row.
 #[test]
 #[serial]
 fn apply_creation_results_finalizes_persisted_stub() {
@@ -958,13 +955,6 @@ fn apply_creation_results_finalizes_persisted_stub() {
 
     let session_id = drain_creation_result(&mut view)
         .expect("apply_creation_results should return Some(session_id)");
-    assert_eq!(
-        crate::session::config::AppStateConfig::load()
-            .unwrap()
-            .sessions_created,
-        1
-    );
-    view.save().unwrap();
     assert_eq!(
         crate::session::config::AppStateConfig::load()
             .unwrap()

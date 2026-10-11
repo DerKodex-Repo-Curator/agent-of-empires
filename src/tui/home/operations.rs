@@ -300,7 +300,7 @@ impl HomeView {
             );
             return Err(error);
         }
-        self.add_instance(instance.clone());
+        self.publish_persisted_instance(instance.clone());
         self.rebuild_group_trees();
         if !instance.group_path.is_empty() {
             if let Some(tree) = self.group_trees.get_mut(&target_profile) {

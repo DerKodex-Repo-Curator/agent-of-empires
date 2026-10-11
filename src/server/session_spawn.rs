@@ -659,15 +659,35 @@ async fn publish_created_instance(
             );
             witness.validate(&authoritative)?;
             // Only startup-only fields may come from the worker snapshot.
-            if let (Some(current), Some(started)) = (
-                authoritative.sandbox_info.as_mut(),
-                expected.sandbox_info.as_ref(),
-            ) {
-                current.before_start_env = started.before_start_env.clone();
+            if authoritative.runs(&expected.tool, expected.active_execution.as_ref())
+                && authoritative.view == expected.view
+                && authoritative.omp_capture_generation == expected.omp_capture_generation
+            {
+                if authoritative.status == crate::session::Status::Starting
+                    && expected.status == crate::session::Status::Starting
+                {
+                    authoritative.last_start_time = expected.last_start_time;
+                }
+                if expected
+                    .poller_serves(&authoritative.tool, authoritative.active_execution.as_ref())
+                {
+                    authoritative.adopt_poller(expected);
+                }
+                authoritative.adopt_poller_repair(expected);
+                if let (Some(current), Some(started)) = (
+                    authoritative.sandbox_info.as_mut(),
+                    expected.sandbox_info.as_ref(),
+                ) {
+                    current.before_start_env = started.before_start_env.clone();
+                }
+                if authoritative.status == crate::session::Status::Error
+                    && expected.status == crate::session::Status::Error
+                {
+                    authoritative.last_error = expected.last_error.clone();
+                    authoritative.last_error_check = expected.last_error_check;
+                }
             }
-            if authoritative.status == crate::session::Status::Error {
-                authoritative.last_error = expected.last_error.clone();
-            }
+
             let response = authoritative.clone();
             crate::server::api::sessions::upsert_instance(&mut instances, authoritative);
             #[cfg(test)]
@@ -1095,60 +1115,134 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn publication_uses_authoritative_peer_fields_not_the_worker_snapshot() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let storage = crate::session::Storage::new_unwatched("test").unwrap();
-        let mut instance =
-            crate::session::Instance::new("worker title", &project.path().to_string_lossy());
-        instance.source_profile = "test".into();
-        let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
-        storage
-            .update(|rows, _| {
-                rows.push(instance.clone());
-                Ok(())
-            })
-            .unwrap();
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let live = state.instances.write().await;
-        let publish = super::publish_created_instance(
-            &state.session_service,
-            instance,
-            storage.clone(),
-            witness,
-        );
-        tokio::pin!(publish);
-        assert!(futures_util::poll!(&mut publish).is_pending());
-        let peer_storage = storage.clone();
-        tokio::task::spawn_blocking(move || {
-            peer_storage
+        for change in ["same", "status", "tool", "view", "capture"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempfile::tempdir().unwrap();
+            let _tmux = crate::session::test_support::EnvGuard::set(&[(
+                "AOE_TMUX_SOCKET",
+                project.path().join("tmux.sock"),
+            )]);
+            let storage = crate::session::Storage::new_unwatched("test").unwrap();
+            let mut instance =
+                crate::session::Instance::new("worker title", &project.path().to_string_lossy());
+            instance.source_profile = "test".into();
+            instance.status = crate::session::Status::Starting;
+            let started = std::time::Instant::now();
+            instance.last_start_time = Some(started);
+            instance.poller_repair.defer(started);
+            instance.session_id_poller_retry_after =
+                Some(started + std::time::Duration::from_secs(30));
+            if change == "same" {
+                let poller = crate::session::poller::SessionPoller::new(
+                    instance.id.clone(),
+                    instance.tool.clone(),
+                    instance.active_execution.clone(),
+                );
+                poller.inject_test_sidecar_update(
+                    &instance.id,
+                    "019342ab-1234-7def-8901-abcdef012345",
+                    None,
+                );
+                instance.session_id_poller =
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+            }
+            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            storage
                 .update(|rows, _| {
-                    rows[0].title = "peer title".into();
-                    rows[0].callback_url = Some("https://peer.invalid/completed".into());
+                    rows.push(instance.clone());
                     Ok(())
                 })
                 .unwrap();
-        })
-        .await
-        .unwrap();
-        drop(live);
-        let published = tokio::time::timeout(std::time::Duration::from_secs(10), publish)
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let live = state.instances.write().await;
+            let publish = super::publish_created_instance(
+                &state.session_service,
+                instance,
+                storage.clone(),
+                witness,
+            );
+            tokio::pin!(publish);
+            assert!(futures_util::poll!(&mut publish).is_pending());
+            let peer_storage = storage.clone();
+            tokio::task::spawn_blocking(move || {
+                peer_storage
+                    .update(|rows, _| {
+                        rows[0].title = "peer title".into();
+                        rows[0].callback_url = Some("https://peer.invalid/completed".into());
+                        rows[0].agent_session_id =
+                            Some("019342aa-2222-7eee-8fff-aaaabbbbcccc".into());
+                        match change {
+                            "status" => rows[0].status = crate::session::Status::Error,
+                            "tool" => rows[0].tool = "gemini".into(),
+                            "view" => rows[0].view = crate::session::View::Structured,
+                            "capture" => {
+                                rows[0].omp_capture_generation =
+                                    Some("019342aa-2222-7eee-8fff-aaaabbbbcccc".into())
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            })
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(published.title, "peer title");
-        assert_eq!(
-            published.callback_url.as_deref(),
-            Some("https://peer.invalid/completed")
-        );
-        let live = state.instances.read().await;
-        assert_eq!(live[0].title, published.title);
-        assert_eq!(live[0].callback_url, published.callback_url);
-        assert_eq!(
-            state
-                .mutation_epoch
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+            drop(live);
+            let published = tokio::time::timeout(std::time::Duration::from_secs(10), publish)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(published.title, "peer title");
+            assert_eq!(
+                published.callback_url.as_deref(),
+                Some("https://peer.invalid/completed")
+            );
+            assert_eq!(
+                published.agent_session_id.as_deref(),
+                Some("019342aa-2222-7eee-8fff-aaaabbbbcccc")
+            );
+            let compatible = change == "same" || change == "status";
+            assert_eq!(
+                published.poller_repair.due(started),
+                !compatible,
+                "{change}"
+            );
+            assert_eq!(
+                published.session_id_poller_retry_after.is_some(),
+                compatible,
+                "{change}"
+            );
+            assert_eq!(
+                published.last_start_time,
+                (change == "same").then_some(started),
+                "{change}"
+            );
+            if change == "same" {
+                assert_eq!(published.status, crate::session::Status::Starting);
+            } else if change == "status" {
+                assert_eq!(published.status, crate::session::Status::Error);
+            }
+            let live = state.instances.read().await;
+            assert_eq!(live[0].title, published.title);
+            assert_eq!(live[0].last_start_time, published.last_start_time);
+            assert_eq!(live[0].agent_session_id, published.agent_session_id);
+            assert_eq!(
+                state
+                    .mutation_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            drop(live);
+            if change == "same" {
+                let mut rows = vec![published];
+                crate::session::sync::drain_and_persist_session_ids(&mut rows, &state.file_watch);
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some("019342ab-1234-7def-8901-abcdef012345")
+                );
+                assert_eq!(rows[0].title, "peer title");
+            }
+        }
     }
 
     #[tokio::test]

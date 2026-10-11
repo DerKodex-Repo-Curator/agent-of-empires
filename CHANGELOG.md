@@ -9,6 +9,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Bug Fixes
 
 - **worktree:** Serialize cross-profile ownership transitions through Git effects and durable publication. Preserve referenced worktrees and branches during purge, trash/restore, orphan cleanup, attachment, creation, reconciliation and rename, including external profile aliases and unreadable inventories. Release abandoned lifecycle reservations only for their original owner, keep creation prompts and sandbox pulls outside ownership leases, and publish retained startup failures as errors without deleting their resources (#4107).
+- **session:** Keep peer deletions authoritative after synchronous TUI creation and preserve compatible launch runtime during API publication.
+- **worktree:** Allow native post-checkout hooks to reenter AoE, including configured hooks and recursive submodule checkouts. Revalidate ownership before resuming and preserve callback-owned resources and data during rollback. Discard canceled TUI creation stubs and their provisional groups.
 
 ## [1.19.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.19.0) - 2026-10-08
 

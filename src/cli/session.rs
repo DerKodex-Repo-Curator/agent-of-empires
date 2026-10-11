@@ -2721,14 +2721,20 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let mut plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
     let inst = crate::session::attach_project::reserve_attach(&storage, &mut plan)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, inst.is_sandboxed());
-    let quiesced = if restarts {
+    let mut quiesced = if restarts {
         println!("Stopping '{title}' so its working directory can move...");
         crate::session::attach_project::quiesce_for_conversion(&storage, &plan)?
     } else {
         crate::session::attach_project::Quiesced::default()
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, &inst, plan) {
+    let outcome = match crate::session::attach_project::attach_planned(
+        &storage,
+        &id,
+        &inst,
+        plan,
+        &mut quiesced,
+    ) {
         Ok(outcome) => outcome,
         Err(e) => {
             crate::session::attach_project::resume_after_conversion(
