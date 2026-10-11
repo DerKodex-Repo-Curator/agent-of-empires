@@ -46,14 +46,31 @@ enum FetchOutcome {
 impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
-    fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(["fetch", remote, branch])
-            .current_dir(&self.repo_path)
-            .stdin(std::process::Stdio::null());
+    fn fetch_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<FetchOutcome> {
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
-        match crate::process::run_with_timeout(&mut cmd, timeout) {
+        let output = match lease {
+            Some(lease) => Ok(crate::git::native_hooks::run_timed(
+                &self.repo_path,
+                &["fetch", remote, branch].map(std::ffi::OsString::from),
+                *lease,
+                timeout,
+            )?),
+            None => {
+                let mut command = std::process::Command::new("git");
+                command
+                    .args(["fetch", remote, branch])
+                    .current_dir(&self.repo_path)
+                    .stdin(std::process::Stdio::null());
+                crate::process::run_with_timeout(&mut command, timeout)
+            }
+        };
+        Ok(match output {
             Ok(Some(output)) if output.status.success() => {
                 tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", start.elapsed());
                 FetchOutcome::Ok
@@ -69,29 +86,27 @@ impl GitWorktree {
                 })
             }
             Ok(None) => {
-                tracing::warn!(target: "git.worktree",
-                    "git fetch {remote}/{branch} timed out after {}s",
-                    timeout.as_secs()
-                );
+                tracing::warn!(target: "git.worktree", "git fetch {remote}/{branch} timed out after {}s", timeout.as_secs());
                 FetchOutcome::TimedOut
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "git.command",
-                    remote = %remote,
-                    branch = %branch,
-                    error = %e,
-                    "git fetch spawn failed"
-                );
-                FetchOutcome::Skipped(format!("spawn failed: {e}"))
+            Err(error) => {
+                tracing::warn!(target: "git.command", remote = %remote, branch = %branch,
+                    error = %error, "git fetch spawn failed");
+                FetchOutcome::Skipped(format!("spawn failed: {error}"))
             }
-        }
+        })
     }
 
-    /// Fetches `branch` and records a non-`Ok` outcome as a warning.
-    fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
-        let detail = match self.fetch_branch(remote, branch) {
-            FetchOutcome::Ok => return,
+    /// Native fetch failures warn; failed ownership handoffs cancel creation.
+    fn fetch_with_warning(
+        &self,
+        warnings: &mut Vec<String>,
+        remote: &str,
+        branch: &str,
+        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<()> {
+        let detail = match self.fetch_branch(remote, branch, lease)? {
+            FetchOutcome::Ok => return Ok(()),
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
             FetchOutcome::TimedOut => "timed out after 10s".to_string(),
         };
@@ -99,6 +114,7 @@ impl GitWorktree {
             "git fetch {remote} {branch} failed for {repo}: {detail}",
             repo = self.repo_path.display()
         ));
+        Ok(())
     }
 
     /// Create a worktree at `path` checking out `branch`.
@@ -143,19 +159,22 @@ impl GitWorktree {
 
         let t = Instant::now();
         if create_branch {
-            let base = self.fetch_base(&mut warnings, base_branch);
+            let base = self.fetch_base(&mut warnings, base_branch, &mut lease)?;
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
             self.create_branch_from_base(branch, base)?;
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         } else {
-            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch);
+            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch, &mut lease)?;
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
             self.ensure_branch_exists(branch)?;
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         }
 
+        if let Some(lease) = &mut lease {
+            lease.prepare_checkout(create_branch)?;
+        }
         self.add_worktree(branch, path, &mut warnings, &mut lease)?;
         if let Some(lease) = &mut lease {
             lease.checkpoint()?;
@@ -203,7 +222,8 @@ impl GitWorktree {
         &self,
         warnings: &mut Vec<String>,
         base_branch: Option<&str>,
-    ) -> (String, Option<String>, bool) {
+        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<(String, Option<String>, bool)> {
         let (base, remote, explicit) = match base_branch.map(str::trim) {
             Some(base) if !base.is_empty() => {
                 (base.to_string(), self.pick_remote_for_branch(base), true)
@@ -218,8 +238,13 @@ impl GitWorktree {
                 (info.name, info.remote, false)
             }
         };
-        self.fetch_with_warning(warnings, remote.as_deref().unwrap_or(FETCH_REMOTE), &base);
-        (base, remote, explicit)
+        self.fetch_with_warning(
+            warnings,
+            remote.as_deref().unwrap_or(FETCH_REMOTE),
+            &base,
+            lease,
+        )?;
+        Ok((base, remote, explicit))
     }
 
     /// Branches from `<remote>/<base>`, then `origin/<base>`, then local
@@ -578,15 +603,19 @@ pub(super) mod tests {
         let (no_remote, _repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
-            git_wt.fetch_branch("origin", "main"),
+            git_wt.fetch_branch("origin", "main", &mut None).unwrap(),
             FetchOutcome::Failed(_)
         ));
-
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();
-        assert_eq!(git_wt.fetch_branch("origin", "main"), FetchOutcome::Ok);
+        assert_eq!(
+            git_wt.fetch_branch("origin", "main", &mut None).unwrap(),
+            FetchOutcome::Ok
+        );
         assert!(matches!(
-            git_wt.fetch_branch("origin", "nonexistent-branch"),
+            git_wt
+                .fetch_branch("origin", "nonexistent-branch", &mut None)
+                .unwrap(),
             FetchOutcome::Failed(_)
         ));
     }

@@ -199,6 +199,154 @@ fn verify_claims(
     Ok(())
 }
 
+enum EntryPin {
+    Directory(DirectoryWitness),
+    File {
+        handle: std::fs::File,
+        bytes: Vec<u8>,
+    },
+}
+
+struct PathSnapshot {
+    path: PathBuf,
+    resolved: PathBuf,
+    pin: Option<EntryPin>,
+}
+
+impl PathSnapshot {
+    fn capture(path: PathBuf) -> Result<Self> {
+        let resolved = super::deletion::resolve_claim_path(&path)
+            .context("unresolved native checkout path")?;
+        let pin = match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                let metadata = std::fs::metadata(&path)?;
+                if metadata.is_dir() {
+                    Some(EntryPin::Directory(DirectoryWitness::capture(&path)?))
+                } else {
+                    anyhow::ensure!(metadata.is_file(), "Native Git route is not a regular file");
+                    use std::io::Read;
+                    let mut handle = std::fs::File::open(&path)?;
+                    let mut bytes = Vec::new();
+                    handle.read_to_end(&mut bytes)?;
+                    Some(EntryPin::File { handle, bytes })
+                }
+            }
+        };
+        Ok(Self {
+            path,
+            resolved,
+            pin,
+        })
+    }
+
+    fn verify(&self) -> Result<()> {
+        anyhow::ensure!(
+            super::deletion::resolve_claim_path(&self.path).as_ref() == Some(&self.resolved),
+            "Native checkout path was redirected during a callback"
+        );
+        match &self.pin {
+            None => anyhow::ensure!(
+                matches!(std::fs::symlink_metadata(&self.path), Err(error) if error.kind() == io::ErrorKind::NotFound),
+                "Native checkout resource appeared during a callback"
+            ),
+            Some(EntryPin::Directory(directory)) => directory.verify()?,
+            Some(EntryPin::File { handle, bytes }) => {
+                anyhow::ensure!(
+                    super::storage::filesystem_identity(&std::fs::metadata(&self.path)?)
+                        == super::storage::filesystem_identity(&handle.metadata()?)
+                        && std::fs::read(&self.path)? == *bytes,
+                    "Native Git route changed during a callback"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn route(&self, prefix: &[u8], base: &Path) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let EntryPin::File { bytes, .. } = self.pin.as_ref()? else {
+            return None;
+        };
+        let route = bytes.strip_prefix(prefix)?;
+        let route = route.strip_suffix(b"\n").unwrap_or(route);
+        let route = route.strip_suffix(b"\r").unwrap_or(route);
+        (!route.is_empty()).then(|| base.join(std::ffi::OsStr::from_bytes(route)))
+    }
+}
+
+struct CheckoutBoundary {
+    checkout: PathSnapshot,
+    parent: PathSnapshot,
+    route: PathSnapshot,
+    admin: Option<PathSnapshot>,
+    common_route: Option<PathSnapshot>,
+    common: Option<PathSnapshot>,
+}
+
+impl CheckoutBoundary {
+    fn capture(path: &Path, git_dir: Option<&Path>) -> Result<Self> {
+        let checkout = PathSnapshot::capture(path.to_path_buf())?;
+        let mut parent = path.parent().context("checkout parent missing")?;
+        while !parent.exists() {
+            parent = parent.parent().context("checkout ancestor missing")?;
+        }
+        let parent = PathSnapshot::capture(parent.to_path_buf())?;
+        let route = PathSnapshot::capture(path.join(".git"))?;
+        let admin_path = if matches!(route.pin, Some(EntryPin::Directory(_))) {
+            Some(route.path.clone())
+        } else {
+            route
+                .route(b"gitdir: ", path)
+                .or_else(|| git_dir.map(|directory| path.join(directory)))
+        };
+        let (admin, common_route, common) = if let Some(admin_path) = admin_path {
+            let admin = if admin_path == route.path {
+                None
+            } else {
+                Some(PathSnapshot::capture(admin_path.clone())?)
+            };
+            let common_route = PathSnapshot::capture(admin_path.join("commondir"))?;
+            let common = common_route
+                .route(b"", &admin_path)
+                .map(PathSnapshot::capture)
+                .transpose()?;
+            (admin, Some(common_route), common)
+        } else {
+            (None, None, None)
+        };
+        Ok(Self {
+            checkout,
+            parent,
+            route,
+            admin,
+            common_route,
+            common,
+        })
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &PathSnapshot> {
+        [
+            Some(&self.checkout),
+            Some(&self.parent),
+            Some(&self.route),
+            self.admin.as_ref(),
+            self.common_route.as_ref(),
+            self.common.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn verify(&self) -> Result<()> {
+        for path in self.paths() {
+            path.verify()?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct NativeLease<'a> {
     ownership: &'a mut Option<OwnershipGuard>,
     exclusive: bool,
@@ -214,6 +362,11 @@ pub(crate) struct NativeLease<'a> {
     main_repo: PathBuf,
     path: PathBuf,
     branch: String,
+    detached: bool,
+    original_tip: Option<git2::Oid>,
+    boundary: Option<CheckoutBoundary>,
+    child_boundary: Option<CheckoutBoundary>,
+    partial_directories: Vec<(PathBuf, DirectoryWitness)>,
     checkout: Option<CheckoutWitness>,
     children: Vec<(PathBuf, CheckoutWitness)>,
 }
@@ -278,20 +431,37 @@ impl<'a> NativeLease<'a> {
             main_repo: main_repo.to_path_buf(),
             path: path.to_path_buf(),
             branch: branch.to_owned(),
+            detached: false,
+            original_tip: None,
+            boundary: None,
+            child_boundary: None,
+            partial_directories: Vec::new(),
             checkout: None,
             children: Vec::new(),
         })
     }
 
     fn pin_checkout(&mut self) -> Result<()> {
+        self.verify()?;
         if self.checkout.is_none() {
-            self.checkout = Some(CheckoutWitness::capture(&self.path)?);
+            let candidate = CheckoutWitness::capture_for_branch(
+                &self.path,
+                &self.branch,
+                self.detached,
+                self.original_tip,
+            )?;
+            self.verify()?;
+            candidate.verify()?;
+            self.checkout = Some(candidate);
         }
         Ok(())
     }
 
     fn verify(&self) -> Result<()> {
         for directory in &self.directories {
+            directory.verify()?;
+        }
+        for (_, directory) in &self.partial_directories {
             directory.verify()?;
         }
         let source = git2::Repository::open(&self.main_repo)?;
@@ -360,12 +530,68 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
             .map_err(|error| io::Error::other(format!("{error:#}")))
     }
 
-    fn pause(&mut self, cwd: &Path) -> io::Result<()> {
+    fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()> {
+        let prepare = || -> Result<(bool, Option<git2::Oid>)> {
+            self.verify()?;
+            let repo = git2::Repository::open(&self.main_repo)?;
+            let local = repo.find_branch(&self.branch, git2::BranchType::Local).ok();
+            let detached = local.is_none() && repo.revparse_single(&self.branch).is_ok();
+            let tip = if owned_branch {
+                Some(
+                    local
+                        .context("native checkout branch is missing")?
+                        .get()
+                        .target()
+                        .context("native checkout branch has no target")?,
+                )
+            } else {
+                None
+            };
+            Ok((detached, tip))
+        };
+        (self.detached, self.original_tip) =
+            prepare().map_err(|error| io::Error::other(format!("{error:#}")))?;
+        Ok(())
+    }
+
+    fn pause(
+        &mut self,
+        cwd: &Path,
+        checkout_ready: bool,
+        git_dir: Option<&Path>,
+    ) -> io::Result<()> {
         let mut prepare = || -> Result<()> {
-            self.pin_checkout()?;
-            if cwd != self.path && !self.children.iter().any(|(path, _)| path == cwd) {
-                self.children
-                    .push((cwd.to_path_buf(), CheckoutWitness::capture(cwd)?));
+            self.verify()?;
+            let admin = git_dir.map(|directory| cwd.join(directory));
+            self.boundary = Some(CheckoutBoundary::capture(&self.path, admin.as_deref())?);
+            self.child_boundary = if cwd != self.path && cwd != self.main_repo {
+                Some(CheckoutBoundary::capture(cwd, admin.as_deref())?)
+            } else {
+                None
+            };
+            for boundary in [&self.boundary, &self.child_boundary].into_iter().flatten() {
+                for path in boundary.paths() {
+                    if let Some(EntryPin::Directory(directory)) = &path.pin {
+                        if !self
+                            .partial_directories
+                            .iter()
+                            .any(|(known, _)| known == &path.path)
+                        {
+                            self.partial_directories
+                                .push((path.path.clone(), directory.clone()));
+                        }
+                    }
+                }
+            }
+            if checkout_ready {
+                self.pin_checkout()?;
+                if cwd != self.path
+                    && cwd != self.main_repo
+                    && !self.children.iter().any(|(path, _)| path == cwd)
+                {
+                    self.children
+                        .push((cwd.to_path_buf(), CheckoutWitness::capture(cwd)?));
+                }
             }
             self.verify()?;
             let root = self
@@ -390,6 +616,9 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
             } else {
                 storage::acquire_ownership_read()?
             });
+            for boundary in [&self.boundary, &self.child_boundary].into_iter().flatten() {
+                boundary.verify()?;
+            }
             self.verify()?;
             if let Some(owner) = &mut self.owner {
                 owner.restore(
@@ -398,6 +627,8 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                         .context("native Git ownership lease missing")?,
                 )?;
             }
+            self.boundary = None;
+            self.child_boundary = None;
             Ok(())
         };
         resume().map_err(|error| io::Error::other(format!("{error:#}")))
@@ -446,4 +677,52 @@ pub(crate) fn cleanup_with_ownership(receipt: &CreatedWorktree, root: &Ownership
             owners,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckoutBoundary;
+    use std::fs;
+
+    #[test]
+    fn partial_checkout_rejects_callback_replacement() {
+        for change in ["checkout", "git-file", "route", "admin", "common", "parent"] {
+            let fixture = tempfile::tempdir().unwrap();
+            let target = fixture.path().join("checkout");
+            let admin = fixture.path().join("admin");
+            let common = fixture.path().join("common");
+            fs::create_dir(&admin).unwrap();
+            fs::create_dir(&common).unwrap();
+            fs::write(admin.join("commondir"), "../common\n").unwrap();
+            if change != "parent" {
+                fs::create_dir(&target).unwrap();
+            }
+            if !matches!(change, "git-file" | "parent") {
+                fs::write(target.join(".git"), "gitdir: ../admin\n").unwrap();
+            }
+            let target = if change == "parent" {
+                target.join("nested")
+            } else {
+                target
+            };
+            // No HEAD or index exists: only the paused structural boundary matters.
+            let boundary = CheckoutBoundary::capture(&target, None).unwrap();
+            match change {
+                "checkout" => {
+                    fs::rename(&target, fixture.path().join("original")).unwrap();
+                    fs::create_dir(&target).unwrap();
+                }
+                "git-file" => fs::write(target.join(".git"), "gitdir: ../admin\n").unwrap(),
+                "route" => fs::write(target.join(".git"), "gitdir: ../common\n").unwrap(),
+                "admin" | "common" => {
+                    let path = if change == "admin" { &admin } else { &common };
+                    fs::rename(path, fixture.path().join("original")).unwrap();
+                    fs::create_dir(path).unwrap();
+                }
+                "parent" => std::os::unix::fs::symlink(&common, target.parent().unwrap()).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(boundary.verify().is_err(), "callback replacement: {change}");
+        }
+    }
 }

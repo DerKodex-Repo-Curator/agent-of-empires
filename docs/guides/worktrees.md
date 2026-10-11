@@ -77,7 +77,7 @@ An externally placed `git worktree lock` is not a deletion guard: aoe locks ever
 
 ## Hooks that call AoE
 
-Native `post-checkout` hooks, including submodule checkout hooks, may call AoE commands. AoE releases its ownership and attach lifecycle leases around these callbacks, then revalidates the original profile and checkout identities and durable session claims before resuming. A callback that moves or removes the owner, replaces a checkout, or adopts a newly created resource cancels the outer operation without reversing the callback. Failed-creation cleanup retains claimed or dirty checkouts and branches with new commits.
+Native fetch and checkout hooks during worktree creation, including `post-index-change`, `reference-transaction` and recursive submodule checkout hooks, may call AoE commands. AoE releases its ownership and attach lifecycle leases around these callbacks, then revalidates the original profile, checkout identity and durable session claims before resuming. A callback that moves or removes the owner, replaces a checkout, changes its requested branch or adopts a newly created resource cancels the outer operation without reversing the callback. Failed-creation cleanup retains claimed or dirty checkouts and branches with new commits.
 
 A TUI creation may save its original `Creating` placeholder while Git is running. Only that unchanged placeholder is excluded from callback adoption checks. Publication and cancellation retire it by its pinned profile, session identity and checkout claims, not by ID alone. Other `Creating` sessions and changed placeholders remain authoritative owners.
 

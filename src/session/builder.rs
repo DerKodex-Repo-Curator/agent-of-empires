@@ -222,6 +222,31 @@ impl CheckoutWitness {
         })
     }
 
+    pub(crate) fn capture_for_branch(
+        path: &Path,
+        branch: &str,
+        detached: bool,
+        original_tip: Option<git2::Oid>,
+    ) -> Result<Self> {
+        let mut witness = Self::capture(path)?;
+        anyhow::ensure!(
+            if detached {
+                witness.branch.as_deref() == Some("HEAD")
+            } else {
+                witness
+                    .branch
+                    .as_deref()
+                    .and_then(|name| name.strip_prefix("refs/heads/"))
+                    == Some(branch)
+            },
+            "Native checkout changed the requested branch"
+        );
+        if let Some(tip) = original_tip {
+            witness.original_tip = tip;
+        }
+        Ok(witness)
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         self.checkout.verify()?;
         self.git_directory.verify()?;

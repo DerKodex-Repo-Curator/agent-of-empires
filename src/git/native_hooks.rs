@@ -1,4 +1,4 @@
-//! Preserve native hook dispatch while handing caller leases off at post-checkout.
+//! Preserve native hook dispatch while handing caller leases off during callbacks.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -20,7 +20,9 @@ const PRIVATE_PREFIX: &str = "AOE_NATIVE_GIT_";
 
 pub(crate) trait HookLease {
     fn runtime_dir(&self) -> &Path;
-    fn pause(&mut self, cwd: &Path) -> io::Result<()>;
+    fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()>;
+    fn pause(&mut self, cwd: &Path, checkout_ready: bool, git_dir: Option<&Path>)
+        -> io::Result<()>;
     fn resume(&mut self) -> io::Result<()>;
     fn checkpoint(&mut self) -> io::Result<()>;
 }
@@ -57,7 +59,11 @@ struct Descriptor {
 
 #[derive(Serialize, Deserialize)]
 enum Frame {
-    Enter(Vec<u8>),
+    Enter {
+        cwd: Vec<u8>,
+        checkout_ready: bool,
+        git_dir: Option<Vec<u8>>,
+    },
     Done,
 }
 
@@ -512,14 +518,34 @@ fn initialize(
 }
 
 pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> io::Result<Output> {
+    run_inner(cwd, args, lease, None)?.ok_or_else(|| invalid("untimed native Git expired"))
+}
+
+pub(crate) fn run_timed(
+    cwd: &Path,
+    args: &[OsString],
+    lease: &mut dyn HookLease,
+    timeout: std::time::Duration,
+) -> io::Result<Option<Output>> {
+    run_inner(cwd, args, lease, Some(timeout))
+}
+
+fn run_inner(
+    cwd: &Path,
+    args: &[OsString],
+    lease: &mut dyn HookLease,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<Option<Output>> {
     let (mut control, child_control) = UnixStream::pair()?;
     let (_root, descriptor, routing_path) = initialize(cwd, lease, child_control.as_raw_fd())?;
     let prefix_len = global_prefix(args)?;
-    let eligible = args
-        .get(prefix_len)
-        .is_some_and(|arg| arg == "checkout" || arg == "worktree");
+    let eligible = args.get(prefix_len).is_some_and(|arg| {
+        matches!(
+            arg.to_str(),
+            Some("checkout" | "worktree" | "fetch" | "reset")
+        )
+    });
     let mut command = if eligible {
-        // Configuration probes must use the same cwd as this native invocation.
         let (descriptor, prefix, path) = descriptor_for_in(cwd, descriptor, args)?;
         configured_git(&descriptor, args, prefix, &path)?
     } else {
@@ -530,13 +556,23 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let capture = if timeout.is_some() {
+        let stdout = tempfile::NamedTempFile::new()?;
+        let stderr = tempfile::NamedTempFile::new()?;
+        command.stdout(Stdio::from(stdout.reopen()?));
+        command.stderr(Stdio::from(stderr.reopen()?));
+        Some((stdout, stderr))
+    } else {
+        None
+    };
     let fd = child_control.as_raw_fd();
     command.process_group(0);
     // SAFETY: the child only changes a descriptor flag before exec.
     unsafe {
         command.pre_exec(move || inheritable(fd, true));
     }
-    let child = command.spawn()?;
+    let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+    let mut child = command.spawn()?;
     let mut family = NativeFamily {
         pid: child.id(),
         complete: false,
@@ -571,17 +607,62 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
         }
     });
     let waiter = std::thread::spawn(move || {
-        let _ = sender.send(Event::Exit(child.wait_with_output()));
+        let output = (|| {
+            if let Some((mut stdout_file, mut stderr_file)) = capture {
+                let status = child.wait()?;
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                stdout_file.as_file_mut().read_to_end(&mut stdout)?;
+                stderr_file.as_file_mut().read_to_end(&mut stderr)?;
+                Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                })
+            } else {
+                child.wait_with_output()
+            }
+        })();
+        let _ = sender.send(Event::Exit(output));
     });
     let mut paused = false;
+    let mut expired = false;
     let mut failure = None;
     let output = loop {
-        match receiver.recv().map_err(invalid)? {
-            Event::Frame(Frame::Enter(cwd)) if failure.is_none() => {
+        let event = if let Some(deadline) = deadline.filter(|_| !expired) {
+            match receiver
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    expired = true;
+                    crate::process::worker::kill_process_group(family.pid);
+                    continue;
+                }
+                Err(error) => break Err(invalid(error)),
+            }
+        } else {
+            match receiver.recv() {
+                Ok(event) => event,
+                Err(error) => break Err(invalid(error)),
+            }
+        };
+        match event {
+            Event::Frame(Frame::Enter {
+                cwd,
+                checkout_ready,
+                git_dir,
+            }) if failure.is_none() && !expired => {
                 let result = if paused {
-                    Err(invalid("overlapping native post-checkout callbacks"))
+                    Err(invalid("overlapping native hook callbacks"))
                 } else {
-                    lease.pause(Path::new(OsStr::from_bytes(&cwd)))
+                    lease.pause(
+                        Path::new(OsStr::from_bytes(&cwd)),
+                        checkout_ready,
+                        git_dir
+                            .as_deref()
+                            .map(|path| Path::new(OsStr::from_bytes(path))),
+                    )
                 };
                 if let Err(error) = result {
                     failure = Some(error);
@@ -594,7 +675,7 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
                     }
                 }
             }
-            Event::Frame(Frame::Done) if failure.is_none() => {
+            Event::Frame(Frame::Done) if failure.is_none() && !expired => {
                 let result = if paused {
                     lease.resume()
                 } else {
@@ -611,7 +692,7 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
                     }
                 }
             }
-            Event::ReadError(error) if failure.is_none() => {
+            Event::ReadError(error) if failure.is_none() && !expired => {
                 failure = Some(error);
                 crate::process::worker::kill_process_group(family.pid);
             }
@@ -619,23 +700,47 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
             _ => {}
         }
     };
-    family.complete = true;
+    if output.is_err() {
+        crate::process::worker::kill_process_group(family.pid);
+    }
+    let _ = control.shutdown(std::net::Shutdown::Read);
     drop(control);
-    waiter
-        .join()
-        .map_err(|_| invalid("native Git waiter panicked"))?;
-    reader
-        .join()
-        .map_err(|_| invalid("native Git control reader panicked"))?;
+    let _ = waiter.join();
+    if reader.join().is_err() && failure.is_none() && !expired {
+        failure = Some(invalid("native Git control reader panicked"));
+    }
+    if !expired {
+        for event in receiver.try_iter() {
+            let error = match event {
+                Event::ReadError(error) => Some(error),
+                Event::Frame(_) => Some(invalid("native Git exited with a pending callback")),
+                Event::Exit(_) => None,
+            };
+            if failure.is_none() {
+                failure = error;
+            }
+        }
+    }
+    if failure.is_some() {
+        crate::process::worker::kill_process_group(family.pid);
+    }
+    family.complete = true;
     if paused && failure.is_none() {
-        failure = Some(invalid(
-            "native hook exited before its lease was reacquired",
-        ));
+        failure = if expired {
+            lease.resume().err()
+        } else {
+            Some(invalid(
+                "native hook exited before its lease was reacquired",
+            ))
+        };
     }
     if let Some(error) = failure {
         Err(error)
+    } else if expired {
+        output?;
+        Ok(None)
     } else {
-        output
+        output.map(Some)
     }
 }
 
@@ -727,16 +832,18 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
             program == "post-checkout",
         ),
     };
-    let gated = post_checkout && is_post_checkout(args, descriptor.oid_width);
+    let checkout_ready = post_checkout && is_post_checkout(args, descriptor.oid_width);
     // SAFETY: this descriptor was deliberately inherited from the supervising Git process.
     let mut control = unsafe { UnixStream::from_raw_fd(descriptor.scope.fd) };
     inheritable(control.as_raw_fd(), false)?;
-    if gated {
-        send_frame(
-            &mut control,
-            &Frame::Enter(std::env::current_dir()?.into_os_string().into_vec()),
-        )?;
-    }
+    send_frame(
+        &mut control,
+        &Frame::Enter {
+            cwd: std::env::current_dir()?.into_os_string().into_vec(),
+            checkout_ready,
+            git_dir: std::env::var_os("GIT_DIR").map(OsString::into_vec),
+        },
+    )?;
     let mut command = hook_command(descriptor, &original, args, configured.is_some())?;
     let status = match command.status() {
         Ok(status) => Some(status),
@@ -754,9 +861,7 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
             None
         }
     };
-    if gated {
-        send_frame(&mut control, &Frame::Done)?;
-    }
+    send_frame(&mut control, &Frame::Done)?;
     Ok(status.map_or(255, |status| {
         status
             .code()
@@ -765,7 +870,6 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
 }
 
 fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
-    inheritable(descriptor.scope.fd, false)?;
     let prefix = global_prefix(args)?;
     let name = args.get(prefix).map(OsString::as_os_str);
     if args.iter().any(|arg| arg == "--exec-path") {
@@ -773,8 +877,16 @@ fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
         io::stdout().write_all(b"\n")?;
         return Ok(0);
     }
-    let eligible = name.is_some_and(|name| name == "checkout" || name == "worktree");
+    let eligible = name.is_some_and(|name| {
+        matches!(
+            name.to_str(),
+            Some("checkout" | "worktree" | "fetch" | "reset")
+        )
+    });
     let routing = name.is_some_and(|name| name == "submodule" || name == "submodule--helper");
+    if eligible || routing {
+        inheritable(descriptor.scope.fd, false)?;
+    }
     let mut command = if eligible {
         let (descriptor, prefix, path) = descriptor_for(descriptor, args)?;
         configured_git(&descriptor, args, prefix, &path)?
@@ -927,10 +1039,18 @@ mod tests {
                     for args in [["add", "tracked"], ["commit", "-mcallback"]] {
                         assert!(Command::new("git").args(args).status().unwrap().success());
                     }
+                } else if action == "switch" {
+                    assert!(Command::new("git")
+                        .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+                        .status()
+                        .unwrap()
+                        .success());
                 } else if action == "dirty" {
                     fs::write(cwd.join("untracked"), "callback").unwrap();
                 }
-                crate::session::rename_profile(&source, &format!("{source}-renamed")).unwrap();
+                if action != "switch" {
+                    crate::session::rename_profile(&source, &format!("{source}-renamed")).unwrap();
+                }
             }
             return;
         }
@@ -989,16 +1109,42 @@ mod tests {
         let git = crate::git::GitWorktree::new(repo.clone())
             .unwrap()
             .with_init_submodules(false);
-        for action in ["rename", "owner", "adopt", "commit", "dirty", "preexisting"] {
-            let owner_name = format!("owner-{action}");
-            let peer_name = format!("peer-{action}");
+        let mut previous_hook = None;
+        for (hook_name, action) in [
+            ("post-checkout", "rename"),
+            ("post-checkout", "owner"),
+            ("post-checkout", "adopt"),
+            ("post-checkout", "commit"),
+            ("post-checkout", "dirty"),
+            ("post-checkout", "preexisting"),
+            ("post-index-change", "rename"),
+            ("reference-transaction", "rename"),
+            ("post-index-change", "adopt"),
+            ("post-index-change", "commit"),
+            ("post-index-change", "switch"),
+        ] {
+            if let Some(previous) = previous_hook.take() {
+                fs::remove_file(previous).unwrap();
+            }
+            let case = format!("{hook_name}-{action}");
+            let owner_name = format!("owner-{case}");
+            let peer_name = format!("peer-{case}");
             let owner = crate::session::Storage::new_unwatched(&owner_name).unwrap();
             let peer = crate::session::Storage::new_unwatched(&peer_name).unwrap();
-            let target = fixture.path().join(action);
-            let branch = format!("topic-{action}");
-            let hook = repo.join(".git/hooks/post-checkout");
+            let target = fixture.path().join(&case);
+            let branch = format!("topic-{case}");
+            let hook = repo.join(".git/hooks").join(hook_name);
+            if action == "switch" {
+                let repository = git2::Repository::open(&repo).unwrap();
+                repository
+                    .branch(
+                        &branch,
+                        &repository.head().unwrap().peel_to_commit().unwrap(),
+                        false,
+                    )
+                    .unwrap();
+            }
             if action == "preexisting" {
-                fs::remove_file(&hook).unwrap();
                 git.create_worktree(&branch, &target, true, Some("main"))
                     .unwrap();
             }
@@ -1007,25 +1153,26 @@ mod tests {
             } else {
                 &peer_name
             };
-            fs::write(
-                &hook,
-                format!(
-                    "#!/bin/sh
-export AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={profile} AOE_TEST_NATIVE_ACTION={action}
-exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture
-",
-                    crate::session::environment::shell_escape(&exe.to_string_lossy())
-                ),
-            )
-            .unwrap();
+            let marker = fixture.path().join(format!("entered-{case}"));
+            let phase = if hook_name == "reference-transaction" {
+                "[ \"$1\" = prepared ] || exit 0\n"
+            } else {
+                ""
+            };
+            fs::write(&hook, format!(
+                "#!/bin/sh\n{phase}[ ! -e {marker} ] || exit 0\n: > {marker}\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={profile} AOE_TEST_NATIVE_ACTION={action}\nexec {exe} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n",
+                marker = crate::session::environment::shell_escape(&marker.to_string_lossy()),
+                exe = crate::session::environment::shell_escape(&exe.to_string_lossy()),
+            )).unwrap();
             fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+            previous_hook = Some(hook);
             let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
             let result = crate::session::native_hooks::create_worktree(
                 &mut ownership,
                 Some(&owner),
                 &git,
                 (&repo, &target, &branch),
-                true,
+                action != "switch",
                 Some("main"),
                 None,
             );
@@ -1065,8 +1212,77 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
                         .unwrap()
                         .find_branch(&branch, git2::BranchType::Local)
                         .is_ok());
+                } else if action == "switch" {
+                    assert_eq!(
+                        git2::Repository::open(&target)
+                            .unwrap()
+                            .head()
+                            .unwrap()
+                            .name()
+                            .unwrap(),
+                        "refs/heads/main"
+                    );
                 }
             }
+        }
+        fs::remove_file(previous_hook.unwrap()).unwrap();
+        {
+            let repository = git2::Repository::open(&repo).unwrap();
+            let tip = repository.head().unwrap().target().unwrap();
+            repository.remote("origin", repo.to_str().unwrap()).unwrap();
+            repository
+                .reference("refs/remotes/origin/remote-only", tip, false, "fixture")
+                .unwrap();
+            assert!(repository
+                .find_branch("remote-only", git2::BranchType::Local)
+                .is_err());
+            let target = fixture.path().join("remote-only");
+            let owner = crate::session::Storage::new_unwatched("owner-remote").unwrap();
+            let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+            crate::session::native_hooks::create_worktree(
+                &mut ownership,
+                Some(&owner),
+                &git,
+                (&repo, &target, "remote-only"),
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .1
+            .verify()
+            .unwrap();
+            assert_eq!(
+                git2::Repository::open(&target)
+                    .unwrap()
+                    .head()
+                    .unwrap()
+                    .name()
+                    .unwrap(),
+                "refs/heads/remote-only"
+            );
+            repository
+                .reference("refs/remotes/origin/main", tip, false, "fixture")
+                .unwrap();
+            let detached = fixture.path().join("detached-remote");
+            crate::session::native_hooks::create_worktree(
+                &mut ownership,
+                Some(&owner),
+                &git,
+                (&repo, &detached, "origin/main"),
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .1
+            .verify()
+            .unwrap();
+            assert!(git2::Repository::open(&detached)
+                .unwrap()
+                .head_detached()
+                .unwrap());
+            repository.remote_delete("origin").unwrap();
         }
         use crate::session::builder::{create_workspace_with_ownership, WorkspaceRepoSpec};
         let extra = fixture.path().join("extra");
