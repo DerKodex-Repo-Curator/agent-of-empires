@@ -1279,27 +1279,36 @@ mod tests {
             return;
         }
         if std::env::var_os("AOE_TEST_NATIVE_RUNNER").is_none() {
-            let mut child = Command::new(std::env::current_exe().unwrap());
-            child
-                .args([
-                    "--exact",
-                    "git::native_hooks::tests::native_callbacks_reenter_ownership",
-                    "--nocapture",
-                ])
-                .env("AOE_TEST_NATIVE_RUNNER", "1");
-            let output = crate::process::run_with_timeout_process_group(
-                &mut child,
-                std::time::Duration::from_secs(30),
-            )
-            .unwrap()
-            .expect("native callback must not wait on its parent lease");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            for phase in ["callbacks", "dynamic", "remote", "workspace"] {
+                eprintln!("native callbacks: starting {phase}");
+                let started = std::time::Instant::now();
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "git::native_hooks::tests::native_callbacks_reenter_ownership",
+                        "--nocapture",
+                    ])
+                    .env("AOE_TEST_NATIVE_RUNNER", phase);
+                let output = crate::process::run_with_timeout_process_group(
+                    &mut child,
+                    std::time::Duration::from_secs(30),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("native callback phase {phase} exceeded its deadline"));
+                assert!(
+                    output.status.success(),
+                    "{phase}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!(
+                    "native callbacks: {phase} completed in {:?}",
+                    started.elapsed()
+                );
+            }
             return;
         }
+        let phase = std::env::var("AOE_TEST_NATIVE_RUNNER").unwrap();
         let _home = crate::session::test_support::isolate_app_dir();
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path().join("source");
@@ -1333,222 +1342,232 @@ mod tests {
         let git = crate::git::GitWorktree::new(repo.clone())
             .unwrap()
             .with_init_submodules(false);
-        let mut previous_hook = None;
-        for (hook_name, action) in [
-            ("post-checkout", "rename"),
-            ("post-checkout", "owner"),
-            ("post-checkout", "adopt"),
-            ("post-checkout", "commit"),
-            ("post-checkout", "detached-commit"),
-            ("post-checkout", "detached-rename"),
-            ("post-checkout", "dirty"),
-            ("post-checkout", "preexisting"),
-            ("post-index-change", "rename"),
-            ("reference-transaction", "rename"),
-            ("post-index-change", "adopt"),
-            ("post-index-change", "commit"),
-            ("post-index-change", "switch"),
-        ] {
-            if let Some(previous) = previous_hook.take() {
-                fs::remove_file(previous).unwrap();
-            }
-            let case = format!("{hook_name}-{action}");
-            let owner_name = format!("owner-{case}");
-            let peer_name = format!("peer-{case}");
-            let owner = crate::session::Storage::new_unwatched(&owner_name).unwrap();
-            let peer = crate::session::Storage::new_unwatched(&peer_name).unwrap();
-            let target = fixture.path().join(&case);
-            let detached = action.starts_with("detached-");
-            let branch = if detached {
-                let repository = git2::Repository::open(&repo).unwrap();
-                let name = format!("origin/topic-{case}");
-                repository
-                    .reference(
-                        &format!("refs/remotes/{name}"),
-                        repository.head().unwrap().target().unwrap(),
-                        false,
-                        "fixture",
-                    )
-                    .unwrap();
-                name
-            } else {
-                format!("topic-{case}")
-            };
-            let hook = repo.join(".git/hooks").join(hook_name);
-            if action == "switch" {
-                let repository = git2::Repository::open(&repo).unwrap();
-                repository
-                    .branch(
-                        &branch,
-                        &repository.head().unwrap().peel_to_commit().unwrap(),
-                        false,
-                    )
-                    .unwrap();
-            }
-            if action == "preexisting" {
-                git.create_worktree(&branch, &target, true, Some("main"))
-                    .unwrap();
-            }
-            let profile = if matches!(
-                action,
-                "owner" | "commit" | "dirty" | "detached-commit" | "detached-rename"
-            ) {
-                &owner_name
-            } else {
-                &peer_name
-            };
-            let marker = fixture.path().join(format!("entered-{case}"));
-            let phase = if hook_name == "reference-transaction" {
-                "[ \"$1\" = prepared ] || exit 0\n"
-            } else {
-                ""
-            };
-            fs::write(&hook, format!(
+        if phase == "callbacks" {
+            let mut previous_hook = None;
+            for (hook_name, action) in [
+                ("post-checkout", "rename"),
+                ("post-checkout", "owner"),
+                ("post-checkout", "adopt"),
+                ("post-checkout", "commit"),
+                ("post-checkout", "detached-commit"),
+                ("post-checkout", "detached-rename"),
+                ("post-checkout", "dirty"),
+                ("post-checkout", "preexisting"),
+                ("post-index-change", "rename"),
+                ("reference-transaction", "rename"),
+                ("post-index-change", "adopt"),
+                ("post-index-change", "commit"),
+                ("post-index-change", "switch"),
+            ] {
+                if let Some(previous) = previous_hook.take() {
+                    fs::remove_file(previous).unwrap();
+                }
+                let case = format!("{hook_name}-{action}");
+                let owner_name = format!("owner-{case}");
+                let peer_name = format!("peer-{case}");
+                let owner = crate::session::Storage::new_unwatched(&owner_name).unwrap();
+                let peer = crate::session::Storage::new_unwatched(&peer_name).unwrap();
+                let target = fixture.path().join(&case);
+                let detached = action.starts_with("detached-");
+                let branch = if detached {
+                    let repository = git2::Repository::open(&repo).unwrap();
+                    let name = format!("origin/topic-{case}");
+                    repository
+                        .reference(
+                            &format!("refs/remotes/{name}"),
+                            repository.head().unwrap().target().unwrap(),
+                            false,
+                            "fixture",
+                        )
+                        .unwrap();
+                    name
+                } else {
+                    format!("topic-{case}")
+                };
+                let hook = repo.join(".git/hooks").join(hook_name);
+                if action == "switch" {
+                    let repository = git2::Repository::open(&repo).unwrap();
+                    repository
+                        .branch(
+                            &branch,
+                            &repository.head().unwrap().peel_to_commit().unwrap(),
+                            false,
+                        )
+                        .unwrap();
+                }
+                if action == "preexisting" {
+                    git.create_worktree(&branch, &target, true, Some("main"))
+                        .unwrap();
+                }
+                let profile = if matches!(
+                    action,
+                    "owner" | "commit" | "dirty" | "detached-commit" | "detached-rename"
+                ) {
+                    &owner_name
+                } else {
+                    &peer_name
+                };
+                let marker = fixture.path().join(format!("entered-{case}"));
+                let phase = if hook_name == "reference-transaction" {
+                    "[ \"$1\" = prepared ] || exit 0\n"
+                } else {
+                    ""
+                };
+                fs::write(&hook, format!(
                 "#!/bin/sh\n{phase}[ ! -e {marker} ] || exit 0\n: > {marker}\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={profile} AOE_TEST_NATIVE_ACTION={action}\nexec {exe} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n",
                 marker = crate::session::environment::shell_escape(&marker.to_string_lossy()),
                 exe = crate::session::environment::shell_escape(&exe.to_string_lossy()),
             )).unwrap();
-            fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
-            previous_hook = Some(hook);
-            let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
-            let result = crate::session::native_hooks::create_worktree(
-                &mut ownership,
-                Some(&owner),
-                &git,
-                (&repo, &target, &branch),
-                action != "switch" && !detached,
-                Some("main"),
-                None,
-            );
-            if action == "rename" {
-                result.unwrap().1.verify().unwrap();
-                assert!(
-                    crate::session::Storage::open_unwatched(&format!("{peer_name}-renamed"))
-                        .is_ok()
+                fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+                previous_hook = Some(hook);
+                let mut ownership =
+                    Some(crate::session::storage::acquire_ownership_read().unwrap());
+                let result = crate::session::native_hooks::create_worktree(
+                    &mut ownership,
+                    Some(&owner),
+                    &git,
+                    (&repo, &target, &branch),
+                    action != "switch" && !detached,
+                    Some("main"),
+                    None,
                 );
-                assert!(crate::session::Storage::open_unwatched(&peer_name).is_err());
-            } else {
-                assert!(
-                    result.is_err(),
-                    "{action} must invalidate creation authority"
-                );
-                if action == "adopt" {
-                    assert_eq!(
-                        fs::canonicalize(&peer.load().unwrap()[0].project_path).unwrap(),
-                        fs::canonicalize(&target).unwrap()
+                if action == "rename" {
+                    result.unwrap().1.verify().unwrap();
+                    assert!(crate::session::Storage::open_unwatched(&format!(
+                        "{peer_name}-renamed"
+                    ))
+                    .is_ok());
+                    assert!(crate::session::Storage::open_unwatched(&peer_name).is_err());
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{action} must invalidate creation authority"
                     );
-                    assert!(target.join("tracked").exists());
-                } else if action == "commit" {
-                    let repository = git2::Repository::open(&repo).unwrap();
-                    let commit = repository
-                        .find_branch(&branch, git2::BranchType::Local)
-                        .unwrap()
-                        .get()
-                        .peel_to_commit()
-                        .unwrap();
-                    let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
-                    assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
-                } else if action == "detached-commit" {
-                    let repository = git2::Repository::open(&target).unwrap();
-                    assert!(repository.head_detached().unwrap());
-                    let commit = repository.head().unwrap().peel_to_commit().unwrap();
-                    let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
-                    assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
-                } else if action == "detached-rename" {
-                    assert!(!target.exists());
-                    assert!(git
-                        .list_worktrees()
-                        .unwrap()
-                        .iter()
-                        .all(|worktree| worktree.path != target));
-                } else if action == "dirty" {
-                    assert_eq!(fs::read(target.join("untracked")).unwrap(), b"callback");
-                } else if action == "preexisting" {
-                    assert!(target.join("tracked").exists());
-                    assert!(git2::Repository::open(&repo)
-                        .unwrap()
-                        .find_branch(&branch, git2::BranchType::Local)
-                        .is_ok());
-                } else if action == "switch" {
-                    assert_eq!(
-                        git2::Repository::open(&target)
+                    if action == "adopt" {
+                        assert_eq!(
+                            fs::canonicalize(&peer.load().unwrap()[0].project_path).unwrap(),
+                            fs::canonicalize(&target).unwrap()
+                        );
+                        assert!(target.join("tracked").exists());
+                    } else if action == "commit" {
+                        let repository = git2::Repository::open(&repo).unwrap();
+                        let commit = repository
+                            .find_branch(&branch, git2::BranchType::Local)
                             .unwrap()
-                            .head()
+                            .get()
+                            .peel_to_commit()
+                            .unwrap();
+                        let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
+                        assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
+                    } else if action == "detached-commit" {
+                        let repository = git2::Repository::open(&target).unwrap();
+                        assert!(repository.head_detached().unwrap());
+                        let commit = repository.head().unwrap().peel_to_commit().unwrap();
+                        let entry = commit.tree().unwrap().get_name("tracked").unwrap().id();
+                        assert_eq!(repository.find_blob(entry).unwrap().content(), b"callback");
+                    } else if action == "detached-rename" {
+                        assert!(!target.exists());
+                        assert!(git
+                            .list_worktrees()
                             .unwrap()
-                            .name()
-                            .unwrap(),
-                        "refs/heads/main"
-                    );
+                            .iter()
+                            .all(|worktree| worktree.path != target));
+                    } else if action == "dirty" {
+                        assert_eq!(fs::read(target.join("untracked")).unwrap(), b"callback");
+                    } else if action == "preexisting" {
+                        assert!(target.join("tracked").exists());
+                        assert!(git2::Repository::open(&repo)
+                            .unwrap()
+                            .find_branch(&branch, git2::BranchType::Local)
+                            .is_ok());
+                    } else if action == "switch" {
+                        assert_eq!(
+                            git2::Repository::open(&target)
+                                .unwrap()
+                                .head()
+                                .unwrap()
+                                .name()
+                                .unwrap(),
+                            "refs/heads/main"
+                        );
+                    }
                 }
             }
+            fs::remove_file(previous_hook.unwrap()).unwrap();
+            return;
         }
-        fs::remove_file(previous_hook.unwrap()).unwrap();
-        for (case, active) in [
-            ("installed", true),
-            ("enabled", true),
-            ("removed", false),
-            ("disabled", false),
-        ] {
-            let owner =
-                crate::session::Storage::new_unwatched(&format!("owner-dynamic-{case}")).unwrap();
-            let peer_name = format!("peer-dynamic-{case}");
-            crate::session::Storage::new_unwatched(&peer_name).unwrap();
-            let checkout_hook = repo.join(".git/hooks/post-checkout");
-            let index_hook = repo.join(".git/hooks/post-index-change");
-            let quote = crate::session::environment::shell_escape;
-            let payload = format!("#!/bin/sh\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={peer_name} AOE_TEST_NATIVE_ACTION=rename\nexec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n", quote(&exe.to_string_lossy()));
-            if case != "installed" {
-                fs::write(&checkout_hook, &payload).unwrap();
-                fs::set_permissions(
-                    &checkout_hook,
-                    fs::Permissions::from_mode(if case == "enabled" { 0o600 } else { 0o700 }),
+        if phase == "dynamic" {
+            for (case, active) in [
+                ("installed", true),
+                ("enabled", true),
+                ("removed", false),
+                ("disabled", false),
+            ] {
+                let owner =
+                    crate::session::Storage::new_unwatched(&format!("owner-dynamic-{case}"))
+                        .unwrap();
+                let peer_name = format!("peer-dynamic-{case}");
+                crate::session::Storage::new_unwatched(&peer_name).unwrap();
+                let checkout_hook = repo.join(".git/hooks/post-checkout");
+                let index_hook = repo.join(".git/hooks/post-index-change");
+                let quote = crate::session::environment::shell_escape;
+                let payload = format!("#!/bin/sh\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={peer_name} AOE_TEST_NATIVE_ACTION=rename\nexec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n", quote(&exe.to_string_lossy()));
+                if case != "installed" {
+                    fs::write(&checkout_hook, &payload).unwrap();
+                    fs::set_permissions(
+                        &checkout_hook,
+                        fs::Permissions::from_mode(if case == "enabled" { 0o600 } else { 0o700 }),
+                    )
+                    .unwrap();
+                }
+                let effect = match case {
+                    "installed" => format!(
+                        "printf '%s' {} > {}; chmod 700 {}",
+                        crate::session::environment::shell_escape_script_word(&payload),
+                        quote(&checkout_hook.to_string_lossy()),
+                        quote(&checkout_hook.to_string_lossy())
+                    ),
+                    "enabled" => format!("chmod 700 {}", quote(&checkout_hook.to_string_lossy())),
+                    "removed" => format!("rm -f {}", quote(&checkout_hook.to_string_lossy())),
+                    _ => format!("chmod 600 {}", quote(&checkout_hook.to_string_lossy())),
+                };
+                fs::write(&index_hook, format!("#!/bin/sh\n{effect}\n")).unwrap();
+                fs::set_permissions(&index_hook, fs::Permissions::from_mode(0o700)).unwrap();
+                let target = fixture.path().join(format!("dynamic-{case}"));
+                let mut ownership =
+                    Some(crate::session::storage::acquire_ownership_read().unwrap());
+                let (warnings, _) = crate::session::native_hooks::create_worktree(
+                    &mut ownership,
+                    Some(&owner),
+                    &git,
+                    (&repo, &target, &format!("dynamic-{case}")),
+                    true,
+                    Some("main"),
+                    None,
                 )
                 .unwrap();
+                drop(ownership);
+                assert_eq!(
+                    crate::session::Storage::open_unwatched(&peer_name).is_ok(),
+                    !active,
+                    "{case}: {warnings:?}; payload={:?}",
+                    fs::read_to_string(&checkout_hook)
+                );
+                assert_eq!(
+                    crate::session::Storage::open_unwatched(&format!("{peer_name}-renamed"))
+                        .is_ok(),
+                    active,
+                    "{case}: {warnings:?}"
+                );
+                assert_eq!(fs::read(target.join("tracked")).unwrap(), b"base\n");
+                fs::remove_file(index_hook).unwrap();
+                if checkout_hook.exists() {
+                    fs::remove_file(checkout_hook).unwrap();
+                }
             }
-            let effect = match case {
-                "installed" => format!(
-                    "printf '%s' {} > {}; chmod 700 {}",
-                    crate::session::environment::shell_escape_script_word(&payload),
-                    quote(&checkout_hook.to_string_lossy()),
-                    quote(&checkout_hook.to_string_lossy())
-                ),
-                "enabled" => format!("chmod 700 {}", quote(&checkout_hook.to_string_lossy())),
-                "removed" => format!("rm -f {}", quote(&checkout_hook.to_string_lossy())),
-                _ => format!("chmod 600 {}", quote(&checkout_hook.to_string_lossy())),
-            };
-            fs::write(&index_hook, format!("#!/bin/sh\n{effect}\n")).unwrap();
-            fs::set_permissions(&index_hook, fs::Permissions::from_mode(0o700)).unwrap();
-            let target = fixture.path().join(format!("dynamic-{case}"));
-            let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
-            let (warnings, _) = crate::session::native_hooks::create_worktree(
-                &mut ownership,
-                Some(&owner),
-                &git,
-                (&repo, &target, &format!("dynamic-{case}")),
-                true,
-                Some("main"),
-                None,
-            )
-            .unwrap();
-            drop(ownership);
-            assert_eq!(
-                crate::session::Storage::open_unwatched(&peer_name).is_ok(),
-                !active,
-                "{case}: {warnings:?}; payload={:?}",
-                fs::read_to_string(&checkout_hook)
-            );
-            assert_eq!(
-                crate::session::Storage::open_unwatched(&format!("{peer_name}-renamed")).is_ok(),
-                active,
-                "{case}: {warnings:?}"
-            );
-            assert_eq!(fs::read(target.join("tracked")).unwrap(), b"base\n");
-            fs::remove_file(index_hook).unwrap();
-            if checkout_hook.exists() {
-                fs::remove_file(checkout_hook).unwrap();
-            }
+            return;
         }
-        {
+        if phase == "remote" {
             let repository = git2::Repository::open(&repo).unwrap();
             let tip = repository.head().unwrap().target().unwrap();
             repository.remote("origin", repo.to_str().unwrap()).unwrap();
@@ -1605,6 +1624,7 @@ mod tests {
                 .head_detached()
                 .unwrap());
             repository.remote_delete("origin").unwrap();
+            return;
         }
         use crate::session::builder::{create_workspace_with_ownership, WorkspaceRepoSpec};
         let extra = fixture.path().join("extra");
