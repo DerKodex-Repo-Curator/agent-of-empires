@@ -163,6 +163,7 @@ pub(crate) async fn spawn_structured_session(
             .filter(|b| !b.is_empty());
 
         let params = InstanceParams {
+            provisional_creation: None,
             title,
             title_typed: false,
             path,

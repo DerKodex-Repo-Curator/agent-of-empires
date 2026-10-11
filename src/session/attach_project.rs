@@ -638,6 +638,7 @@ impl AttachOwner<'_> {
             Some(storage),
             Some(self),
             checkout,
+            None,
         )?;
         let result = lease.create(git, create_branch, base);
         let receipt = lease.receipt(create_branch);

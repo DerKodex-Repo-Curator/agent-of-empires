@@ -1117,10 +1117,135 @@ fn cancel_during_on_create_skips_on_launch() {
     assert!(storage.load().unwrap().is_empty());
 }
 
-/// A peer can commit the same title/path while the background builder waits for
-/// finalization. The duplicate rollback must preserve every resource the persisted winner
-/// references and its own pre-existing empty group, while discarding the losing stub's
-/// provisional group, in memory and across a later save.
+#[test]
+#[serial]
+fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct ReleaseNative<'a>(&'a std::path::Path);
+    impl Drop for ReleaseNative<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0, b"release");
+        }
+    }
+
+    for claimant in ["none", "foreign", "redirected", "queued"] {
+        let mut env = setup_creation_test_env();
+        let entered = env._temp.path().join("native-entered");
+        let release = env._temp.path().join("native-release");
+        let hook = env.project_dir.join(".git/hooks/post-checkout");
+        let quote = crate::session::environment::shell_escape;
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$PWD\" > {}.tmp\nmv {}.tmp {}\nwhile [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done\n",
+                quote(&entered.to_string_lossy()),
+                quote(&entered.to_string_lossy()),
+                quote(&entered.to_string_lossy()),
+                quote(&release.to_string_lossy()),
+                quote(&env._temp.path().to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _release_native = ReleaseNative(&release);
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        let mut data = creation_data(&env.project_dir, "Native stub", "");
+        data.worktree_enabled = true;
+        data.worktree_branch = Some("native-stub".into());
+        data.create_new_branch = true;
+        env.view.request_creation(data, None);
+        let stub_id = env.view.creating_stub_id.clone().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !entered.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native callback did not enter"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let target = std::path::PathBuf::from(std::fs::read_to_string(&entered).unwrap());
+        env.view.save().unwrap();
+        let saved = env.storage.load().unwrap();
+        assert!(saved
+            .iter()
+            .any(|row| row.id == stub_id && row.status == Status::Creating));
+        let mut owner_id = match claimant {
+            "foreign" => {
+                let mut owner = Instance::new("Foreign creator", target.to_str().unwrap());
+                owner.status = Status::Creating;
+                owner.worktree_info = Some(crate::session::WorktreeInfo {
+                    branch: "native-stub".into(),
+                    main_repo_path: env.project_dir.to_str().unwrap().into(),
+                    managed_by_aoe: false,
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+                let id = owner.id.clone();
+                env.storage
+                    .update(|rows, _| {
+                        rows.push(owner);
+                        Ok(())
+                    })
+                    .unwrap();
+                Some(id)
+            }
+            "redirected" => {
+                env.storage
+                    .update(|rows, _| {
+                        rows.iter_mut()
+                            .find(|row| row.id == stub_id)
+                            .unwrap()
+                            .project_path = target.to_str().unwrap().into();
+                        Ok(())
+                    })
+                    .unwrap();
+                Some(stub_id.clone())
+            }
+            _ => None,
+        };
+        std::fs::write(&release, b"release").unwrap();
+        queued
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker queued its real result");
+        if claimant == "queued" {
+            env.storage
+                .update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == stub_id)
+                        .unwrap()
+                        .project_path = target.to_string_lossy().into_owned();
+                    Ok(())
+                })
+                .unwrap();
+            owner_id = Some(stub_id.clone());
+        }
+        let created = drain_creation_result(&mut env.view);
+        env.view.save().unwrap();
+        if let Some(owner_id) = owner_id {
+            assert_eq!(created, None, "{claimant} must invalidate publication");
+            assert!(env
+                .storage
+                .load()
+                .unwrap()
+                .iter()
+                .any(|row| row.id == owner_id));
+        } else {
+            let id =
+                created.expect("saving the unchanged originating stub must not cancel creation");
+            let rows = env.storage.load().unwrap();
+            assert!(rows.iter().any(|row| row.id == id));
+            assert!(rows.iter().all(|row| row.id != stub_id));
+        }
+        assert_eq!(std::fs::read(target.join("README.md")).unwrap(), b"test\n");
+        assert!(git2::Repository::open(&env.project_dir)
+            .unwrap()
+            .find_branch("native-stub", git2::BranchType::Local)
+            .is_ok());
+    }
+}
+
+/// A publication collision retains the committed owner and pre-existing groups.
 #[test]
 #[serial]
 fn apply_creation_results_rolls_back_on_peer_collision() {
@@ -1155,6 +1280,7 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
     raced.worktree_enabled = true;
     raced.worktree_branch = Some(branch.to_string());
     raced.create_new_branch = true;
+    let queued = view.creation_poller.observe_next_queued_result();
     view.request_creation(raced, None);
     let raced_stub_id = view
         .creating_stub_id
@@ -1174,23 +1300,16 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
 
     let main_repo_path = project_dir.canonicalize().unwrap();
     let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
-    let start = std::time::Instant::now();
-    let winner_path = loop {
-        if let Some(path) = git
-            .list_worktrees()
-            .unwrap()
-            .into_iter()
-            .find(|worktree| worktree.branch.as_deref() == Some(branch))
-            .map(|worktree| worktree.path)
-        {
-            break path;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "background worktree creation timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("worker queued its real result before the publication collision");
+    let winner_path = git
+        .list_worktrees()
+        .unwrap()
+        .into_iter()
+        .find(|worktree| worktree.branch.as_deref() == Some(branch))
+        .expect("successful producer must leave its worktree registered")
+        .path;
 
     let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
     owner.source_profile = "default".to_string();
@@ -1215,7 +1334,12 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
         view.creating_provisional_group_paths.is_empty(),
         "rollback must leave no provisional group paths behind"
     );
-    assert!(view.info_dialog.is_some());
+    assert_eq!(
+        view.get_instance(&owner_id)
+            .map(|row| row.project_path.as_str()),
+        Some(winner_path.to_str().unwrap()),
+        "duplicate rejection must reload the authoritative owner",
+    );
     assert!(
         winner_path.is_dir(),
         "rollback must preserve the winner's worktree"
@@ -1418,6 +1542,7 @@ esac
             existing_instances: vec![],
             hooks,
             cancel: cancel.clone(),
+            provisional_creation: None,
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() && Instant::now() < deadline {

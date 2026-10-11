@@ -1027,6 +1027,7 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
                 (&repo, &target, &branch),
                 true,
                 Some("main"),
+                None,
             );
             if action == "rename" {
                 result.unwrap().1.verify().unwrap();
@@ -1096,7 +1097,7 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
             true,
             fixture.path().join("workspace/{branch}").to_str().unwrap(),
             false,
-            (&mut ownership, Some(&workspace_owner)),
+            (&mut ownership, Some(&workspace_owner), None),
         );
         assert!(
             result.is_err(),
@@ -1170,6 +1171,7 @@ exec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --n
             (&repo, &target, "submodule-checkout"),
             true,
             Some("main"),
+            None,
         )
         .unwrap()
         .1

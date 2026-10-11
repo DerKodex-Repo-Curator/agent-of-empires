@@ -39,7 +39,49 @@ pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _ownership: Option<crate::session::storage::OwnershipGuard>,
 }
 
+fn retire_provisional_stub(
+    profile: &str,
+    id: &str,
+    provisional: &crate::session::builder::ProvisionalCreation,
+    provisional_groups: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let ownership = crate::session::storage::acquire_ownership_read()?;
+    provisional.profile_directory.verify()?;
+    let storage = Storage::open_unwatched_with_ownership(profile, &ownership)?;
+    provisional.verify_profile(&storage)?;
+    storage.update_with_ownership(&ownership, |rows, groups| {
+        let Some(index) = rows.iter().position(|row| row.id == id) else {
+            return Ok(());
+        };
+        if provisional.matches_instance(&rows[index])? {
+            rows.remove(index);
+            groups.retain(|group| !provisional_groups.contains(&group.path));
+            *groups = GroupTree::new_with_groups(rows, groups).get_all_groups();
+        }
+        Ok(())
+    })
+}
+
 impl HomeView {
+    fn forget_creation_stub(
+        &mut self,
+        id: &str,
+        provisional: Option<&crate::session::builder::ProvisionalCreation>,
+    ) {
+        if provisional.is_none() {
+            self.remove_instance(id);
+            return;
+        }
+        if let Some(instance) = self.instances.shift_remove(id) {
+            if let Some(deletions) = self.pending_deletions.get_mut(&instance.source_profile) {
+                deletions.remove(id);
+            }
+            if let Some(added) = self.pending_added.get_mut(&instance.source_profile) {
+                added.remove(id);
+            }
+        }
+    }
+
     /// Request background session creation, used for sandbox sessions so the UI does not
     /// block. A `Status::Creating` stub appears in the list, so progress shows in the
     /// preview pane while the TUI stays usable.
@@ -113,6 +155,23 @@ impl HomeView {
             });
         }
 
+        let provisional_creation = if data.worktree_enabled || !data.extra_repo_paths.is_empty() {
+            match Storage::open_unwatched(&data.profile).and_then(|storage| {
+                crate::session::builder::ProvisionalCreation::capture(&storage, &stub)
+            }) {
+                Ok(provisional) => Some(std::sync::Arc::new(provisional)),
+                Err(error) => {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Creation Failed",
+                        &format!("{error:#}"),
+                    ));
+                    self.new_dialog = None;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let stub_id = stub.id.clone();
         let target_profile = data.profile.clone();
         let existing_group_paths: HashSet<String> = self
@@ -155,6 +214,7 @@ impl HomeView {
             },
         );
         self.creating_stub_id = Some(stub_id.clone());
+        self.creating_provisional_creation = provisional_creation.clone();
         self.rebuild_flat_items();
 
         // Move cursor to the new stub
@@ -185,6 +245,7 @@ impl HomeView {
             existing_instances,
             hooks,
             cancel,
+            provisional_creation,
         };
         self.creation_poller.request_creation(request);
     }
@@ -194,10 +255,29 @@ impl HomeView {
         if let Some(cancel) = self.creation_cancel.take() {
             cancel.cancel();
         }
-        // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
-            self.creating_provisional_group_paths.clear();
-            self.remove_instance(&stub_id);
+            let provisional = self.creating_provisional_creation.take();
+            let groups = std::mem::take(&mut self.creating_provisional_group_paths);
+            let profile = self
+                .get_instance(&stub_id)
+                .map(|row| row.source_profile.clone());
+            self.forget_creation_stub(&stub_id, provisional.as_deref());
+            if let (Some(provisional), Some(profile)) = (provisional, profile) {
+                if let Err(error) =
+                    retire_provisional_stub(&profile, &stub_id, &provisional, &groups)
+                {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Cancellation cleanup failed",
+                        &format!("{error:#}"),
+                    ));
+                }
+                if let Err(error) = self.reload() {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Cancellation reload failed",
+                        &format!("{error:#}"),
+                    ));
+                }
+            }
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
             self.rebuild_flat_items();
@@ -231,6 +311,7 @@ impl HomeView {
 
         self.creation_cancel = None;
         let stub_id = self.creating_stub_id.take();
+        let provisional = self.creating_provisional_creation.take();
         // Taken, not borrowed, so every early return leaves the field empty: the
         // provisional group paths belong to this stub alone and must not carry into the
         // next creation.
@@ -252,7 +333,7 @@ impl HomeView {
                     witness,
                 } = *success;
                 if let Some(id) = &stub_id {
-                    self.remove_instance(id);
+                    self.forget_creation_stub(id, provisional.as_deref());
                 }
 
                 let mut instance = instance;
@@ -275,7 +356,7 @@ impl HomeView {
                         Ok(storage) => {
                             self.storages.insert(target_profile.clone(), storage);
                         }
-                        Err(error) => {
+                        Err(mut error) => {
                             drop(ownership.take());
                             cleanup_creation_resources(
                                 &instance,
@@ -284,9 +365,23 @@ impl HomeView {
                                 None,
                                 &witness,
                             );
+                            if let (Some(id), Some(provisional)) =
+                                (stub_id.as_deref(), provisional.as_deref())
+                            {
+                                if let Err(retire_error) = retire_provisional_stub(
+                                    &target_profile,
+                                    id,
+                                    provisional,
+                                    &provisional_group_paths,
+                                ) {
+                                    error = error.context(format!(
+                                        "Failed to retire creation placeholder: {retire_error:#}"
+                                    ));
+                                }
+                            }
                             self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
-                                &format!("Failed to open profile storage: {error}"),
+                                &format!("Failed to open profile storage: {error:#}"),
                             ));
                             self.new_dialog = None;
                             self.rebuild_group_trees();
@@ -306,15 +401,24 @@ impl HomeView {
                     ownership.as_ref().expect("creation ownership reacquired"),
                     |instances, groups| {
                         witness.validate(&instance)?;
-                        // `save()` can run while the builder works and persist the
-                        // placeholder, so remove that exact row under the same storage lock used
-                        // for collision detection and insertion, or it collides with its own
-                        // result.
-                        let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
-                            let before = instances.len();
-                            instances.retain(|row| row.id != stub_id);
-                            instances.len() != before
-                        });
+                        if let Some(provisional) = provisional.as_deref() {
+                            provisional.verify_profile(storage)?;
+                        }
+                        let removed_persisted_stub = if let Some(index) = stub_id
+                            .as_deref()
+                            .and_then(|id| instances.iter().position(|row| row.id == id))
+                        {
+                            if let Some(provisional) = provisional.as_deref() {
+                                anyhow::ensure!(
+                                    provisional.matches_instance(&instances[index])?,
+                                    "Creating placeholder changed before publication"
+                                );
+                            }
+                            instances.remove(index);
+                            true
+                        } else {
+                            false
+                        };
                         if removed_persisted_stub && !provisional_group_paths.is_empty() {
                             groups.retain(|group| !provisional_group_paths.contains(&group.path));
                             // A peer may have committed another row into one of these paths,
@@ -364,56 +468,70 @@ impl HomeView {
                         }
                         return None;
                     }
-                    Err(error) => match storage.load() {
-                        Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
-                            warnings.push(format!(
+                    Err(mut error) => {
+                        match storage.load() {
+                            Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
+                                warnings.push(format!(
                                 "Session metadata was written, but finalizing profile storage reported an error: {error}"
                             ));
-                        }
-                        Ok(instances) => {
-                            let owner = crate::session::find_duplicate_session(
-                                &instances,
-                                &instance.title,
-                                &instance.project_path,
-                                None,
-                            )
-                            .cloned();
-                            drop(ownership.take());
-                            cleanup_creation_resources(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                owner.as_ref(),
-                                &witness,
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!("Failed to save session: {error}"),
-                            ));
-                            self.new_dialog = None;
-                            if let Err(reload_error) = self.reload() {
-                                tracing::warn!(
-                                    target: "tui.home",
-                                    "Failed to reload authoritative state after creation rollback: {reload_error}"
-                                );
                             }
-                            return None;
-                        }
-                        Err(verify_error) => {
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            Ok(instances) => {
+                                let owner = crate::session::find_duplicate_session(
+                                    &instances,
+                                    &instance.title,
+                                    &instance.project_path,
+                                    None,
+                                )
+                                .cloned();
+                                drop(ownership.take());
+                                cleanup_creation_resources(
+                                    &instance,
+                                    created_worktree.as_ref(),
+                                    &created_workspace_worktrees,
+                                    owner.as_ref(),
+                                    &witness,
+                                );
+                                if let (Some(id), Some(provisional)) =
+                                    (stub_id.as_deref(), provisional.as_deref())
+                                {
+                                    if let Err(retire_error) = retire_provisional_stub(
+                                        &target_profile,
+                                        id,
+                                        provisional,
+                                        &provisional_group_paths,
+                                    ) {
+                                        error = error.context(format!("Failed to retire creation placeholder: {retire_error:#}"));
+                                    }
+                                }
+                                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                    "Creation Failed",
+                                    &format!("Failed to save session: {error:#}"),
+                                ));
+                                self.new_dialog = None;
+                                if let Err(reload_error) = self.reload() {
+                                    tracing::warn!(
+                                        target: "tui.home",
+                                        "Failed to reload authoritative state after creation rollback: {reload_error}"
+                                    );
+                                }
+                                return None;
+                            }
+                            Err(verify_error) => {
+                                self.info_dialog = Some(InfoDialog::sized_to_fit(
                                 "Creation Failed",
                                 &format!(
                                     "Failed to save session and could not verify the result: {error}\n\
                                      Created resources were retained to avoid deleting a persisted session: {verify_error}"
                                 ),
                             ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
+                                self.new_dialog = None;
+                                self.rebuild_group_trees();
+                                self.rebuild_flat_items();
+                                self.update_selected();
+                                return None;
+                            }
                         }
-                    },
+                    }
                 }
 
                 crate::tips::record_session_creations(1);
@@ -462,13 +580,25 @@ impl HomeView {
 
                 Some(session_id)
             }
-            CreationResult::Error(error) => {
+            CreationResult::Error(mut error) => {
                 if let Some(id) = &stub_id {
                     let profile = self
                         .get_instance(id)
                         .map(|instance| instance.source_profile.clone());
-                    self.remove_instance(id);
+                    self.forget_creation_stub(id, provisional.as_deref());
                     if let Some(profile) = profile {
+                        if let Some(provisional) = provisional.as_deref() {
+                            if let Err(retire_error) = retire_provisional_stub(
+                                &profile,
+                                id,
+                                provisional,
+                                &provisional_group_paths,
+                            ) {
+                                error.push_str(&format!(
+                                    "\nFailed to retire creation placeholder: {retire_error:#}"
+                                ));
+                            }
+                        }
                         let instances = self.cloned_instances_for_profile(&profile);
                         if let Some(tree) = self.group_trees.get_mut(&profile) {
                             let mut groups = tree.get_all_groups();
@@ -480,6 +610,13 @@ impl HomeView {
                                 .entry(profile)
                                 .or_default()
                                 .extend(provisional_group_paths);
+                        }
+                    }
+                    if provisional.is_some() {
+                        if let Err(reload_error) = self.reload() {
+                            error.push_str(&format!(
+                                "\nFailed to reload authoritative state: {reload_error:#}"
+                            ));
                         }
                     }
                     self.rebuild_flat_items();

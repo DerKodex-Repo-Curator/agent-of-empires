@@ -156,6 +156,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             repo_base_branches: Vec::new(),
             scratch: data.scratch,
             fork_seed: data.fork_seed,
+            provisional_creation: None,
         }
     }
 }

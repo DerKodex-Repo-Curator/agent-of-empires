@@ -19,6 +19,7 @@ pub struct CreationRequest {
     /// Trusted hooks to execute after instance creation (already approved by user).
     pub hooks: Option<ResolvedHooks>,
     pub cancel: CancellationToken,
+    pub provisional_creation: Option<std::sync::Arc<builder::ProvisionalCreation>>,
 }
 
 pub struct CreationSuccess {
@@ -176,7 +177,8 @@ impl CreationPoller {
         // `structured` is applied post-build (mirrors the web create
         // handler); read it off before the params conversion consumes data.
         let structured = data.structured;
-        let params = InstanceParams::from(data);
+        let mut params = InstanceParams::from(data);
+        params.provisional_creation = request.provisional_creation;
 
         let build_result =
             match builder::build_instance(params, &existing_titles, &existing_branches, &profile) {

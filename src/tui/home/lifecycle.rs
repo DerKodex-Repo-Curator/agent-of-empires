@@ -400,6 +400,7 @@ impl HomeView {
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
+            creating_provisional_creation: None,
             creating_provisional_group_paths: HashSet::new(),
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),

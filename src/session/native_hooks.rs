@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use super::builder::{CheckoutWitness, CleanupProtection, CreatedWorktree, DirectoryWitness};
+use super::builder::{
+    CheckoutWitness, CleanupProtection, CreatedWorktree, DirectoryWitness, ProvisionalCreation,
+};
 use super::storage::{self, OwnershipGuard};
 use super::Storage;
 
@@ -13,16 +15,87 @@ pub(crate) trait NativeOwner {
     fn restore(&mut self, ownership: &OwnershipGuard) -> Result<()>;
 }
 
-#[derive(Hash, PartialEq, Eq)]
-struct Claim {
-    profile: (u64, u64),
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub(crate) profile: (u64, u64),
     id: String,
     born: chrono::DateTime<chrono::Utc>,
     path: PathBuf,
     branch: Option<(PathBuf, String)>,
 }
 
-fn inventory(ownership: &OwnershipGuard) -> Result<(HashSet<Claim>, Vec<DirectoryWitness>)> {
+impl Claim {
+    pub(crate) fn from_instance(profile: (u64, u64), row: &super::Instance) -> Result<Self> {
+        Self::for_path(
+            profile,
+            row,
+            &row.project_path,
+            row.worktree_info
+                .as_ref()
+                .map(|wt| (wt.main_repo_path.as_str(), wt.branch.as_str())),
+        )
+    }
+
+    pub(crate) fn matches_instance(&self, row: &super::Instance) -> Result<bool> {
+        if self.id != row.id || self.born != row.created_at {
+            return Ok(false);
+        }
+        let path = super::deletion::resolve_claim_path(Path::new(&row.project_path))
+            .context("unresolved checkout claim")?;
+        if path != self.path {
+            return Ok(false);
+        }
+        match (&self.branch, &row.worktree_info) {
+            (None, None) => Ok(true),
+            (Some((repo, branch)), Some(wt)) if branch == &wt.branch => {
+                if wt.main_repo_path == row.project_path {
+                    Ok(repo == &path)
+                } else {
+                    Ok(repo
+                        == &super::deletion::resolve_claim_path(Path::new(&wt.main_repo_path))
+                            .context("unresolved repository claim")?)
+                }
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn for_path(
+        profile: (u64, u64),
+        row: &super::Instance,
+        path: &str,
+        branch: Option<(&str, &str)>,
+    ) -> Result<Self> {
+        let resolved = super::deletion::resolve_claim_path(Path::new(path))
+            .context("unresolved checkout claim")?;
+        let branch = branch
+            .map(|(repo, branch)| -> Result<_> {
+                let repo = if repo == path {
+                    resolved.clone()
+                } else {
+                    super::deletion::resolve_claim_path(Path::new(repo))
+                        .context("unresolved repository claim")?
+                };
+                Ok((repo, branch.to_owned()))
+            })
+            .transpose()?;
+        Ok(Self {
+            profile,
+            id: row.id.clone(),
+            born: row.created_at,
+            path: resolved,
+            branch,
+        })
+    }
+}
+
+fn inventory(
+    ownership: &OwnershipGuard,
+    provisional: Option<&ProvisionalCreation>,
+) -> Result<(HashSet<Claim>, Vec<DirectoryWitness>)> {
+    if let Some(provisional) = provisional {
+        provisional.profile_directory.verify()?;
+    }
     let mut claims = HashSet::new();
     let mut directories = Vec::new();
     let mut seen = HashSet::new();
@@ -39,31 +112,21 @@ fn inventory(ownership: &OwnershipGuard) -> Result<(HashSet<Claim>, Vec<Director
                 .context("profile directory missing")?,
         )?);
         for row in storage.load_strict_for_worktree_ownership()? {
+            let primary = Claim::from_instance(physical, &row)?;
+            if let Some(provisional) =
+                provisional.filter(|p| p.claim.profile == physical && p.claim.id == row.id)
+            {
+                anyhow::ensure!(
+                    provisional.matches_claim(&row, &primary),
+                    "Creating placeholder changed during native Git creation"
+                );
+                continue;
+            }
+            claims.insert(primary);
             let mut add = |path: &str, branch: Option<(&str, &str)>| -> Result<()> {
-                claims.insert(Claim {
-                    profile: physical,
-                    id: row.id.clone(),
-                    born: row.created_at,
-                    path: super::deletion::resolve_claim_path(Path::new(path))
-                        .context("unresolved checkout claim")?,
-                    branch: branch
-                        .map(|(repo, branch)| -> Result<_> {
-                            Ok((
-                                super::deletion::resolve_claim_path(Path::new(repo))
-                                    .context("unresolved repository claim")?,
-                                branch.to_owned(),
-                            ))
-                        })
-                        .transpose()?,
-                });
+                claims.insert(Claim::for_path(physical, &row, path, branch)?);
                 Ok(())
             };
-            add(
-                &row.project_path,
-                row.worktree_info
-                    .as_ref()
-                    .map(|wt| (wt.main_repo_path.as_str(), wt.branch.as_str())),
-            )?;
             if let Some(path) = &row.pre_trash_project_path {
                 add(path, None)?;
             }
@@ -87,8 +150,11 @@ pub(crate) struct ClaimSnapshot {
 }
 
 impl ClaimSnapshot {
-    pub(crate) fn capture(root: &OwnershipGuard) -> Result<Self> {
-        let (claims, pins) = inventory(root)?;
+    pub(crate) fn capture(
+        root: &OwnershipGuard,
+        provisional: Option<&ProvisionalCreation>,
+    ) -> Result<Self> {
+        let (claims, pins) = inventory(root, provisional)?;
         Ok(Self {
             claims,
             _pins: pins,
@@ -101,8 +167,9 @@ impl ClaimSnapshot {
         main_repo: &Path,
         target: &Path,
         branch: &str,
+        provisional: Option<&ProvisionalCreation>,
     ) -> Result<()> {
-        verify_claims(root, &self.claims, main_repo, target, branch)
+        verify_claims(root, &self.claims, main_repo, target, branch, provisional)
     }
 }
 
@@ -112,8 +179,9 @@ fn verify_claims(
     main_repo: &Path,
     target: &Path,
     branch: &str,
+    provisional: Option<&ProvisionalCreation>,
 ) -> Result<()> {
-    let (claims, _pins) = inventory(root)?;
+    let (claims, _pins) = inventory(root, provisional)?;
     let target =
         super::deletion::resolve_claim_path(target).context("unresolved native checkout")?;
     let main_repo =
@@ -142,6 +210,7 @@ pub(crate) struct NativeLease<'a> {
     source_common: DirectoryWitness,
     profile_pins: Vec<DirectoryWitness>,
     claims: HashSet<Claim>,
+    provisional: Option<&'a ProvisionalCreation>,
     main_repo: PathBuf,
     path: PathBuf,
     branch: String,
@@ -156,13 +225,14 @@ impl<'a> NativeLease<'a> {
         profile: Option<&'a Storage>,
         owner: Option<&'a mut dyn NativeOwner>,
         checkout: (&Path, &Path, &str),
+        provisional: Option<&'a ProvisionalCreation>,
     ) -> Result<Self> {
         let (main_repo, path, branch) = checkout;
         let root = ownership
             .as_ref()
             .context("native Git ownership lease missing")?;
         let app_dir = root.app_dir().to_path_buf();
-        let (claims, profile_pins) = inventory(root)?;
+        let (claims, profile_pins) = inventory(root, provisional)?;
         let mut parent = path.parent().context("checkout parent missing")?;
         while !parent.exists() {
             parent = parent.parent().context("checkout ancestor missing")?;
@@ -182,7 +252,17 @@ impl<'a> NativeLease<'a> {
                     .parent()
                     .context("profile directory missing")?,
             )?);
+            if let Some(provisional) = provisional {
+                anyhow::ensure!(
+                    profile.physical_profile_identity()? == provisional.claim.profile,
+                    "Creation profile changed before native Git"
+                );
+            }
         }
+        anyhow::ensure!(
+            provisional.is_none() || profile.is_some(),
+            "Provisional creation profile missing"
+        );
         Ok(Self {
             ownership,
             exclusive,
@@ -194,6 +274,7 @@ impl<'a> NativeLease<'a> {
             source_common: DirectoryWitness::capture(repo.commondir())?,
             profile_pins,
             claims,
+            provisional,
             main_repo: main_repo.to_path_buf(),
             path: path.to_path_buf(),
             branch: branch.to_owned(),
@@ -235,6 +316,7 @@ impl<'a> NativeLease<'a> {
             &self.main_repo,
             &self.path,
             &self.branch,
+            self.provisional,
         )
     }
 
@@ -290,7 +372,7 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                 .ownership
                 .as_ref()
                 .context("native Git ownership lease missing")?;
-            let (_, pins) = inventory(root)?;
+            let (_, pins) = inventory(root, self.provisional)?;
             self.profile_pins.extend(pins);
             if let Some(owner) = &mut self.owner {
                 owner.release(root)?;
@@ -329,8 +411,9 @@ pub(crate) fn create_worktree(
     checkout: (&Path, &Path, &str),
     create_branch: bool,
     base: Option<&str>,
+    provisional: Option<&ProvisionalCreation>,
 ) -> Result<(Vec<String>, CheckoutWitness)> {
-    let mut lease = NativeLease::new(ownership, false, profile, None, checkout)?;
+    let mut lease = NativeLease::new(ownership, false, profile, None, checkout, provisional)?;
     let result = lease.create(git, create_branch, base);
     let receipt = lease.receipt(create_branch);
     drop(lease);

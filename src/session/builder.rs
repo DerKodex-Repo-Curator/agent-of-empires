@@ -85,6 +85,55 @@ pub struct InstanceParams {
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Exact originating placeholder, if creation is queued by the TUI.
+    pub provisional_creation: Option<std::sync::Arc<ProvisionalCreation>>,
+}
+
+/// Pinned identity and claims of this creation's original UI placeholder.
+#[derive(Debug)]
+pub struct ProvisionalCreation {
+    pub(crate) profile_directory: DirectoryWitness,
+    pub(crate) claim: super::native_hooks::Claim,
+}
+
+impl ProvisionalCreation {
+    pub(crate) fn capture(storage: &super::Storage, row: &Instance) -> Result<Self> {
+        Ok(Self {
+            profile_directory: DirectoryWitness::capture(
+                storage
+                    .sessions_path()
+                    .parent()
+                    .context("profile directory missing")?,
+            )?,
+            claim: super::native_hooks::Claim::from_instance(
+                storage.physical_profile_identity()?,
+                row,
+            )?,
+        })
+    }
+
+    pub(crate) fn verify_profile(&self, storage: &super::Storage) -> Result<()> {
+        self.profile_directory.verify()?;
+        anyhow::ensure!(
+            storage.physical_profile_identity()? == self.claim.profile,
+            "Creating placeholder profile changed"
+        );
+        Ok(())
+    }
+
+    fn is_placeholder(row: &Instance) -> bool {
+        row.status == super::Status::Creating
+            && row.pre_trash_project_path.is_none()
+            && row.workspace_info.is_none()
+    }
+
+    pub(crate) fn matches_claim(&self, row: &Instance, claim: &super::native_hooks::Claim) -> bool {
+        Self::is_placeholder(row) && claim == &self.claim
+    }
+
+    pub(crate) fn matches_instance(&self, row: &Instance) -> Result<bool> {
+        Ok(Self::is_placeholder(row) && self.claim.matches_instance(row)?)
+    }
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -423,7 +472,7 @@ pub fn create_workspace(
         create_new_branch,
         workspace_template,
         init_submodules,
-        (&mut ownership, None),
+        (&mut ownership, None, None),
     )
 }
 
@@ -437,9 +486,10 @@ pub(crate) fn create_workspace_with_ownership(
     fence: (
         &mut Option<super::storage::OwnershipGuard>,
         Option<&super::Storage>,
+        Option<&ProvisionalCreation>,
     ),
 ) -> Result<WorkspaceResult> {
-    let (ownership, profile) = fence;
+    let (ownership, profile, provisional) = fence;
     let primary_main_repo = GitWorktree::find_main_repo(&primary.path)?;
     let primary_git_wt = GitWorktree::new(primary_main_repo)?;
 
@@ -529,6 +579,7 @@ pub(crate) fn create_workspace_with_ownership(
         ownership
             .as_ref()
             .context("workspace ownership lease missing")?,
+        provisional,
     )?;
     drop(ownership.take());
     // Run create_worktree for every repo concurrently.
@@ -564,6 +615,7 @@ pub(crate) fn create_workspace_with_ownership(
                                     (&main_repo_path, &worktree_subdir, &branch),
                                     create_new_branch,
                                     base.as_deref(),
+                                    provisional,
                                 )
                             })()
                             .map_err(|error| format!("{repo_name}: {error:#}"));
@@ -643,6 +695,7 @@ pub(crate) fn create_workspace_with_ownership(
                 &worktree.main_repo_path,
                 &worktree.path,
                 branch,
+                provisional,
             )?;
         }
         Ok(())
@@ -687,7 +740,16 @@ pub fn build_instance(
     profile: &str,
 ) -> Result<BuildResult> {
     let mut ownership = Some(super::storage::acquire_ownership_read()?);
+    if let Some(provisional) = &params.provisional_creation {
+        provisional.profile_directory.verify()?;
+    }
     let profile_storage = super::Storage::new_unwatched(profile)?;
+    if let Some(provisional) = &params.provisional_creation {
+        anyhow::ensure!(
+            profile_storage.physical_profile_identity()? == provisional.claim.profile,
+            "Creation profile changed before building"
+        );
+    }
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
     let is_host_only = crate::agents::get_agent(&params.tool).is_some_and(|a| a.host_only);
     if is_host_only && params.sandbox {
@@ -828,7 +890,11 @@ pub fn build_instance(
                 params.create_new_branch,
                 &config.worktree.workspace_path_template,
                 config.worktree.init_submodules,
-                (&mut ownership, Some(&profile_storage)),
+                (
+                    &mut ownership,
+                    Some(&profile_storage),
+                    params.provisional_creation.as_deref(),
+                ),
             )?;
 
             final_path = ws_result.workspace_path.to_string_lossy().to_string();
@@ -888,6 +954,7 @@ pub fn build_instance(
                         (&main_repo_path, &worktree_path, branch),
                         false,
                         None,
+                        params.provisional_creation.as_deref(),
                     )?;
                     warnings.extend(w);
 
@@ -938,6 +1005,7 @@ pub fn build_instance(
                     (&main_repo_path, &worktree_path, branch),
                     true,
                     base.as_deref(),
+                    params.provisional_creation.as_deref(),
                 )?;
                 warnings.extend(w);
 
@@ -2429,6 +2497,7 @@ mod tests {
 
     fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
         InstanceParams {
+            provisional_creation: None,
             title: "custom session".to_string(),
             title_typed: false,
             path: project_path.to_string_lossy().to_string(),
@@ -2638,6 +2707,7 @@ mod tests {
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
+            provisional_creation: None,
             title: "Forked".into(),
             title_typed: false,
             path: "/tmp".into(),
@@ -2694,6 +2764,7 @@ mod tests {
             transcript_path: None,
         };
         let params = InstanceParams {
+            provisional_creation: None,
             title: "Forked".into(),
             title_typed: false,
             path: "/tmp".into(),

@@ -329,6 +329,8 @@ pub struct HomeView {
 
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     pub(super) creating_stub_id: Option<String>,
+    creating_provisional_creation:
+        Option<std::sync::Arc<crate::session::builder::ProvisionalCreation>>,
     creating_provisional_group_paths: HashSet<String>,
 
     pub(super) preview_cache: PreviewCache,

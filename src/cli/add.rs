@@ -351,7 +351,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 args.create_branch,
                 &config.worktree.workspace_path_template,
                 init_submodules,
-                (&mut ownership, Some(&storage)),
+                (&mut ownership, Some(&storage), None),
             )?;
 
             for repo in &ws_result.workspace_info.repos {
@@ -457,6 +457,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     (&main_repo_path, &worktree_path, branch),
                     args.create_branch,
                     base.as_deref(),
+                    None,
                 )?;
                 native_created.push(builder::CreatedWorktree {
                     path: worktree_path.clone(),
