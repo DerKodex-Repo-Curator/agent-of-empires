@@ -32,6 +32,7 @@ fn hooked_command(name: Option<&OsStr>) -> bool {
             Some(
                 "checkout"
                     | "worktree"
+                    | "branch"
                     | "fetch"
                     | "reset"
                     | "clone"

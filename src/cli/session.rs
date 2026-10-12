@@ -1708,6 +1708,12 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let _lifecycle_lock = storage
         .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)
         .context("failed to acquire session lifecycle lock")?;
+    let native_locks = [
+        &_identity_lock,
+        _session_title_lock.as_ref().unwrap_or(&_lifecycle_lock),
+        &_lifecycle_lock,
+    ];
+    let native_locks = &native_locks[..if _session_title_lock.is_some() { 3 } else { 2 }];
     let (authoritative_instances, _groups) = storage.load_with_groups()?;
     let inst = authoritative_instances
         .iter()
@@ -1774,7 +1780,11 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 true,
             )?;
         }
-        if crate::session::worktree_edit::rename_worktree_branch(
+        if crate::session::worktree_edit::rename_worktree_branch_with_ownership(
+            &ownership,
+            native_locks,
+            profile,
+            &id,
             info,
             std::path::Path::new(&inst.project_path),
             branch,
@@ -1815,6 +1825,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         }
         match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
             &ownership,
+            native_locks,
             profile,
             &id,
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -1842,6 +1853,21 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     }
 
     let persist = storage.update_with_ownership(&ownership, |instances, groups| {
+        if title_requested || new_path.is_some() {
+            let current = instances
+                .iter()
+                .find(|row| row.id == id)
+                .context("Session disappeared before rename publication")?;
+            let title = if title_requested {
+                &effective_title
+            } else {
+                &current.title
+            };
+            let path = new_path.as_deref().unwrap_or(&current.project_path);
+            if is_duplicate_session(instances.iter(), title, path, Some(&id)) {
+                return Err(duplicate_session_error(title));
+            }
+        }
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
@@ -1887,7 +1913,11 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                         .map(|wt| wt.branch.as_str());
                     if persisted_branch == Some(info.branch.as_str()) {
                         if let Err(rollback) =
-                            crate::session::worktree_edit::rollback_worktree_branch(
+                            crate::session::worktree_edit::rollback_worktree_branch_with_ownership(
+                                &ownership,
+                                native_locks,
+                                profile,
+                                &id,
                                 info,
                                 std::path::Path::new(&inst.project_path),
                                 branch,
@@ -2532,6 +2562,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
 
     let outcome = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
         &ownership,
+        &[&_identity_lock, &_lifecycle_lock],
         profile,
         &id,
         crate::session::worktree_edit::WorktreeEditRequest {

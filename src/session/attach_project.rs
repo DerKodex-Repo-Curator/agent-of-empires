@@ -654,7 +654,18 @@ impl AttachOwner<'_> {
             Err(error) => {
                 if let Some(receipt) = receipt.as_ref() {
                     if let Some(root) = ownership.as_ref() {
-                        super::native_hooks::cleanup_with_ownership(receipt, root);
+                        if self.verify(root).is_ok() {
+                            let locks = self.lifecycle.as_ref().map(|lock| [lock]);
+                            super::native_hooks::cleanup_with_ownership(
+                                receipt,
+                                super::native_hooks::BranchHandoff {
+                                    root,
+                                    nested: locks.as_ref().map_or(&[], |locks| locks.as_slice()),
+                                    owner: Some((self.storage.profile(), &self.plan.original.id)),
+                                    protected_path: None,
+                                },
+                            );
+                        }
                     }
                 }
                 Err(error)
@@ -836,7 +847,14 @@ fn execute(
                 Ok((_warnings, receipt)) => undo.created_primary = Some(receipt),
                 Err(error) => {
                     if let Some(root) = ownership.as_ref() {
-                        undo.run(root);
+                        if owner.verify(root).is_ok() {
+                            undo.run(
+                                root,
+                                owner.lifecycle.as_ref(),
+                                owner.storage.profile(),
+                                &owner.plan.original.id,
+                            );
+                        }
                     }
                     return Err(error).context("could not create the primary worktree");
                 }
@@ -858,7 +876,14 @@ fn execute(
         }
         Err(error) => {
             if let Some(root) = ownership.as_ref() {
-                undo.run(root);
+                if owner.verify(root).is_ok() {
+                    undo.run(
+                        root,
+                        owner.lifecycle.as_ref(),
+                        owner.storage.profile(),
+                        &owner.plan.original.id,
+                    );
+                }
             }
             return Err(error)
                 .with_context(|| format!("could not create a worktree for '{repo_name}'"));
@@ -869,7 +894,14 @@ fn execute(
         let primary_git = GitWorktree::new(PathBuf::from(&primary.main_repo_path))?;
         if let Err(error) = primary_git.move_worktree(from, &to) {
             if let Some(root) = ownership.as_ref() {
-                undo.run(root);
+                if owner.verify(root).is_ok() {
+                    undo.run(
+                        root,
+                        owner.lifecycle.as_ref(),
+                        owner.storage.profile(),
+                        &owner.plan.original.id,
+                    );
+                }
             }
             return Err(error).context("could not move the primary worktree into the workspace");
         }
@@ -937,12 +969,30 @@ struct Undo {
 }
 
 impl Undo {
-    fn run(&self, ownership: &super::storage::OwnershipGuard) {
+    fn run(
+        &self,
+        ownership: &super::storage::OwnershipGuard,
+        lifecycle: Option<&super::storage::StorageFlock>,
+        profile: &str,
+        id: &str,
+    ) {
+        let locks = lifecycle.map(|lock| [lock]);
+        let handoff = super::native_hooks::BranchHandoff {
+            root: ownership,
+            nested: locks.as_ref().map_or(&[], |locks| locks.as_slice()),
+            owner: Some((profile, id)),
+            protected_path: self
+                .moved_primary
+                .as_ref()
+                .map(|(_, _, path)| path.as_path()),
+        };
         for receipt in [self.added.as_ref(), self.created_primary.as_ref()]
             .into_iter()
             .flatten()
         {
-            super::native_hooks::cleanup_with_ownership(receipt, ownership);
+            if !super::native_hooks::cleanup_with_ownership(receipt, handoff) {
+                return;
+            }
         }
         // Putting the session's own worktree back is the one step that matters for user data: until
         // it lands, `project_path` names a directory that does not exist.
@@ -982,8 +1032,14 @@ struct PreparedAttach {
 
 impl PreparedAttach {
     /// Undo every filesystem change this attach made.
-    fn rollback(&self, ownership: &super::storage::OwnershipGuard) {
-        self.undo.run(ownership);
+    fn rollback(
+        &self,
+        ownership: &super::storage::OwnershipGuard,
+        lifecycle: Option<&super::storage::StorageFlock>,
+        profile: &str,
+        id: &str,
+    ) {
+        self.undo.run(ownership, lifecycle, profile, id);
     }
 
     /// Where the session's working directory ends up, for the caller to persist
@@ -1124,6 +1180,9 @@ pub fn attach_planned(
             ownership
                 .as_ref()
                 .context("attach ownership lease missing")?,
+            lifecycle.as_ref(),
+            storage.profile(),
+            session_id,
         );
         return Err(e).with_context(|| {
             format!(

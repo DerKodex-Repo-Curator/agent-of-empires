@@ -230,6 +230,14 @@ impl GitWorktree {
     /// git's localized diagnostics. An unmerged branch no worktree holds is
     /// force-deleted.
     pub fn delete_branch(&self, branch: &str) -> Result<()> {
+        self.delete_branch_with_hooks(branch, None)
+    }
+
+    pub(crate) fn delete_branch_with_hooks(
+        &self,
+        branch: &str,
+        mut lease: Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<()> {
         tracing::debug!(target: "git.worktree",
             branch,
             repo = %self.repo_path.display(),
@@ -246,7 +254,8 @@ impl GitWorktree {
         // held; reap that entry once and retry.
         let mut used_by_worktree_retried = false;
         loop {
-            let output = run_git(&self.repo_path, ["branch", "-d", branch])?;
+            let output =
+                run_branch_mutation(&self.repo_path, ["branch", "-d", branch], &mut lease)?;
             if output.status.success() {
                 return Ok(());
             }
@@ -283,7 +292,8 @@ impl GitWorktree {
                 )));
             }
 
-            let force_output = run_git(&self.repo_path, ["branch", "-D", branch])?;
+            let force_output =
+                run_branch_mutation(&self.repo_path, ["branch", "-D", branch], &mut lease)?;
             if !force_output.status.success() {
                 let force_stderr = String::from_utf8_lossy(&force_output.stderr);
                 tracing::debug!(target: "git.worktree",
@@ -380,17 +390,36 @@ impl GitWorktree {
 
     /// `git branch -m`, which also updates a worktree that has `old` checked out.
     pub fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        self.rename_branch_with_hooks(old, new, None)
+    }
+
+    pub(crate) fn rename_branch_with_hooks(
+        &self,
+        old: &str,
+        new: &str,
+        lease: Option<&mut dyn crate::git::native_hooks::HookLease>,
+    ) -> Result<()> {
         tracing::info!(target: "git.worktree",
             old, new,
             repo = %self.repo_path.display(),
             "rename_branch: invoking `git branch -m`"
         );
-        let Some(output) = run_git_with_timeout(
-            &self.repo_path,
-            ["branch", "-m", old, new],
-            WORKTREE_MUTATION_TIMEOUT,
-        )?
-        else {
+        let output = if let Some(lease) = lease {
+            let args = ["branch", "-m", old, new].map(std::ffi::OsString::from);
+            crate::git::native_hooks::run_timed(
+                &self.repo_path,
+                &args,
+                lease,
+                WORKTREE_MUTATION_TIMEOUT,
+            )?
+        } else {
+            run_git_with_timeout(
+                &self.repo_path,
+                ["branch", "-m", old, new],
+                WORKTREE_MUTATION_TIMEOUT,
+            )?
+        };
+        let Some(output) = output else {
             let outcome = classify_ref_observations(
                 observe_local_branch_ref(&self.repo_path, old),
                 observe_local_branch_ref(&self.repo_path, new),
@@ -415,6 +444,26 @@ impl GitWorktree {
             return Err(super::command_failed(&output));
         }
         Ok(())
+    }
+}
+
+fn run_branch_mutation(
+    repo: &Path,
+    args: [&str; 3],
+    lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
+) -> Result<std::process::Output> {
+    if let Some(lease) = lease.as_deref_mut() {
+        lease.checkpoint()?;
+        let args = args.map(std::ffi::OsString::from);
+        crate::git::native_hooks::run_timed(repo, &args, lease, WORKTREE_MUTATION_TIMEOUT)?
+            .ok_or_else(|| {
+                GitError::WorktreeCommandFailed(
+                    "Native branch deletion timed out; reference retained or outcome indeterminate"
+                        .into(),
+                )
+            })
+    } else {
+        Ok(run_git(repo, args)?)
     }
 }
 

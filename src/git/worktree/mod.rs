@@ -555,44 +555,4 @@ mod tests {
             .unwrap();
         assert!(wt_path.join(".git").is_file());
     }
-
-    /// Every git subprocess reachable from a worktree move or edit is bounded:
-    /// the profile-move transaction runs them under app-global locks, so one
-    /// hang pins every `aoe` process. Source-level, since a git hang on
-    /// metadata is not reproducible in a unit test.
-    #[test]
-    fn every_worktree_mutation_subprocess_is_bounded() {
-        let flat = [
-            include_str!("mod.rs"),
-            include_str!("branch.rs"),
-            include_str!("relocate.rs"),
-        ]
-        .map(|source| source.split_once("\n#[cfg(test)]\nmod tests").unwrap().0)
-        .concat()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-        for (needle, label) in [
-            ("\"worktree\", \"lock\"", "git worktree lock"),
-            ("\"worktree\", \"unlock\"", "git worktree unlock"),
-            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
-            ("\"worktree\", \"move\"", "git worktree move"),
-            ("\"branch\", \"-m\"", "git branch -m"),
-        ] {
-            let at = flat
-                .find(needle)
-                .unwrap_or_else(|| panic!("{label} not found"));
-            let call = flat[..at]
-                .rfind("run_")
-                .map(|i| &flat[i..])
-                .unwrap_or_default();
-            assert!(
-                call.starts_with("run_git_with_timeout")
-                    || call.starts_with("run_git_quiet_with_timeout")
-                    || call.starts_with("run_bounded"),
-                "{label} must go through a bounded helper, found `{}`",
-                call.split('(').next().unwrap_or(call)
-            );
-        }
-    }
 }

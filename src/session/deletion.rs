@@ -447,6 +447,9 @@ impl PurgeTransaction {
         let mut result = perform_deletion_teardown_lifecycle_locked(
             &self.request,
             self.ownership.as_ref().expect("exclusive purge"),
+            self.lifecycle_lock
+                .as_ref()
+                .expect("exclusive purge lifecycle"),
         );
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
@@ -570,7 +573,8 @@ impl CommittedPurge {
                 )
             }
         };
-        let mut result = perform_deletion_teardown_lifecycle_locked(&request, &ownership);
+        let mut result =
+            perform_deletion_teardown_lifecycle_locked(&request, &ownership, &_lifecycle);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -929,6 +933,7 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
 fn perform_deletion_teardown_lifecycle_locked(
     request: &DeletionRequest,
     ownership: &OwnershipGuard,
+    lifecycle: &StorageFlock,
 ) -> DeletionResult {
     let mut guarded_request = None;
     if request.delete_branch {
@@ -962,7 +967,7 @@ fn perform_deletion_teardown_lifecycle_locked(
         }
     }
     let request = guarded_request.as_ref().unwrap_or(request);
-    perform_deletion_core(request, Some(ownership), |session_id| {
+    perform_deletion_core(request, Some(ownership), &[lifecycle], |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -974,17 +979,19 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, None, teardown)
+    perform_deletion_core(request, None, &[], teardown)
 }
 
 /// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
 fn perform_deletion_core(
     request: &DeletionRequest,
     ownership: Option<&OwnershipGuard>,
+    nested: &[&StorageFlock],
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
     let mut messages = Vec::new();
+    let mut pending_branches = Vec::new();
 
     tracing::debug!(target: "session.delete",
         session_id = %request.session_id,
@@ -1057,8 +1064,8 @@ fn perform_deletion_core(
             is_sandboxed,
             paths_in_use,
             teardown,
-            &mut errors,
-            &mut messages,
+            (&mut errors, &mut messages),
+            &mut pending_branches,
         )
     };
     let container_gone = if let Some(ownership) = ownership.filter(|_| removes_managed_worktree) {
@@ -1071,6 +1078,30 @@ fn perform_deletion_core(
     } else {
         stage(&PathsInUse::Known(Vec::new()))
     };
+    // Storage/save/transition locks from the ownership scan are gone here.
+    // Branch receipts were captured before removing the originating checkout.
+    for pending in pending_branches {
+        let result = if let Some(root) = ownership {
+            super::native_hooks::delete_branch(
+                super::native_hooks::BranchHandoff {
+                    root,
+                    nested,
+                    owner: Some((&request.instance.source_profile, &request.session_id)),
+                    protected_path: None,
+                },
+                &pending.origin,
+                &pending.path,
+            )
+        } else {
+            GitWorktree::new(pending.origin.repository().to_path_buf())
+                .and_then(|git| git.delete_branch(&pending.branch))
+                .map_err(Into::into)
+        };
+        match result {
+            Ok(()) => messages.push(format!("Branch '{}' deleted", pending.branch)),
+            Err(error) => errors.push(format!("{}: {error:#}", pending.label)),
+        }
+    }
 
     if let Some(ownership) = ownership.filter(|_| request.instance.scratch && !request.keep_scratch)
     {
@@ -1129,9 +1160,10 @@ fn stage_teardown_worktrees(
     is_sandboxed: bool,
     paths_in_use: &PathsInUse,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
-    errors: &mut Vec<String>,
-    messages: &mut Vec<String>,
+    feedback: (&mut Vec<String>, &mut Vec<String>),
+    pending_branches: &mut Vec<PendingBranchDeletion>,
 ) -> bool {
+    let (errors, messages) = feedback;
     let preserved_worktree_paths =
         stage_collect_preserved_worktrees(request, repos, paths_in_use, errors, messages);
     // Any preserved worktree, dirty or default-branch, blocks the in-container preclean (a
@@ -1163,6 +1195,7 @@ fn stage_teardown_worktrees(
         any_preserved,
         errors,
         messages,
+        pending_branches,
     );
 
     container_gone
@@ -1296,6 +1329,50 @@ fn stage_collect_preserved_worktrees(
     preserved_worktree_paths
 }
 
+struct PendingBranchDeletion {
+    origin: super::native_hooks::BranchOrigin,
+    path: PathBuf,
+    branch: String,
+    label: String,
+}
+
+fn capture_branch_origin(
+    repo: &Path,
+    branch: &str,
+) -> Result<Option<super::native_hooks::BranchOrigin>> {
+    let git = GitWorktree::new(repo.to_path_buf())?;
+    if !git.branch_exists(branch)? {
+        return Ok(None);
+    }
+    super::native_hooks::BranchOrigin::capture(repo, branch).map(Some)
+}
+
+fn queue_branch_deletion(
+    origins: &mut std::collections::HashMap<
+        (PathBuf, String),
+        Result<Option<super::native_hooks::BranchOrigin>>,
+    >,
+    pending: &mut Vec<PendingBranchDeletion>,
+    repo: PathBuf,
+    branch: String,
+    path: PathBuf,
+    label: String,
+    feedback: (&mut Vec<String>, &mut Vec<String>),
+) {
+    let (errors, messages) = feedback;
+    match origins.remove(&(repo, branch.clone())) {
+        Some(Ok(Some(origin))) => pending.push(PendingBranchDeletion {
+            origin,
+            path,
+            branch,
+            label,
+        }),
+        Some(Ok(None)) => messages.push(format!("Branch '{branch}' already absent")),
+        Some(Err(error)) => errors.push(format!("{label}: {error:#}")),
+        None => errors.push(format!("{label}: original branch authority missing")),
+    }
+}
+
 fn stage_remove_worktrees_and_branches(
     request: &DeletionRequest,
     repos: &[super::WorkspaceRepo],
@@ -1303,6 +1380,7 @@ fn stage_remove_worktrees_and_branches(
     any_preserved: bool,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
+    pending_branches: &mut Vec<PendingBranchDeletion>,
 ) {
     // Stage 4: worktree cleanup.
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "worktree_remove", "perform_deletion: stage");
@@ -1318,6 +1396,21 @@ fn stage_remove_worktrees_and_branches(
     };
     if let Some((b, r)) = branch_to_delete.as_ref() {
         tracing::debug!(target: "session.delete", branch = %b, main_repo = %r.display(), "perform_deletion: branch_to_delete resolved");
+    }
+    let mut origins = std::collections::HashMap::new();
+    if let Some((branch, repo)) = &branch_to_delete {
+        origins.insert(
+            (repo.clone(), branch.clone()),
+            capture_branch_origin(repo, branch),
+        );
+    }
+    if request.delete_branch {
+        for repo in repos.iter().filter(|repo| !repo.branch_preexisting) {
+            let main = PathBuf::from(&repo.main_repo_path);
+            origins
+                .entry((main.clone(), repo.branch.clone()))
+                .or_insert_with(|| capture_branch_origin(&main, &repo.branch));
+        }
     }
 
     // Branch cleanup is gated on the worktree actually being removed, not on
@@ -1449,20 +1542,15 @@ fn stage_remove_worktrees_and_branches(
     if let Some((branch, main_repo)) = branch_to_delete {
         tracing::debug!(target: "session.delete", branch = %branch, main_repo = %main_repo.display(), main_worktree_removed, "perform_deletion: attempting branch deletion");
         if main_worktree_removed {
-            match GitWorktree::new(main_repo.clone()) {
-                Ok(git_wt) => {
-                    if let Err(e) = git_wt.delete_branch(&branch) {
-                        tracing::debug!(target: "session.delete", branch = %branch, error = %e, "perform_deletion: delete_branch returned error");
-                        errors.push(format!("Branch: {}", e));
-                    } else {
-                        messages.push(format!("Branch '{}' deleted", branch));
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(target: "session.delete", main_repo = %main_repo.display(), error = %e, "perform_deletion: GitWorktree::new failed");
-                    errors.push(format!("Branch: {}", e));
-                }
-            }
+            queue_branch_deletion(
+                &mut origins,
+                pending_branches,
+                main_repo,
+                branch,
+                PathBuf::from(&request.instance.project_path),
+                "Branch".into(),
+                (errors, messages),
+            );
         } else {
             tracing::debug!(target: "session.delete",
                 "perform_deletion: skipping branch deletion (worktree preserved or not removed)"
@@ -1499,14 +1587,15 @@ fn stage_remove_worktrees_and_branches(
                 ));
                 continue;
             }
-            let main_repo = PathBuf::from(&repo.main_repo_path);
-            if let Ok(git_wt) = GitWorktree::new(main_repo) {
-                if let Err(e) = git_wt.delete_branch(&repo.branch) {
-                    errors.push(format!("Branch ({}): {}", repo.name, e));
-                } else {
-                    messages.push(format!("Branch '{}' ({}) deleted", repo.branch, repo.name));
-                }
-            }
+            queue_branch_deletion(
+                &mut origins,
+                pending_branches,
+                PathBuf::from(&repo.main_repo_path),
+                repo.branch.clone(),
+                PathBuf::from(&repo.worktree_path),
+                format!("Branch ({})", repo.name),
+                (errors, messages),
+            );
         }
     }
 }

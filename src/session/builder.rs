@@ -1268,9 +1268,25 @@ fn cleanup_workspace_resources(
         .iter()
         .all(|worktree| worktree.witness.verify().is_ok());
     for worktree in created {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+        cleanup_created_worktree(
+            worktree,
+            "workspace worktree",
+            &protection,
+            super::native_hooks::BranchHandoff::unpublished(&ownership),
+        );
     }
-    if originals_intact && witness.verify().is_ok() && !protection.references_path(workspace_path) {
+    let Ok(owners) = cleanup_owners(&ownership) else {
+        return;
+    };
+    let current = CleanupProtection {
+        owner: None,
+        owners,
+    };
+    if originals_intact
+        && witness.verify().is_ok()
+        && !protection.references_path(workspace_path)
+        && !current.references_path(workspace_path)
+    {
         let _ = std::fs::remove_dir(workspace_path);
     }
 }
@@ -1347,42 +1363,58 @@ pub(crate) fn cleanup_created_worktree(
     created: &CreatedWorktree,
     label: &str,
     protection: &CleanupProtection<'_>,
-) {
+    handoff: super::native_hooks::BranchHandoff<'_>,
+) -> bool {
+    let ownership = handoff.root;
+    // A preceding native cleanup callback may have adopted another receipt.
+    let Ok(owners) = cleanup_owners(ownership) else {
+        return false;
+    };
+    let current = CleanupProtection {
+        owner: None,
+        owners,
+    };
     if created.witness.verify().is_err() {
-        return;
+        return false;
     }
     if created.witness.detached_tip_changed() {
-        return;
+        return false;
     }
-    if protection.references_path(&created.path) {
+    if protection.references_path(&created.path) || current.references_path(&created.path) {
         tracing::debug!(
             target: "session.create",
             path = %created.path.display(),
             "Preserving {label} referenced by the persisted uniqueness winner"
         );
-        return;
+        return false;
     }
     let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
-        return;
+        return false;
     };
-    if let Err(error) = worktree.remove_worktree(&created.path, false) {
-        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
-        return;
-    }
-    if let Some(branch) = created
+    let branch_origin = created
         .owned_branch
         .as_deref()
         .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
+        .filter(|branch| !current.references_branch(&created.main_repo_path, branch))
         .filter(|branch| {
             created
                 .witness
                 .branch_unchanged(&created.main_repo_path, branch)
         })
-    {
-        if let Err(error) = worktree.delete_branch(branch) {
-            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
+        .map(|branch| super::native_hooks::BranchOrigin::capture(&created.main_repo_path, branch));
+    if let Err(error) = worktree.remove_worktree(&created.path, false) {
+        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
+        return false;
+    }
+    if let Some(origin) = branch_origin {
+        let result = origin
+            .and_then(|origin| super::native_hooks::delete_branch(handoff, &origin, &created.path));
+        if let Err(error) = result {
+            tracing::warn!(target: "session.create", "Failed to clean up branch: {error:#}");
+            return false;
         }
     }
+    true
 }
 
 /// Roll back resources of a creation candidate that was never published.
@@ -1455,17 +1487,35 @@ pub fn cleanup_unpublished_instance(
         .iter()
         .all(|worktree| worktree.witness.verify().is_ok());
     if let Some(worktree) = created_worktree {
-        cleanup_created_worktree(worktree, "worktree", &protection);
+        cleanup_created_worktree(
+            worktree,
+            "worktree",
+            &protection,
+            super::native_hooks::BranchHandoff::unpublished(&ownership),
+        );
     }
 
     for worktree in created_workspace_worktrees {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+        cleanup_created_worktree(
+            worktree,
+            "workspace worktree",
+            &protection,
+            super::native_hooks::BranchHandoff::unpublished(&ownership),
+        );
     }
+    let Ok(owners) = cleanup_owners(&ownership) else {
+        return;
+    };
+    let current = CleanupProtection {
+        owner: None,
+        owners,
+    };
     if let Some(workspace) = &instance.workspace_info {
         let workspace_dir = Path::new(&workspace.workspace_dir);
         if originals_intact
             && witness.original_directory(workspace_dir)
             && !protection.references_path(workspace_dir)
+            && !current.references_path(workspace_dir)
         {
             let _ = std::fs::remove_dir(workspace_dir);
         }
@@ -2359,7 +2409,14 @@ mod tests {
             .iter()
             .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
         for worktree in &result.created_worktrees {
-            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+            cleanup_created_worktree(
+                worktree,
+                "test worktree",
+                &CleanupProtection::default(),
+                super::super::native_hooks::BranchHandoff::unpublished(
+                    &super::super::storage::acquire_ownership_lock().unwrap(),
+                ),
+            );
             let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
             assert!(repo
                 .find_branch("feature-x", git2::BranchType::Local)
@@ -2395,7 +2452,14 @@ mod tests {
         assert_eq!(result.workspace_info.repos[0].base_branch, None);
         assert_eq!(result.created_worktrees[0].owned_branch, None);
         let worktree = &result.created_worktrees[0];
-        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+        cleanup_created_worktree(
+            worktree,
+            "test worktree",
+            &CleanupProtection::default(),
+            super::super::native_hooks::BranchHandoff::unpublished(
+                &super::super::storage::acquire_ownership_lock().unwrap(),
+            ),
+        );
         let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
         assert!(repo
             .find_branch("feature-x", git2::BranchType::Local)

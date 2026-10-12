@@ -1333,6 +1333,7 @@ impl HomeView {
 
         let outcome = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
             &ownership,
+            &[&_identity_lock, &_lifecycle_lock],
             &source_profile,
             &id,
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -1627,6 +1628,11 @@ impl HomeView {
                     }
                     match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
                         &ownership,
+                        &[
+                            &_identity_lock,
+                            &_mutation_guards._session_title,
+                            &_mutation_guards._lifecycle,
+                        ],
                         &current_profile,
                         &id,
                         crate::session::worktree_edit::WorktreeEditRequest {
@@ -1659,8 +1665,8 @@ impl HomeView {
                 }
             }
 
-            // Cross-profile worktree and container effects run inside the dual-profile
-            // transaction; tmux rekeying waits until persistence and publication succeed.
+            // The existing move journal precedes the native effect; profile locks
+            // are released for Git, then authoritative rows are reloaded before commit.
             if let Some(target_profile) = cross_profile_target.as_deref() {
                 if tied_edit {
                     if let Some(info) = current_instance.worktree_info.as_ref() {
@@ -1698,68 +1704,34 @@ impl HomeView {
                 }
                 let tied_edit = (current_title != effective_title || rename_branch)
                     && self.tie_workdir_applies_for(&id);
-                let effect_instance = current_instance.clone();
-                let effect_id = id.clone();
-                let effect_title = effective_title.clone();
                 self.move_to_profile_with_effect_with_ownership(
-                    &ownership,
-                    &id,
-                    target_profile,
-                    (projected_move, Some(&current_instance)),
-                    false,
-                    move |candidate| {
+                    &ownership, &id, target_profile,
+                    (projected_move, Some(&current_instance)), false,
+                    (tied_edit, |candidate| {
                         if tied_edit {
-                            if let Some(worktree_info) = effect_instance.worktree_info.as_ref() {
-                                let leaf = crate::session::worktree_edit::worktree_leaf_from_title(
-                                    &effect_title,
-                                );
-                                let container_holds_worktree =
-                                    !candidate.status.blocks_worktree_edit()
-                                        && crate::session::worktree_edit::worktree_move_required(
-                                            std::path::Path::new(
-                                                &effect_instance.project_path,
-                                            ),
-                                            &leaf,
-                                        )
-                                        && crate::session::worktree_edit::ensure_sandbox_container_released(
-                                            &effect_id,
-                                            candidate.is_sandboxed(),
-                                        );
-                                if let Some(reason) = worktree_rename_block(
-                                    candidate.status,
-                                    candidate.is_sandboxed(),
-                                    container_holds_worktree,
-                                ) {
+                            if let Some(worktree_info) = current_instance.worktree_info.as_ref() {
+                                let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+                                let container_holds_worktree = !candidate.status.blocks_worktree_edit()
+                                    && crate::session::worktree_edit::worktree_move_required(std::path::Path::new(&current_instance.project_path), &leaf)
+                                    && crate::session::worktree_edit::ensure_sandbox_container_released(&id, candidate.is_sandboxed());
+                                if let Some(reason) = worktree_rename_block(candidate.status, candidate.is_sandboxed(), container_holds_worktree) {
                                     anyhow::bail!("{}", worktree_rename_block_message(&reason));
                                 }
-                                match crate::session::worktree_edit::edit_worktree_workdir(
+                                match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+                                    &ownership,
+                                    &[&_identity_lock, &_mutation_guards._session_title, &_mutation_guards._lifecycle],
+                                    &current_profile, &id,
                                     crate::session::worktree_edit::WorktreeEditRequest {
                                         worktree_info,
-                                        current_path: std::path::Path::new(
-                                            &effect_instance.project_path,
-                                        ),
+                                        current_path: std::path::Path::new(&current_instance.project_path),
                                         new_name: &leaf,
                                         rename_branch,
                                     },
                                 ) {
                                     Ok(outcome) => {
-                                        // Both sides derive the leaf from the same
-                                        // title through `target_worktree_path`, so the
-                                        // published row and the directory that moved must
-                                        // agree; assert it so a drift in either sanitizer
-                                        // fails loudly instead of stranding the row.
-                                        debug_assert_eq!(
-                                            outcome.new_path,
-                                            std::path::Path::new(&candidate.project_path),
-                                            "published project_path must match the moved worktree directory"
-                                        );
-                                        if outcome.new_path
-                                            != std::path::Path::new(&effect_instance.project_path)
-                                        {
-                                            crate::session::worktree_edit::discard_sandbox_container_after_move(
-                                                &effect_id,
-                                                candidate.is_sandboxed(),
-                                            );
+                                        anyhow::ensure!(outcome.new_path == std::path::Path::new(&candidate.project_path), "Profile move checkout destination changed");
+                                        if outcome.new_path != std::path::Path::new(&current_instance.project_path) {
+                                            crate::session::worktree_edit::discard_sandbox_container_after_move(&id, candidate.is_sandboxed());
                                         }
                                     }
                                     Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
@@ -1768,7 +1740,7 @@ impl HomeView {
                             }
                         }
                         Ok(())
-                    },
+                    }),
                 )?;
                 drop(_mutation_guards);
                 drop(_identity_lock);

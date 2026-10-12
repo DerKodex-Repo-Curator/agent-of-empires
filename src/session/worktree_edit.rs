@@ -235,11 +235,12 @@ pub(crate) fn ensure_worktree_unshared(
 
 pub(crate) fn edit_worktree_workdir_with_ownership(
     ownership: &super::storage::OwnershipGuard,
+    nested: &[&super::storage::StorageFlock],
     profile: &str,
     id: &str,
     req: WorktreeEditRequest<'_>,
 ) -> Result<WorktreeEditOutcome, WorktreeEditError> {
-    edit_worktree_workdir_inner(req, Some((ownership, profile, id)))
+    edit_worktree_workdir_inner(req, Some((ownership, nested, profile, id)))
 }
 
 /// Validate and apply an in-place worktree workdir edit.
@@ -251,7 +252,12 @@ pub fn edit_worktree_workdir(
 
 fn edit_worktree_workdir_inner(
     req: WorktreeEditRequest<'_>,
-    ownership: Option<(&super::storage::OwnershipGuard, &str, &str)>,
+    ownership: Option<(
+        &super::storage::OwnershipGuard,
+        &[&super::storage::StorageFlock],
+        &str,
+        &str,
+    )>,
 ) -> Result<WorktreeEditOutcome, WorktreeEditError> {
     if !req.worktree_info.managed_by_aoe {
         return Err(WorktreeEditError::NotManaged);
@@ -274,7 +280,7 @@ fn edit_worktree_workdir_inner(
     if !branch_changes && !path_changes {
         return Err(WorktreeEditError::Unchanged);
     }
-    if let Some((ownership, profile, id)) = ownership {
+    if let Some((ownership, _, profile, id)) = ownership {
         ensure_worktree_unshared(
             ownership,
             profile,
@@ -306,14 +312,28 @@ fn edit_worktree_workdir_inner(
     // (the riskier step) then fails.
     let mut renamed_branch = false;
     if branch_changes {
-        git.rename_branch(&req.worktree_info.branch, &new_branch)?;
+        rename_branch_effect(
+            &git,
+            req.current_path,
+            &req.worktree_info.branch,
+            &new_branch,
+            path_changes.then_some(new_path.as_path()),
+            ownership,
+        )?;
         renamed_branch = true;
     }
 
     if path_changes {
         if let Err(e) = git.move_worktree(req.current_path, &new_path) {
             if renamed_branch {
-                if let Err(rollback) = git.rename_branch(&new_branch, &req.worktree_info.branch) {
+                if let Err(rollback) = rename_branch_effect(
+                    &git,
+                    req.current_path,
+                    &new_branch,
+                    &req.worktree_info.branch,
+                    path_changes.then_some(new_path.as_path()),
+                    ownership,
+                ) {
                     tracing::error!(
                         target: "git.worktree",
                         new = %new_branch,
@@ -338,12 +358,60 @@ fn edit_worktree_workdir_inner(
     })
 }
 
-/// Rename a managed branch without moving its directory or touching its files.
-/// The caller holds the session identity and lifecycle locks and persists the result.
-pub fn rename_worktree_branch(
+fn rename_branch_effect(
+    git: &GitWorktree,
+    path: &Path,
+    old: &str,
+    new: &str,
+    protected_path: Option<&Path>,
+    ownership: Option<(
+        &super::storage::OwnershipGuard,
+        &[&super::storage::StorageFlock],
+        &str,
+        &str,
+    )>,
+) -> Result<(), WorktreeEditError> {
+    if let Some((root, nested, profile, id)) = ownership {
+        super::native_hooks::rename_branch(
+            super::native_hooks::BranchHandoff {
+                root,
+                nested,
+                owner: Some((profile, id)),
+                protected_path,
+            },
+            &git.repo_path,
+            path,
+            old,
+            new,
+        )
+        .map_err(|error| WorktreeEditError::Ownership(format!("{error:#}")))
+    } else {
+        git.rename_branch(old, new).map_err(Into::into)
+    }
+}
+
+pub(crate) fn rename_worktree_branch_with_ownership(
+    ownership: &super::storage::OwnershipGuard,
+    nested: &[&super::storage::StorageFlock],
+    profile: &str,
+    id: &str,
     info: &WorktreeInfo,
     path: &Path,
     branch: &str,
+) -> anyhow::Result<bool> {
+    rename_worktree_branch_inner(info, path, branch, Some((ownership, nested, profile, id)))
+}
+
+fn rename_worktree_branch_inner(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+    ownership: Option<(
+        &super::storage::OwnershipGuard,
+        &[&super::storage::StorageFlock],
+        &str,
+        &str,
+    )>,
 ) -> anyhow::Result<bool> {
     anyhow::ensure!(
         info.managed_by_aoe,
@@ -394,7 +462,7 @@ pub fn rename_worktree_branch(
         !git.branch_exists(branch)?,
         "Target branch already exists: {branch}"
     );
-    git.rename_branch(&info.branch, branch)?;
+    rename_branch_effect(&git, path, &info.branch, branch, None, ownership)?;
     Ok(true)
 }
 
@@ -404,12 +472,43 @@ pub fn rollback_worktree_branch(
     path: &Path,
     renamed_branch: &str,
 ) -> anyhow::Result<()> {
+    rollback_worktree_branch_inner(info, path, renamed_branch, None)
+}
+
+pub(crate) fn rollback_worktree_branch_with_ownership(
+    ownership: &super::storage::OwnershipGuard,
+    nested: &[&super::storage::StorageFlock],
+    profile: &str,
+    id: &str,
+    info: &WorktreeInfo,
+    path: &Path,
+    renamed_branch: &str,
+) -> anyhow::Result<()> {
+    rollback_worktree_branch_inner(
+        info,
+        path,
+        renamed_branch,
+        Some((ownership, nested, profile, id)),
+    )
+}
+
+fn rollback_worktree_branch_inner(
+    info: &WorktreeInfo,
+    path: &Path,
+    renamed_branch: &str,
+    ownership: Option<(
+        &super::storage::OwnershipGuard,
+        &[&super::storage::StorageFlock],
+        &str,
+        &str,
+    )>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         GitWorktree::get_current_branch(path)? == renamed_branch,
         "Worktree branch changed concurrently; refusing branch rollback"
     );
-    GitWorktree::new(PathBuf::from(&info.main_repo_path))?
-        .rename_branch(renamed_branch, &info.branch)?;
+    let git = GitWorktree::new(PathBuf::from(&info.main_repo_path))?;
+    rename_branch_effect(&git, path, renamed_branch, &info.branch, None, ownership)?;
     Ok(())
 }
 
@@ -466,6 +565,7 @@ mod tests {
             let ownership = super::super::storage::acquire_ownership_lock().unwrap();
             let result = edit_worktree_workdir_with_ownership(
                 &ownership,
+                &[],
                 "rename-a",
                 &id,
                 WorktreeEditRequest {
@@ -489,6 +589,7 @@ mod tests {
             let ownership = super::super::storage::acquire_ownership_lock().unwrap();
             let outcome = edit_worktree_workdir_with_ownership(
                 &ownership,
+                &[],
                 "rename-a",
                 &id,
                 WorktreeEditRequest {

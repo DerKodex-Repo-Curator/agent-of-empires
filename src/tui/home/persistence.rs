@@ -338,10 +338,9 @@ impl HomeView {
     /// row and group metadata must be removed in the same transaction that durably
     /// publishes the target row and metadata.
     ///
-    /// `before_commit` runs after authoritative target validation while both profile
-    /// storage locks are held; it may perform only bounded worktree/container effects and
-    /// must not re-enter storage or rekey tmux. Callers retain [`SessionMutationGuards`]
-    /// around the transaction and any post-persist rekey.
+    /// Ordinary effects run inside the profile transaction. Hook-bearing Git effects
+    /// use the explicit native handoff path: journal, release profile locks, effect,
+    /// then authoritative reload and validation before durable publication.
     pub(in crate::tui) fn move_to_profile_with_effect<B>(
         &mut self,
         id: &str,
@@ -361,7 +360,7 @@ impl HomeView {
             target,
             (requested, baseline),
             account_swap,
-            before_commit,
+            (false, before_commit),
         )
     }
 
@@ -372,11 +371,12 @@ impl HomeView {
         target: &str,
         change: (Instance, Option<&Instance>),
         account_swap: bool,
-        before_commit: B,
+        effect: (bool, B),
     ) -> anyhow::Result<()>
     where
         B: FnOnce(&Instance) -> anyhow::Result<()>,
     {
+        let (native_handoff, before_commit) = effect;
         let (mut requested, baseline) = change;
         let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
@@ -429,7 +429,7 @@ impl HomeView {
                 }
                 Ok(())
             },
-            before_commit,
+            (native_handoff, before_commit),
         )?;
         moved.merge_runtime_for_profile_move(&current);
         moved.source_profile = target.to_string();

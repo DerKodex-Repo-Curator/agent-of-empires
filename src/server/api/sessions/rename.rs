@@ -239,6 +239,14 @@ pub(super) fn persist_rename_metadata(
     new_branch: Option<&str>,
 ) -> anyhow::Result<RenamePersistOutcome> {
     storage.update_with_ownership(ownership, |instances, _groups| {
+        if let Some(current) = instances.iter().find(|instance| instance.id == id) {
+            let path = new_path.unwrap_or(&current.project_path);
+            anyhow::ensure!(
+                !crate::session::is_duplicate_session(instances.iter(), title, path, Some(id)),
+                "{}",
+                crate::session::duplicate_session_error(title)
+            );
+        }
         let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
             return Ok(RenamePersistOutcome::Missing);
         };
@@ -488,8 +496,9 @@ pub async fn rename_session(
         let edit_profile = profile.clone();
         let edit_id = id.clone();
         let edit = tokio::task::spawn_blocking(move || {
-            crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+            let result = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
                 &edit_ownership,
+                &[&_identity_lock, &_session_title_lock, &_lifecycle_lock],
                 &edit_profile,
                 &edit_id,
                 crate::session::worktree_edit::WorktreeEditRequest {
@@ -499,12 +508,23 @@ pub async fn rename_session(
                     rename_branch,
                 },
             )
-            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch));
+            (result, _identity_lock, _session_title_lock, _lifecycle_lock)
         })
         .await;
+        let (result, identity, title_lock, lifecycle) = match edit {
+            Ok(locked) => locked,
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", %error, "Worktree edit task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        _identity_lock = identity;
+        _session_title_lock = title_lock;
+        _lifecycle_lock = lifecycle;
 
-        match edit {
-            Ok(Ok((path, branch))) => {
+        match result {
+            Ok((path, branch)) => {
                 // A sandbox container created against the old path is stale
                 // once the dir moved, so drop it to force a fresh create.
                 // Awaited so an immediate restart cannot race the removal.
@@ -523,19 +543,11 @@ pub async fn rename_session(
             }
             // The title slug already maps to the current leaf and no branch
             // rename was asked for: fall through to a plain title rename.
-            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
-            Ok(Err(e)) => {
+            Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
+            Err(e) => {
                 tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
                 let (code, msg) = worktree_edit_error_response(&e);
                 return (code, Json(serde_json::json!({ "message": msg }))).into_response();
-            }
-            Err(e) => {
-                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
-                )
-                    .into_response();
             }
         }
     }
@@ -923,8 +935,9 @@ pub async fn set_worktree_name(
     let edit_profile = profile.clone();
     let edit_id = id.clone();
     let edit = tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
+        let result = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
             &edit_ownership,
+            &[&_identity_lock, &_exclusive_title_lock, &_lifecycle_lock],
             &edit_profile,
             &edit_id,
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -934,24 +947,31 @@ pub async fn set_worktree_name(
                 rename_branch,
             },
         )
-        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
+        .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch));
+        (
+            result,
+            _identity_lock,
+            _exclusive_title_lock,
+            _lifecycle_lock,
+        )
     })
     .await;
+    let (result, identity, _exclusive_title_lock, lifecycle) = match edit {
+        Ok(locked) => locked,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Worktree edit task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    _identity_lock = identity;
+    _lifecycle_lock = lifecycle;
 
-    let (new_path, new_branch) = match edit {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
+    let (new_path, new_branch) = match result {
+        Ok(v) => v,
+        Err(e) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "worktree edit failed: {e}");
             let (code, msg) = worktree_edit_error_response(&e);
             return (code, Json(serde_json::json!({ "message": msg }))).into_response();
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "worktree edit join failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "message": "Worktree edit task failed" })),
-            )
-                .into_response();
         }
     };
 

@@ -347,11 +347,23 @@ fn workspace_ordering_lock() -> &'static Mutex<()> {
 #[derive(Debug)]
 struct HeldFlock {
     file: fs::File,
+    path: PathBuf,
 }
 
 impl Drop for HeldFlock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
+    }
+}
+
+impl HeldFlock {
+    fn verify_route(&self) -> Result<()> {
+        anyhow::ensure!(
+            filesystem_identity(&self.file.metadata()?)
+                == filesystem_identity(&fs::metadata(&self.path)?),
+            "Native callback replaced a lock file"
+        );
+        Ok(())
     }
 }
 
@@ -361,22 +373,48 @@ pub(crate) struct StorageFlock {
     ownership: Option<OwnershipGuard>,
 }
 
+impl StorageFlock {
+    pub(crate) fn pause_native(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.ownership.is_none(),
+            "Native nested lock owns another root lease"
+        );
+        self.held.verify_route()?;
+        FileExt::unlock(&self.held.file)?;
+        Ok(())
+    }
+
+    pub(crate) fn resume_native(&self) -> Result<()> {
+        FileExt::lock_exclusive(&self.held.file)?;
+        self.held.verify_route()
+    }
+}
+
 /// Shared leases protect claims; exclusive leases protect namespace and Git effects.
 #[derive(Debug)]
 pub(crate) struct OwnershipGuard {
     _held: HeldFlock,
-    app_dir: PathBuf,
     exclusive: bool,
+    native_paused: std::sync::atomic::AtomicBool,
 }
 
 impl OwnershipGuard {
     pub(crate) fn app_dir(&self) -> &Path {
-        &self.app_dir
+        self._held
+            .path
+            .parent()
+            .expect("ownership lock has an application directory")
     }
 
     fn verify(&self) -> Result<()> {
         anyhow::ensure!(
-            paths_share_filesystem_identity(&self.app_dir, &get_app_dir()?)?,
+            !self
+                .native_paused
+                .load(std::sync::atomic::Ordering::Acquire),
+            "Native callback ownership is suspended"
+        );
+        anyhow::ensure!(
+            paths_share_filesystem_identity(self.app_dir(), &get_app_dir()?)?,
             "ownership guard belongs to a different application directory"
         );
         Ok(())
@@ -390,6 +428,27 @@ impl OwnershipGuard {
         );
         Ok(())
     }
+
+    pub(crate) fn pause_native(&self) -> Result<()> {
+        self.require_exclusive()?;
+        self._held.verify_route()?;
+        self.native_paused
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Err(error) = FileExt::unlock(&self._held.file) {
+            self.native_paused
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_native(&self) -> Result<()> {
+        FileExt::lock_exclusive(&self._held.file)?;
+        self._held.verify_route()?;
+        self.native_paused
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.require_exclusive()
+    }
 }
 
 fn ownership_lock(shared: bool) -> Result<OwnershipGuard> {
@@ -401,13 +460,26 @@ fn ownership_lock(shared: bool) -> Result<OwnershipGuard> {
     };
     Ok(OwnershipGuard {
         _held: lock.held,
-        app_dir,
         exclusive: !shared,
+        native_paused: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
 pub(crate) fn acquire_ownership_read() -> Result<OwnershipGuard> {
     ownership_lock(true)
+}
+pub(crate) fn try_acquire_ownership_read() -> Result<Option<OwnershipGuard>> {
+    let app_dir = get_app_dir()?;
+    let (file, path) = open_storage_lock_file(&app_dir, ".workspace-claim.lock")?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Some(OwnershipGuard {
+            _held: HeldFlock { file, path },
+            exclusive: false,
+            native_paused: std::sync::atomic::AtomicBool::new(false),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn acquire_ownership_lock() -> Result<OwnershipGuard> {
@@ -679,7 +751,10 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
         }
     }
     Ok(StorageFlock {
-        held: HeldFlock { file },
+        held: HeldFlock {
+            file,
+            path: path.to_path_buf(),
+        },
         ownership: None,
     })
 }
@@ -711,7 +786,10 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
         }
     }
     Ok(StorageFlock {
-        held: HeldFlock { file },
+        held: HeldFlock {
+            file,
+            path: path.to_path_buf(),
+        },
         ownership: None,
     })
 }
@@ -728,7 +806,7 @@ pub(crate) fn acquire_session_identity_lock_with_ownership(
     ownership: &OwnershipGuard,
 ) -> Result<StorageFlock> {
     ownership.verify()?;
-    acquire_storage_flock(&ownership.app_dir, SESSION_IDENTITY_LOCK_FILENAME)
+    acquire_storage_flock(ownership.app_dir(), SESSION_IDENTITY_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
@@ -748,7 +826,7 @@ pub(crate) fn acquire_session_title_lock_with_ownership(
     super::validate_instance_id(instance_id)
         .context("refusing session title lock for invalid instance id")?;
     acquire_storage_flock(
-        &ownership.app_dir,
+        ownership.app_dir(),
         &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
     )
 }
@@ -871,10 +949,10 @@ pub(crate) fn acquire_storage_shared_flock(dir: &Path, name: &str) -> Result<Sto
 
 /// [`acquire_storage_flock`] without the wait.
 pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option<StorageFlock>> {
-    let (file, _path) = open_storage_lock_file(dir, name)?;
+    let (file, path) = open_storage_lock_file(dir, name)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(StorageFlock {
-            held: HeldFlock { file },
+            held: HeldFlock { file, path },
             ownership: None,
         })),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -933,6 +1011,33 @@ struct MoveTransactionPlan<'a> {
     /// agents, so the moved row keeps its conversation; see
     /// [`Instance::merge_profile_move_diff`].
     account_swap: bool,
+}
+
+fn record_move_journal(
+    source: &Storage,
+    target: &Storage,
+    ids: &std::collections::HashSet<&str>,
+    plan: &MoveTransactionPlan<'_>,
+) -> Result<PathBuf> {
+    let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    ids.sort();
+    let entry = super::move_journal::MoveJournalEntry {
+        version: super::move_journal::MOVE_JOURNAL_VERSION,
+        ids,
+        source_profile: source.profile.clone(),
+        target_profile: target.profile.clone(),
+        source_sessions_path: source.sessions_path.clone(),
+        target_sessions_path: target.sessions_path.clone(),
+        group_move_source_path: plan.group_move.source_path.clone(),
+        group_move_target_path: plan.group_move.target_path.clone(),
+        group_move_subtree: plan.group_move.move_subtree,
+        created_at_epoch_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default(),
+    };
+    super::move_journal::record(&entry, &source.sessions_path)
+        .context("recording the durable move journal failed; no move effect or profile row changed")
 }
 
 fn apply_group_move(
@@ -1413,21 +1518,22 @@ impl Storage {
         Ok(result)
     }
 
-    /// Move one session, running `before_commit` only after the authoritative
-    /// target validation succeeds while both profile locks are still held.
+    /// Move one session after authoritative target validation. Native effects
+    /// release profile locks after journaling, then reload and validate again.
     pub(crate) fn move_instance_to_with_effect_with_ownership<F, B>(
         &self,
         ownership: &OwnershipGuard,
         target: &Storage,
         change: (&Instance, &Instance),
         account_swap: bool,
-        validate_target: F,
-        before_commit: B,
+        mut validate_target: F,
+        effect: (bool, B),
     ) -> Result<Instance>
     where
-        F: FnOnce(&[Instance], &Instance) -> Result<()>,
+        F: FnMut(&[Instance], &Instance) -> Result<()>,
         B: FnOnce(&Instance) -> Result<()>,
     {
+        let (native_handoff, before_commit) = effect;
         let (before, after) = change;
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
@@ -1443,6 +1549,7 @@ impl Storage {
             (
                 |instances, candidates| validate_target(instances, &candidates[0]),
                 |candidates| before_commit(&candidates[0]),
+                native_handoff,
             ),
             sync_resolved_parent_directory,
         )?;
@@ -1458,7 +1565,7 @@ impl Storage {
         validate_target: F,
     ) -> Result<Vec<Instance>>
     where
-        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
+        F: FnMut(&[Instance], &[Instance]) -> Result<()>,
     {
         self.move_instances_to_inner(
             target,
@@ -1484,7 +1591,7 @@ impl Storage {
         sync_target_parent: S,
     ) -> Result<Vec<Instance>>
     where
-        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
+        F: FnMut(&[Instance], &[Instance]) -> Result<()>,
         B: FnOnce(&[Instance]) -> Result<()>,
         S: FnMut(&Path) -> Result<()>,
     {
@@ -1494,7 +1601,7 @@ impl Storage {
             target,
             changes,
             plan,
-            (validate_target, before_commit),
+            (validate_target, before_commit, false),
             sync_target_parent,
         )
     }
@@ -1505,314 +1612,251 @@ impl Storage {
         target: &Storage,
         changes: &[(Instance, Instance)],
         plan: MoveTransactionPlan<'_>,
-        callbacks: (F, B),
+        callbacks: (F, B, bool),
         mut sync_target_parent: S,
     ) -> Result<Vec<Instance>>
     where
-        F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
+        F: FnMut(&[Instance], &[Instance]) -> Result<()>,
         B: FnOnce(&[Instance]) -> Result<()>,
         S: FnMut(&Path) -> Result<()>,
     {
         ownership.verify()?;
-        let (validate_target, before_commit) = callbacks;
-        self.verify_profile_identity()?;
-        target.verify_profile_identity()?;
-        if self.profile == target.profile {
-            return Err(anyhow!("source and target profile are the same"));
+        let (mut validate_target, before_commit, mut native_handoff) = callbacks;
+        let mut before_commit = Some(before_commit);
+        let mut prepared_journal = None;
+        if native_handoff {
+            ownership.require_exclusive()?;
         }
-        let source_dir = self
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("source sessions path has no parent"))?
-            .canonicalize()?;
-        let target_dir = target
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("target sessions path has no parent"))?
-            .canonicalize()?;
-        if source_dir == target_dir || paths_share_filesystem_identity(&source_dir, &target_dir)? {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical directory"
-            ));
-        }
-
-        let _mutexes = lock_two_save_mutexes(self, target);
-        let (first, second) = (self, target);
-        let first_dir = first
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-        let second_dir = second
-            .sessions_path
-            .parent()
-            .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-        let _transition_flocks =
-            acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
-        let (first_lock_file, first_lock_path) =
-            open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
-        let (second_lock_file, second_lock_path) =
-            open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
-        if same_filesystem_identity(&first_lock_file.metadata()?, &second_lock_file.metadata()?) {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical storage lock"
-            ));
-        }
-        let _flocks = acquire_two_open_storage_flocks(
-            OpenStorageLock::new(first_lock_file, first_lock_path)?,
-            OpenStorageLock::new(second_lock_file, second_lock_path)?,
-        )?;
-        self.verify_profile_identity()?;
-        target.verify_profile_identity()?;
-
-        let source_groups_path = self.sessions_path.with_file_name("groups.json");
-        let target_groups_path = target.sessions_path.with_file_name("groups.json");
-        if existing_paths_share_filesystem_identity(&self.sessions_path, &target.sessions_path)? {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical sessions file"
-            ));
-        }
-        if existing_paths_share_filesystem_identity(&source_groups_path, &target_groups_path)? {
-            return Err(anyhow!(
-                "source and target profiles resolve to the same physical groups file"
-            ));
-        }
-
-        let (mut source_instances, mut source_groups) = self.load_with_groups()?;
-        let (mut target_instances, mut target_groups) = target.load_with_groups()?;
-        let mut ids = std::collections::HashSet::with_capacity(changes.len());
-        let mut moved = Vec::with_capacity(changes.len());
-        for (before, after) in changes {
-            if !ids.insert(before.id.as_str()) {
-                return Err(anyhow!("duplicate session id in profile move batch"));
+        loop {
+            self.verify_profile_identity()?;
+            target.verify_profile_identity()?;
+            if self.profile == target.profile {
+                return Err(anyhow!("source and target profile are the same"));
             }
-            let source = source_instances
-                .iter()
-                .find(|instance| instance.id == before.id)
-                .ok_or_else(|| anyhow!("Session not found in source profile"))?;
-            if target_instances
-                .iter()
-                .any(|instance| instance.id == before.id)
+            let source_dir = self
+                .sessions_path
+                .parent()
+                .ok_or_else(|| anyhow!("source sessions path has no parent"))?
+                .canonicalize()?;
+            let target_dir = target
+                .sessions_path
+                .parent()
+                .ok_or_else(|| anyhow!("target sessions path has no parent"))?
+                .canonicalize()?;
+            if source_dir == target_dir
+                || paths_share_filesystem_identity(&source_dir, &target_dir)?
             {
-                return Err(anyhow!("Session already exists in target profile"));
-            }
-            let mut candidate = source.clone();
-            if plan.merge_complete_post {
-                candidate.merge_profile_move_diff(before, after, plan.account_swap);
-            } else {
-                candidate.merge_user_action_diff(before, after);
-            }
-            candidate.source_profile.clone_from(&target.profile);
-            moved.push(candidate);
-        }
-        if plan.group_move.move_subtree {
-            let source_prefix = format!("{}/", plan.group_move.source_path);
-            let locked_members: std::collections::HashSet<&str> = source_instances
-                .iter()
-                .filter(|instance| {
-                    instance.group_path == plan.group_move.source_path
-                        || instance.group_path.starts_with(&source_prefix)
-                })
-                .map(|instance| instance.id.as_str())
-                .collect();
-            if locked_members != ids {
                 return Err(anyhow!(
-                    "group membership changed while the cross-profile move was pending"
+                    "source and target profiles resolve to the same physical directory"
                 ));
             }
-        }
-        validate_target(&target_instances, &moved)?;
 
-        let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
-        let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
-        let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
-
-        let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
-        source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
-        target_instances.extend(moved.iter().cloned());
-        apply_group_move(
-            plan.group_move,
-            &source_instances,
-            &mut source_groups,
-            &target_instances,
-            &mut target_groups,
-        );
-        let source_instances_after = serde_json::to_vec_pretty(&source_instances)?;
-        let source_groups_after = serde_json::to_vec_pretty(&source_groups)?;
-        let target_instances_after = serde_json::to_vec_pretty(&target_instances)?;
-        let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
-        let source_groups_changed = source_groups_after != source_groups_before;
-        let target_groups_changed = target_groups_after != target_groups_before;
-        let journal_entry = super::move_journal::MoveJournalEntry {
-            version: super::move_journal::MOVE_JOURNAL_VERSION,
-            ids: {
-                let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
-                ids.sort();
-                ids
-            },
-            source_profile: self.profile.clone(),
-            target_profile: target.profile.clone(),
-            source_sessions_path: self.sessions_path.clone(),
-            target_sessions_path: target.sessions_path.clone(),
-            group_move_source_path: plan.group_move.source_path.clone(),
-            group_move_target_path: plan.group_move.target_path.clone(),
-            group_move_subtree: plan.group_move.move_subtree,
-            created_at_epoch_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or_default(),
-        };
-        let journal_path = super::move_journal::record(&journal_entry, &self.sessions_path)
-            .context(
-                "recording the durable move journal failed; no move effect or profile row changed",
+            let _mutexes = lock_two_save_mutexes(self, target);
+            let (first, second) = (self, target);
+            let first_dir = first
+                .sessions_path
+                .parent()
+                .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+            let second_dir = second
+                .sessions_path
+                .parent()
+                .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+            let _transition_flocks =
+                acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
+            let (first_lock_file, first_lock_path) =
+                open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+            let (second_lock_file, second_lock_path) =
+                open_existing_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+            if same_filesystem_identity(&first_lock_file.metadata()?, &second_lock_file.metadata()?)
+            {
+                return Err(anyhow!(
+                    "source and target profiles resolve to the same physical storage lock"
+                ));
+            }
+            let _flocks = acquire_two_open_storage_flocks(
+                OpenStorageLock::new(first_lock_file, first_lock_path)?,
+                OpenStorageLock::new(second_lock_file, second_lock_path)?,
             )?;
-        #[cfg(test)]
-        test_crash_point("profile-move-journal");
-        // The durable journal precedes every mutation, including the external
-        // worktree/container effect.
-        before_commit(&moved)?;
+            self.verify_profile_identity()?;
+            target.verify_profile_identity()?;
 
-        let resolved_target_groups_path = if target_groups_changed {
-            Some(atomic_write_verified_resolved(
-                &target_groups_path,
-                &target_groups_after,
-            )?)
-        } else {
-            None
-        };
-        let resolved_target_sessions_path = match atomic_write_verified_resolved(
-            &target.sessions_path,
-            &target_instances_after,
-        ) {
-            Ok(path) => path,
-            Err(target_error) => {
-                if target_groups_changed {
-                    if let Err(rollback_error) = restore_file_durably(
-                        &target_groups_path,
-                        &target_groups_before,
-                        || "target group rollback failed".to_string(),
-                        || "target group rollback was not durable".to_string(),
-                    ) {
-                        return Err(anyhow!(
+            let source_groups_path = self.sessions_path.with_file_name("groups.json");
+            let target_groups_path = target.sessions_path.with_file_name("groups.json");
+            if existing_paths_share_filesystem_identity(&self.sessions_path, &target.sessions_path)?
+            {
+                return Err(anyhow!(
+                    "source and target profiles resolve to the same physical sessions file"
+                ));
+            }
+            if existing_paths_share_filesystem_identity(&source_groups_path, &target_groups_path)? {
+                return Err(anyhow!(
+                    "source and target profiles resolve to the same physical groups file"
+                ));
+            }
+
+            let (mut source_instances, mut source_groups) = self.load_with_groups()?;
+            let (mut target_instances, mut target_groups) = target.load_with_groups()?;
+            let mut ids = std::collections::HashSet::with_capacity(changes.len());
+            let mut moved = Vec::with_capacity(changes.len());
+            for (before, after) in changes {
+                if !ids.insert(before.id.as_str()) {
+                    return Err(anyhow!("duplicate session id in profile move batch"));
+                }
+                let source = source_instances
+                    .iter()
+                    .find(|instance| instance.id == before.id)
+                    .ok_or_else(|| anyhow!("Session not found in source profile"))?;
+                if target_instances
+                    .iter()
+                    .any(|instance| instance.id == before.id)
+                {
+                    return Err(anyhow!("Session already exists in target profile"));
+                }
+                let mut candidate = source.clone();
+                if plan.merge_complete_post {
+                    candidate.merge_profile_move_diff(before, after, plan.account_swap);
+                } else {
+                    candidate.merge_user_action_diff(before, after);
+                }
+                candidate.source_profile.clone_from(&target.profile);
+                moved.push(candidate);
+            }
+            if plan.group_move.move_subtree {
+                let source_prefix = format!("{}/", plan.group_move.source_path);
+                let locked_members: std::collections::HashSet<&str> = source_instances
+                    .iter()
+                    .filter(|instance| {
+                        instance.group_path == plan.group_move.source_path
+                            || instance.group_path.starts_with(&source_prefix)
+                    })
+                    .map(|instance| instance.id.as_str())
+                    .collect();
+                if locked_members != ids {
+                    return Err(anyhow!(
+                        "group membership changed while the cross-profile move was pending"
+                    ));
+                }
+            }
+            validate_target(&target_instances, &moved)?;
+
+            if native_handoff {
+                prepared_journal = Some(record_move_journal(self, target, &ids, &plan)?);
+                #[cfg(test)]
+                test_crash_point("profile-move-journal");
+                // Git may hand the root/session leases off only after all profile
+                // save mutexes and transition/storage flocks have left scope.
+                drop(_flocks);
+                drop(_transition_flocks);
+                drop(_mutexes);
+                before_commit.take().context("native move effect missing")?(&moved)?;
+                native_handoff = false;
+                continue;
+            }
+
+            let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
+            let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
+            let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
+
+            let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
+            source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
+            target_instances.extend(moved.iter().cloned());
+            apply_group_move(
+                plan.group_move,
+                &source_instances,
+                &mut source_groups,
+                &target_instances,
+                &mut target_groups,
+            );
+            let source_instances_after = serde_json::to_vec_pretty(&source_instances)?;
+            let source_groups_after = serde_json::to_vec_pretty(&source_groups)?;
+            let target_instances_after = serde_json::to_vec_pretty(&target_instances)?;
+            let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
+            let source_groups_changed = source_groups_after != source_groups_before;
+            let target_groups_changed = target_groups_after != target_groups_before;
+            let journal_path = match prepared_journal.take() {
+                Some(path) => path,
+                None => record_move_journal(self, target, &ids, &plan)?,
+            };
+            #[cfg(test)]
+            test_crash_point("profile-move-journal");
+            // The durable journal precedes every mutation, including the external
+            // worktree/container effect.
+            if let Some(before_commit) = before_commit.take() {
+                before_commit(&moved)?;
+            }
+
+            let resolved_target_groups_path = if target_groups_changed {
+                Some(atomic_write_verified_resolved(
+                    &target_groups_path,
+                    &target_groups_after,
+                )?)
+            } else {
+                None
+            };
+            let resolved_target_sessions_path = match atomic_write_verified_resolved(
+                &target.sessions_path,
+                &target_instances_after,
+            ) {
+                Ok(path) => path,
+                Err(target_error) => {
+                    if target_groups_changed {
+                        if let Err(rollback_error) = restore_file_durably(
+                            &target_groups_path,
+                            &target_groups_before,
+                            || "target group rollback failed".to_string(),
+                            || "target group rollback was not durable".to_string(),
+                        ) {
+                            return Err(anyhow!(
                             "target profile write failed ({target_error}); target group rollback also failed or was not durable ({rollback_error})"
                         ));
+                        }
                     }
+                    return Err(target_error);
                 }
-                return Err(target_error);
+            };
+            // `atomic_write` already syncs file content and attempts a directory sync.
+            if let Some(path) = resolved_target_groups_path.as_deref() {
+                sync_target_parent(path)?;
             }
-        };
-        // `atomic_write` already syncs file content and attempts a directory sync.
-        if let Some(path) = resolved_target_groups_path.as_deref() {
-            sync_target_parent(path)?;
-        }
-        sync_target_parent(&resolved_target_sessions_path)?;
-        #[cfg(test)]
-        test_crash_point("profile-move-target");
-        if target_groups_changed {
-            target.file_watch.notify_local_change(&target_groups_path);
-        }
-        target.file_watch.notify_local_change(&target.sessions_path);
+            sync_target_parent(&resolved_target_sessions_path)?;
+            #[cfg(test)]
+            test_crash_point("profile-move-target");
+            if target_groups_changed {
+                target.file_watch.notify_local_change(&target_groups_path);
+            }
+            target.file_watch.notify_local_change(&target.sessions_path);
 
-        if source_groups_changed {
-            let source_group_result =
-                atomic_write_verified(&source_groups_path, &source_groups_after)
-                    .and_then(|()| sync_parent_directory(&source_groups_path));
-            if let Err(source_group_error) = source_group_result {
-                restore_file_durably(
-                    &source_groups_path,
-                    &source_groups_before,
-                    || {
-                        format!(
+            if source_groups_changed {
+                let source_group_result =
+                    atomic_write_verified(&source_groups_path, &source_groups_after)
+                        .and_then(|()| sync_parent_directory(&source_groups_path));
+                if let Err(source_group_error) = source_group_result {
+                    restore_file_durably(
+                        &source_groups_path,
+                        &source_groups_before,
+                        || {
+                            format!(
                             "source group write failed ({source_group_error}); source group rollback failed"
                         )
-                    },
-                    || {
-                        format!(
+                        },
+                        || {
+                            format!(
                             "source group write failed ({source_group_error}); source group rollback was not durable"
                         )
-                    },
-                )?;
-                restore_file_durably(
-                    &target.sessions_path,
-                    &target_instances_before,
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); target session rollback failed"
-                        )
-                    },
-                    || {
-                        format!(
-                            "source group write failed ({source_group_error}); target session rollback was not durable"
-                        )
-                    },
-                )?;
-                if target_groups_changed {
-                    restore_file_durably(
-                        &target_groups_path,
-                        &target_groups_before,
-                        || {
-                            format!(
-                                "source group write failed ({source_group_error}); target group rollback failed"
-                            )
-                        },
-                        || {
-                            format!(
-                                "source group write failed ({source_group_error}); target group rollback was not durable"
-                            )
                         },
                     )?;
-                }
-                self.file_watch.notify_local_change(&source_groups_path);
-                target.file_watch.notify_local_change(&target.sessions_path);
-                if target_groups_changed {
-                    target.file_watch.notify_local_change(&target_groups_path);
-                }
-                return Err(source_group_error);
-            }
-            #[cfg(test)]
-            test_crash_point("profile-move-source-groups");
-        }
-        #[cfg(test)]
-        test_crash_point("profile-move-source-sessions");
-        if let Err(source_error) =
-            atomic_write_verified(&self.sessions_path, &source_instances_after)
-        {
-            match self.load() {
-                Ok(instances)
-                    if moved
-                        .iter()
-                        .all(|candidate| instances.iter().all(|row| row.id != candidate.id)) =>
-                {
-                    tracing::warn!(target: "session.store", error = %source_error, "source profile write committed but could not be byte-verified");
-                }
-                Ok(_) => {
-                    if source_groups_changed {
-                        restore_file_durably(
-                            &source_groups_path,
-                            &source_groups_before,
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); source group rollback failed"
-                                )
-                            },
-                            || {
-                                format!(
-                                    "source session write failed ({source_error}); source group rollback was not durable"
-                                )
-                            },
-                        )?;
-                    }
                     restore_file_durably(
                         &target.sessions_path,
                         &target_instances_before,
                         || {
                             format!(
-                                "source session write failed ({source_error}); target session rollback failed"
-                            )
+                            "source group write failed ({source_group_error}); target session rollback failed"
+                        )
                         },
                         || {
                             format!(
-                                "source session write failed ({source_error}); target session rollback was not durable"
-                            )
+                            "source group write failed ({source_group_error}); target session rollback was not durable"
+                        )
                         },
                     )?;
                     if target_groups_changed {
@@ -1821,82 +1865,153 @@ impl Storage {
                             &target_groups_before,
                             || {
                                 format!(
-                                    "source session write failed ({source_error}); target group rollback failed"
-                                )
+                                "source group write failed ({source_group_error}); target group rollback failed"
+                            )
                             },
                             || {
                                 format!(
-                                    "source session write failed ({source_error}); target group rollback was not durable"
-                                )
+                                "source group write failed ({source_group_error}); target group rollback was not durable"
+                            )
                             },
                         )?;
                     }
-                    if source_groups_changed {
-                        self.file_watch.notify_local_change(&source_groups_path);
-                    }
+                    self.file_watch.notify_local_change(&source_groups_path);
                     target.file_watch.notify_local_change(&target.sessions_path);
                     if target_groups_changed {
                         target.file_watch.notify_local_change(&target_groups_path);
                     }
-                    return Err(source_error);
+                    return Err(source_group_error);
                 }
-                Err(verify_error) => {
-                    return Err(anyhow!(
+                #[cfg(test)]
+                test_crash_point("profile-move-source-groups");
+            }
+            #[cfg(test)]
+            test_crash_point("profile-move-source-sessions");
+            if let Err(source_error) =
+                atomic_write_verified(&self.sessions_path, &source_instances_after)
+            {
+                match self.load() {
+                    Ok(instances)
+                        if moved.iter().all(|candidate| {
+                            instances.iter().all(|row| row.id != candidate.id)
+                        }) =>
+                    {
+                        tracing::warn!(target: "session.store", error = %source_error, "source profile write committed but could not be byte-verified");
+                    }
+                    Ok(_) => {
+                        if source_groups_changed {
+                            restore_file_durably(
+                                &source_groups_path,
+                                &source_groups_before,
+                                || {
+                                    format!(
+                                    "source session write failed ({source_error}); source group rollback failed"
+                                )
+                                },
+                                || {
+                                    format!(
+                                    "source session write failed ({source_error}); source group rollback was not durable"
+                                )
+                                },
+                            )?;
+                        }
+                        restore_file_durably(
+                            &target.sessions_path,
+                            &target_instances_before,
+                            || {
+                                format!(
+                                "source session write failed ({source_error}); target session rollback failed"
+                            )
+                            },
+                            || {
+                                format!(
+                                "source session write failed ({source_error}); target session rollback was not durable"
+                            )
+                            },
+                        )?;
+                        if target_groups_changed {
+                            restore_file_durably(
+                                &target_groups_path,
+                                &target_groups_before,
+                                || {
+                                    format!(
+                                    "source session write failed ({source_error}); target group rollback failed"
+                                )
+                                },
+                                || {
+                                    format!(
+                                    "source session write failed ({source_error}); target group rollback was not durable"
+                                )
+                                },
+                            )?;
+                        }
+                        if source_groups_changed {
+                            self.file_watch.notify_local_change(&source_groups_path);
+                        }
+                        target.file_watch.notify_local_change(&target.sessions_path);
+                        if target_groups_changed {
+                            target.file_watch.notify_local_change(&target_groups_path);
+                        }
+                        return Err(source_error);
+                    }
+                    Err(verify_error) => {
+                        return Err(anyhow!(
                         "source profile write failed ({source_error}) and could not be verified ({verify_error}); target copies were retained"
                     ));
+                    }
                 }
             }
-        }
-        if let Err(sync_error) = sync_parent_directory(&self.sessions_path) {
-            if source_groups_changed {
-                restore_file_durably(
-                    &source_groups_path,
-                    &source_groups_before,
-                    || {
-                        format!(
+            if let Err(sync_error) = sync_parent_directory(&self.sessions_path) {
+                if source_groups_changed {
+                    restore_file_durably(
+                        &source_groups_path,
+                        &source_groups_before,
+                        || {
+                            format!(
                             "source session directory sync failed ({sync_error}); source group restore failed"
                         )
+                        },
+                        || {
+                            format!(
+                            "source session directory sync failed ({sync_error}); restored source groups were not durable"
+                        )
+                        },
+                    )?;
+                    self.file_watch.notify_local_change(&source_groups_path);
+                }
+                restore_file_durably(
+                    &self.sessions_path,
+                    &source_instances_before,
+                    || {
+                        format!(
+                        "source session directory sync failed ({sync_error}); source row restore failed"
+                    )
                     },
                     || {
                         format!(
-                            "source session directory sync failed ({sync_error}); restored source groups were not durable"
-                        )
-                    },
-                )?;
-                self.file_watch.notify_local_change(&source_groups_path);
-            }
-            restore_file_durably(
-                &self.sessions_path,
-                &source_instances_before,
-                || {
-                    format!(
-                        "source session directory sync failed ({sync_error}); source row restore failed"
-                    )
-                },
-                || {
-                    format!(
                         "source session directory sync failed ({sync_error}); restored source rows were not durable"
                     )
-                },
-            )?;
-            self.file_watch.notify_local_change(&self.sessions_path);
-            return Err(anyhow!(
+                    },
+                )?;
+                self.file_watch.notify_local_change(&self.sessions_path);
+                return Err(anyhow!(
                 "source session removal was not durable ({sync_error}); source rows were restored and target copies retained"
             ));
+            }
+            // Every write and directory barrier above has passed.
+            if let Err(error) = super::move_journal::consume(&journal_path) {
+                tracing::warn!(
+                    target: "session.store",
+                    error = %error,
+                    "completed profile move could not consume its journal; recovery will discard it"
+                );
+            }
+            if source_groups_changed {
+                self.file_watch.notify_local_change(&source_groups_path);
+            }
+            self.file_watch.notify_local_change(&self.sessions_path);
+            return Ok(moved);
         }
-        // Every write and directory barrier above has passed.
-        if let Err(error) = super::move_journal::consume(&journal_path) {
-            tracing::warn!(
-                target: "session.store",
-                error = %error,
-                "completed profile move could not consume its journal; recovery will discard it"
-            );
-        }
-        if source_groups_changed {
-            self.file_watch.notify_local_change(&source_groups_path);
-        }
-        self.file_watch.notify_local_change(&self.sessions_path);
-        Ok(moved)
     }
 }
 
@@ -3915,16 +4030,133 @@ mod tests {
                 }
                 Ok(())
             },
-            |_| {
+            (false, |_| {
                 effect_ran.set(true);
                 Ok(())
-            },
+            }),
         );
 
         assert!(result.is_err());
         assert!(!effect_ran.get());
         assert_eq!(source.load()?.len(), 1);
         assert_eq!(target.load()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn native_profile_move_reloads_metadata_and_revalidates_target() -> Result<()> {
+        for collision in [false, true] {
+            let temp = tempdir()?;
+            let _guard = setup_test_home(temp.path());
+            let source = Storage::new_unwatched("native-source")?;
+            let target = Storage::new_unwatched("native-target")?;
+            let mut before = Instance::new("before", "/repo/checkout");
+            before.group_path = "original-group".into();
+            source.update(|rows, _| {
+                rows.push(before.clone());
+                Ok(())
+            })?;
+            let mut requested = before.clone();
+            requested.title = "requested-title".into();
+            let root = acquire_ownership_lock()?;
+            let validations = std::cell::Cell::new(0);
+            let result = source.move_instance_to_with_effect_with_ownership(
+                &root,
+                &target,
+                (&before, &requested),
+                false,
+                |rows, candidate| {
+                    validations.set(validations.get() + 1);
+                    anyhow::ensure!(
+                        !crate::session::is_duplicate_session(
+                            rows.iter(),
+                            &candidate.title,
+                            &candidate.project_path,
+                            None
+                        ),
+                        "duplicate after native callback"
+                    );
+                    Ok(())
+                },
+                (true, |_| {
+                    let journal =
+                        super::super::move_journal::scan([source.sessions_path().to_path_buf()]);
+                    assert_eq!(
+                        journal.entries.len(),
+                        1,
+                        "the existing journal must precede the effect"
+                    );
+                    assert!(journal.entries[0].1.as_ref().unwrap().is_current());
+                    assert!(
+                        source.save_lock.try_lock().is_ok(),
+                        "source save mutex crossed native callback"
+                    );
+                    assert!(
+                        target.save_lock.try_lock().is_ok(),
+                        "target save mutex crossed native callback"
+                    );
+                    for storage in [&source, &target] {
+                        let lock = try_acquire_storage_flock(
+                            storage.sessions_path().parent().unwrap(),
+                            STORAGE_LOCK_FILENAME,
+                        )?
+                        .expect("storage flock crossed native callback");
+                        drop(lock);
+                    }
+                    root.pause_native()?;
+                    let callback = (|| -> Result<()> {
+                        source.update(|rows, _| {
+                            rows[0].favorite();
+                            rows[0].group_path = "callback-group".into();
+                            Ok(())
+                        })?;
+                        target.update(|rows, _| {
+                            rows.push(Instance::new(
+                                if collision { "requested-title" } else { "peer" },
+                                if collision { "/repo/checkout" } else { "/peer" },
+                            ));
+                            Ok(())
+                        })?;
+                        Ok(())
+                    })();
+                    root.resume_native()?;
+                    callback
+                }),
+            );
+            assert_eq!(
+                validations.get(),
+                2,
+                "authoritative target validation must be repeated"
+            );
+            let remaining =
+                super::super::move_journal::scan([source.sessions_path().to_path_buf()]);
+            if collision {
+                assert!(result.is_err());
+                assert_eq!(source.load()?[0].title, "before");
+                assert_eq!(target.load()?.len(), 1);
+                assert_eq!(
+                    remaining.entries.len(),
+                    1,
+                    "failed move must retain its one recovery journal"
+                );
+            } else {
+                let moved = result?;
+                assert_eq!(moved.title, "requested-title");
+                assert_eq!(moved.group_path, "callback-group");
+                assert!(moved.is_favorited());
+                assert!(source.load()?.is_empty());
+                assert_eq!(
+                    target.load()?.len(),
+                    2,
+                    "callback-created peer row must survive publication"
+                );
+                assert!(
+                    remaining.entries.is_empty(),
+                    "successful move consumes the original journal"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4185,7 +4417,7 @@ mod tests {
                     (&before, &before),
                     false,
                     |_, _| Ok(()),
-                    effect,
+                    (false, effect),
                 )
                 .expect_err("shared inode must be rejected before locking or effects")
         };
