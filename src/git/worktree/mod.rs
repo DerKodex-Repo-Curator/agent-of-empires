@@ -19,7 +19,7 @@ const FETCH_REMOTE: &str = "origin";
 
 /// Bound for local metadata mutations that normally take milliseconds but can
 /// hang on a stalled filesystem.
-const WORKTREE_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const WORKTREE_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reason on every aoe-created worktree lock. The lock keeps a `git worktree

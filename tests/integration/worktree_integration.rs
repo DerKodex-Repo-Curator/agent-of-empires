@@ -461,3 +461,162 @@ fn reconcile_refuses_a_checkout_another_session_records() {
     let live_row = reloaded.iter().find(|i| i.id == live.id).unwrap();
     assert_eq!(live_row.project_path, live.project_path);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::parallel]
+fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    for replace in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let home = root.join("home");
+        let xdg = root.join("xdg");
+        let bin = root.join("bin");
+        for directory in [&home, &xdg, &bin] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let repo_path = root.join("repo");
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &repo.find_tree(tree_id).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let hook = repo.path().join("hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf '%s\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = root.join("aoe");
+        std::fs::copy(env!("CARGO_BIN_EXE_aoe"), &executable).unwrap();
+        let replacement = root.join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\nexit 93\n").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real_git = which::which("git").unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$AOE_TEST_REPLACE\" = 1 ] && [ \"$1\" = --exec-path ] && mkdir \"$AOE_TEST_GATE\" 2>/dev/null; then\n mv \"$AOE_TEST_REPLACEMENT\" \"$AOE_TEST_IMAGE\" || exit 94\n readlink \"/proc/$PPID/exe\" > \"$AOE_TEST_IMAGE_AFTER\" || exit 95\nfi\nexec \"$AOE_TEST_REAL_GIT\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 96\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let app = xdg.join(if cfg!(debug_assertions) {
+            "agent-of-empires-dev"
+        } else {
+            "agent-of-empires"
+        });
+        std::fs::create_dir_all(&app).unwrap();
+        crate::common::disable_systemd_scopes(&app);
+        let marker = root.join("hook-ran");
+        let image_after = root.join("image-after");
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "-p",
+                "owner",
+                "add",
+                repo_path.to_str().unwrap(),
+                "--title",
+                "native-proof",
+                "--worktree",
+                "native-proof",
+                "--new-branch",
+                "--cmd",
+                "claude",
+                "--trust-hooks",
+                "--no-submodules",
+            ])
+            .current_dir(root)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_TMUX_SOCKET", root.join("tmux.sock"))
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                )))
+                .unwrap(),
+            )
+            .env("AOE_TEST_REAL_GIT", real_git)
+            .env("AOE_TEST_HOOK", &marker)
+            .env("AOE_TEST_IMAGE", &executable)
+            .env("AOE_TEST_REPLACEMENT", &replacement)
+            .env("AOE_TEST_IMAGE_AFTER", &image_after)
+            .env("AOE_TEST_GATE", root.join("replacement-entered"))
+            .env("AOE_TEST_REPLACE", if replace { "1" } else { "0" })
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
+            .env_remove("CODEX_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("CURSOR_CONFIG_DIR")
+            .env_remove("COPILOT_CONFIG_DIR")
+            .env_remove("KIRO_CONFIG_DIR");
+        let mut create_profile = Command::new(&executable);
+        create_profile
+            .args(["profile", "create", "owner"])
+            .current_dir(root);
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => {
+                    create_profile.env(key, value);
+                }
+                None => {
+                    create_profile.env_remove(key);
+                }
+            }
+        }
+        create_profile.env("AOE_TEST_REPLACE", "0");
+        let created = agent_of_empires::process::run_with_timeout_process_group(
+            &mut create_profile,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+        .expect("profile creation exceeded its deadline");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        let output = agent_of_empires::process::run_with_timeout_process_group(
+            &mut command,
+            std::time::Duration::from_secs(40),
+        )
+        .unwrap()
+        .expect("native CLI creation exceeded its deadline");
+        assert!(
+            output.status.success(),
+            "replace={replace}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            marker.exists(),
+            "replace={replace}: real post-checkout hook was skipped"
+        );
+        if replace {
+            assert!(std::fs::read_to_string(image_after)
+                .unwrap()
+                .ends_with(" (deleted)\n"));
+        }
+        let rows: Vec<Instance> = serde_json::from_slice(
+            &std::fs::read(app.join("profiles/owner/sessions.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(std::path::Path::new(&rows[0].project_path)
+            .join(".git")
+            .exists());
+        assert!(repo
+            .find_branch("native-proof", git2::BranchType::Local)
+            .is_ok());
+    }
+}

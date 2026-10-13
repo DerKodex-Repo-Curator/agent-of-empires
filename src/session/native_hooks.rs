@@ -21,6 +21,7 @@ pub(crate) struct Claim {
     id: String,
     born: chrono::DateTime<chrono::Utc>,
     path: PathBuf,
+    recursive: bool,
     branch: Option<(PathBuf, String)>,
 }
 
@@ -30,6 +31,7 @@ impl Claim {
             profile,
             row,
             &row.project_path,
+            row.worktree_info.is_some(),
             row.worktree_info
                 .as_ref()
                 .map(|wt| (wt.main_repo_path.as_str(), wt.branch.as_str())),
@@ -64,6 +66,7 @@ impl Claim {
         profile: (u64, u64),
         row: &super::Instance,
         path: &str,
+        recursive: bool,
         branch: Option<(&str, &str)>,
     ) -> Result<Self> {
         let resolved = super::deletion::resolve_claim_path(Path::new(path))
@@ -84,6 +87,7 @@ impl Claim {
             id: row.id.clone(),
             born: row.created_at,
             path: resolved,
+            recursive,
             branch,
         })
     }
@@ -123,18 +127,20 @@ fn inventory(
                 continue;
             }
             claims.insert(primary);
-            let mut add = |path: &str, branch: Option<(&str, &str)>| -> Result<()> {
-                claims.insert(Claim::for_path(physical, &row, path, branch)?);
-                Ok(())
-            };
+            let mut add =
+                |path: &str, recursive: bool, branch: Option<(&str, &str)>| -> Result<()> {
+                    claims.insert(Claim::for_path(physical, &row, path, recursive, branch)?);
+                    Ok(())
+                };
             if let Some(path) = &row.pre_trash_project_path {
-                add(path, None)?;
+                add(path, row.worktree_info.is_some(), None)?;
             }
             if let Some(workspace) = &row.workspace_info {
-                add(&workspace.workspace_dir, None)?;
+                add(&workspace.workspace_dir, true, None)?;
                 for repo in &workspace.repos {
                     add(
                         &repo.worktree_path,
+                        true,
                         Some((&repo.main_repo_path, &repo.branch)),
                     )?;
                 }
@@ -188,7 +194,8 @@ fn verify_claims(
         super::deletion::resolve_claim_path(main_repo).context("unresolved native repository")?;
     for claim in claims.difference(baseline) {
         anyhow::ensure!(
-            !(claim.path.starts_with(&target) || target.starts_with(&claim.path))
+            !(claim.path.starts_with(&target)
+                || (claim.recursive && target.starts_with(&claim.path)))
                 && !claim
                     .branch
                     .as_ref()
@@ -378,10 +385,25 @@ pub(crate) struct BranchOrigin {
     directory: DirectoryWitness,
 }
 
+impl std::fmt::Debug for BranchOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BranchOrigin")
+            .field("repo", &self.repo)
+            .field("branch", &self.branch)
+            .field("tip", &self.tip)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BranchOrigin {
     pub(crate) fn repository(&self) -> &Path {
         &self.repo
     }
+    pub(crate) fn branch_name(&self) -> &str {
+        &self.branch
+    }
+
     pub(crate) fn capture(repo: &Path, branch: &str) -> Result<Self> {
         let source = git2::Repository::open(repo)?;
         let reference = source.find_reference(&format!("refs/heads/{branch}"))?;
@@ -753,6 +775,7 @@ pub(crate) struct NativeLease<'a> {
     branch: String,
     detached: bool,
     original_tip: Option<git2::Oid>,
+    owned_branch_origin: Option<std::sync::Arc<BranchOrigin>>,
     boundary: Option<CheckoutBoundary>,
     child_boundary: Option<CheckoutBoundary>,
     partial_directories: Vec<(PathBuf, DirectoryWitness)>,
@@ -822,6 +845,7 @@ impl<'a> NativeLease<'a> {
             branch: branch.to_owned(),
             detached: false,
             original_tip: None,
+            owned_branch_origin: None,
             boundary: None,
             child_boundary: None,
             partial_directories: Vec::new(),
@@ -833,12 +857,13 @@ impl<'a> NativeLease<'a> {
     fn pin_checkout(&mut self) -> Result<()> {
         self.verify()?;
         if self.checkout.is_none() {
-            let candidate = CheckoutWitness::capture_for_branch(
+            let mut candidate = CheckoutWitness::capture_for_branch(
                 &self.path,
                 &self.branch,
                 self.detached,
                 self.original_tip,
             )?;
+            candidate.record_created_branch(self.owned_branch_origin.clone());
             self.verify()?;
             candidate.verify()?;
             self.checkout = Some(candidate);
@@ -899,6 +924,10 @@ impl<'a> NativeLease<'a> {
         ))
     }
 
+    pub(crate) fn take_branch_origin(&mut self) -> Option<std::sync::Arc<BranchOrigin>> {
+        self.owned_branch_origin.take()
+    }
+
     pub(crate) fn receipt(&self, create_branch: bool) -> Option<CreatedWorktree> {
         self.checkout.clone().map(|witness| CreatedWorktree {
             path: self.path.clone(),
@@ -942,6 +971,10 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
         };
         (self.detached, self.original_tip) =
             prepare().map_err(|error| io::Error::other(format!("{error:#}")))?;
+        self.owned_branch_origin = owned_branch
+            .then(|| BranchOrigin::capture(&self.main_repo, &self.branch).map(std::sync::Arc::new))
+            .transpose()
+            .map_err(|error| io::Error::other(format!("{error:#}")))?;
         Ok(())
     }
 
@@ -1038,32 +1071,86 @@ pub(crate) fn create_worktree(
     let mut lease = NativeLease::new(ownership, false, profile, None, checkout, provisional)?;
     let result = lease.create(git, create_branch, base);
     let receipt = lease.receipt(create_branch);
+    let branch = if result.is_err() && receipt.is_none() {
+        lease.take_branch_origin()
+    } else {
+        None
+    };
     drop(lease);
     if result.is_err() {
         drop(ownership.take());
-        cleanup(receipt.as_ref());
+        cleanup(receipt.as_ref(), branch.as_deref(), checkout.1);
     }
     result
 }
 
-pub(crate) fn cleanup(receipt: Option<&CreatedWorktree>) {
-    let Some(receipt) = receipt else {
+pub(crate) fn cleanup(
+    receipt: Option<&CreatedWorktree>,
+    branch: Option<&BranchOrigin>,
+    path: &Path,
+) {
+    if receipt.is_none() && branch.is_none() {
         return;
-    };
+    }
     let Ok(root) = storage::acquire_ownership_lock() else {
         return;
     };
-    cleanup_with_ownership(receipt, BranchHandoff::unpublished(&root));
+    if let Some(receipt) = receipt {
+        cleanup_with_ownership(receipt, BranchHandoff::unpublished(&root), None);
+    } else if let Some(branch) = branch {
+        if let Err(error) =
+            cleanup_branch_with_ownership(branch, path, BranchHandoff::unpublished(&root), None)
+        {
+            tracing::warn!(target: "session.create", "Preserving failed-creation branch: {error:#}");
+        }
+    }
+}
+
+pub(crate) fn cleanup_branch_with_ownership(
+    origin: &BranchOrigin,
+    path: &Path,
+    handoff: BranchHandoff<'_>,
+    workspace_owner: Option<(&Storage, &super::Instance)>,
+) -> Result<()> {
+    handoff.root.require_exclusive()?;
+    origin.verify(None)?;
+    anyhow::ensure!(
+        !path.try_exists()?,
+        "unwitnessed checkout exists; branch cleanup authority is uncertain"
+    );
+    anyhow::ensure!(
+        branch_checkout_paths(origin, None)?.is_empty(),
+        "created branch acquired a Git checkout"
+    );
+    let owners = super::builder::cleanup_owners(handoff.root)?;
+    let protection = CleanupProtection {
+        owner: None,
+        owners,
+        workspace_owner,
+    };
+    anyhow::ensure!(
+        !protection.references_path(path)
+            && !protection.references_branch(&origin.repo, &origin.branch),
+        "created branch or checkout was adopted"
+    );
+    if local_branch_tip(&git2::Repository::open(&origin.repo)?, &origin.branch)?.is_none() {
+        return Ok(());
+    }
+    delete_branch(handoff, origin, path)
 }
 
 pub(crate) fn cleanup_with_ownership(
     receipt: &CreatedWorktree,
     handoff: BranchHandoff<'_>,
+    workspace_owner: Option<(&Storage, &super::Instance)>,
 ) -> bool {
     super::builder::cleanup_created_worktree(
         receipt,
         "native Git creation",
-        &CleanupProtection::default(),
+        &CleanupProtection {
+            workspace_owner,
+            ..CleanupProtection::default()
+        },
         handoff,
     )
 }
@@ -1414,6 +1501,138 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(boundary.verify().is_err(), "callback replacement: {change}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn branch_only_creation_receipts_preserve_replacements_adoptions_and_user_branches() {
+        use super::{cleanup_branch_with_ownership, BranchHandoff, NativeLease};
+        use crate::git::native_hooks::HookLease;
+        for case in [
+            "owned",
+            "workspace-owner",
+            "preexisting",
+            "replaced-ref",
+            "checkout",
+            "adopted",
+            "unreadable",
+        ] {
+            let fixture = tempfile::tempdir().unwrap();
+            let _home =
+                crate::session::test_support::isolate_app_dir_at(&fixture.path().join("home"));
+            let storage = crate::session::Storage::new_unwatched("owner").unwrap();
+            let peer = crate::session::Storage::new_unwatched("peer").unwrap();
+            let main = fixture.path().join("repo");
+            let repo = git2::Repository::init(&main).unwrap();
+            let tree_id = repo.index().unwrap().write_tree().unwrap();
+            let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
+            let tip = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "fixture",
+                    &repo.find_tree(tree_id).unwrap(),
+                    &[],
+                )
+                .unwrap();
+            let path = fixture.path().join("checkout");
+            let mut row =
+                crate::session::Instance::new("workspace owner", fixture.path().to_str().unwrap());
+            row.source_profile = "owner".into();
+            if case == "workspace-owner" {
+                row.workspace_info = Some(crate::session::WorkspaceInfo {
+                    branch: "main".into(),
+                    workspace_dir: row.project_path.clone(),
+                    repos: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    cleanup_on_delete: true,
+                });
+                storage
+                    .update(|rows, _| {
+                        rows.push(row.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            if case == "preexisting" {
+                repo.branch("topic", &repo.find_commit(tip).unwrap(), false)
+                    .unwrap();
+            }
+            let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+            let mut lease = NativeLease::new(
+                &mut ownership,
+                false,
+                Some(&storage),
+                None,
+                (&main, &path, "topic"),
+                None,
+            )
+            .unwrap();
+            if case != "preexisting" {
+                repo.branch("topic", &repo.find_commit(tip).unwrap(), false)
+                    .unwrap();
+            }
+            lease.prepare_checkout(case != "preexisting").unwrap();
+            assert!(lease.receipt(case != "preexisting").is_none());
+            let origin = lease.take_branch_origin();
+            drop(lease);
+            if case == "replaced-ref" {
+                let reference = repo.path().join("refs/heads/topic");
+                let replacement = fixture.path().join("replacement-ref");
+                std::fs::write(&replacement, std::fs::read(&reference).unwrap()).unwrap();
+                std::fs::rename(replacement, reference).unwrap();
+            } else if case == "checkout" {
+                crate::git::GitWorktree::new(main.clone())
+                    .unwrap()
+                    .with_init_submodules(false)
+                    .create_worktree("topic", &fixture.path().join("foreign"), false, None)
+                    .unwrap();
+            } else if case == "adopted" {
+                let mut adopter = crate::session::Instance::new("adopter", path.to_str().unwrap());
+                adopter.worktree_info = Some(crate::session::WorktreeInfo {
+                    branch: "topic".into(),
+                    main_repo_path: main.to_string_lossy().into_owned(),
+                    managed_by_aoe: true,
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+                peer.update(|rows, _| {
+                    rows.push(adopter);
+                    Ok(())
+                })
+                .unwrap();
+            } else if case == "unreadable" {
+                std::fs::write(peer.sessions_path(), "invalid rows").unwrap();
+            }
+            drop(ownership.take());
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            let removable = matches!(case, "owned" | "workspace-owner");
+            if let Some(origin) = origin {
+                let owner = (case == "workspace-owner").then_some((&storage, &row));
+                let result = cleanup_branch_with_ownership(
+                    &origin,
+                    &path,
+                    BranchHandoff::unpublished(&root),
+                    owner,
+                );
+                assert_eq!(result.is_ok(), removable, "{case}: {result:?}");
+            } else {
+                assert_eq!(case, "preexisting");
+            }
+            assert_eq!(
+                repo.find_branch("topic", git2::BranchType::Local).is_ok(),
+                !removable,
+                "{case}: wrong branch cleanup"
+            );
+            assert!(!path.exists());
+            if case == "unreadable" {
+                assert_eq!(
+                    std::fs::read(peer.sessions_path()).unwrap(),
+                    b"invalid rows"
+                );
+            }
         }
     }
 }

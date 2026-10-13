@@ -470,65 +470,20 @@ pub async fn trash_session(
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let mut cleanup = crate::session::claim::ReservationCleanup::new(
-            &storage,
-            &snapshot,
-            LifecycleOperation::Trash,
+        let request = crate::session::trash::TrashRequest {
+            storage: storage.clone(),
+            session_id: work_id.clone(),
+            instance: snapshot,
             generation,
-        );
-        let ownership = crate::session::storage::acquire_ownership_lock()?;
-        let _identity_lock =
-            crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-        let _lifecycle_lock =
-            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &work_id)?;
-        let mut instance = storage
-            .load_strict_for_worktree_ownership()?
-            .into_iter()
-            .find(|instance| instance.id == work_id)
-            .ok_or_else(|| anyhow::anyhow!("session disappeared before trash relocation"))?;
-        anyhow::ensure!(
-            instance.created_at == snapshot.created_at
-                && instance.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
-                && crate::session::trash::plan_inputs_unchanged(&snapshot, &instance),
-            "trash lifecycle reservation or relocation plan was superseded"
-        );
-        cleanup.disarm();
-        drop(cleanup);
-        if kill_pane {
-            if was_structured_view {
-                instance.kill_ancillary_tmux_sessions_locked();
-            } else {
-                instance.kill_all_tmux_sessions_locked();
-            }
-        }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance, &ownership);
-        let relocation = match &outcome {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                Some(crate::session::trash::TrashRelocation {
-                    new_project_path: instance.project_path.clone(),
-                    pre_trash_project_path: instance.pre_trash_project_path.clone(),
-                })
-            }
-            crate::session::trash::RelocateOutcome::Skipped
-            | crate::session::trash::RelocateOutcome::Failed { .. } => None,
         };
-        storage.update_with_ownership(&ownership, |instances, _groups| {
-            if let Some(relocation) = &relocation {
-                let commit = crate::session::claim::commit_trash_relocation(
-                    instances, &work_id, generation, relocation,
-                );
-                anyhow::ensure!(
-                    commit == crate::session::claim::RelocationCommit::Persisted,
-                    "trash relocation reservation was superseded"
-                );
-            } else if let Some(stored) = instances
-                .iter_mut()
-                .find(|candidate| candidate.id == work_id)
-            {
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
+        let outcome = crate::session::trash::trash_transition(&request, |instance| {
+            if kill_pane {
+                if was_structured_view {
+                    instance.kill_ancillary_tmux_sessions_locked();
+                } else {
+                    instance.kill_all_tmux_sessions_locked();
+                }
             }
-            Ok(())
         })?;
         let durable = storage
             .load()?

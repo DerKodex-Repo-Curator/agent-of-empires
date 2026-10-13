@@ -582,7 +582,7 @@ fn descriptor_for(
         Some(hooks)
     };
     descriptor.commands.clear();
-    let helper = helper_program(&descriptor.scope.root, descriptor.scope.fd)?;
+    let helper = descriptor.scope.proxy_exec.join("git");
     for (index, (name, (command, post_checkout))) in commands.into_iter().enumerate() {
         let Some(command) = command else {
             continue;
@@ -722,10 +722,6 @@ fn initialize(
     let path = root.path().join("scope.json");
     fs::write(&path, serde_json::to_vec(&descriptor).map_err(invalid)?)?;
     Ok((root, descriptor, path))
-}
-
-pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> io::Result<Output> {
-    run_inner(cwd, args, lease, None)?.ok_or_else(|| invalid("untimed native Git expired"))
 }
 
 pub(crate) fn run_timed(
@@ -1177,7 +1173,7 @@ fn proxy_entry(argv: &[OsString]) -> Option<io::Result<i32>> {
 
 #[cfg(not(test))]
 fn helper_program(_: &Path, _: RawFd) -> io::Result<PathBuf> {
-    std::env::current_exe()
+    crate::process::running_image()
 }
 
 #[cfg(test)]
@@ -1185,7 +1181,7 @@ fn helper_program(root: &Path, control_fd: RawFd) -> io::Result<PathBuf> {
     use crate::session::environment::shell_escape;
     let path = root.join("helper");
     if !path.exists() {
-        let exe = std::env::current_exe()?;
+        let exe = crate::process::running_image()?;
         let stdout_fd = if control_fd == 9 { 8 } else { 9 };
         let script = format!("#!/bin/sh\nargs=$(mktemp {}/argv.XXXXXX) || exit 1\nprintf '%s\\0' \"$0\" \"$@\" >\"$args\"\nexec {stdout_fd}>&1\nexport AOE_NATIVE_GIT_TEST_ARGS=\"$args\" AOE_NATIVE_GIT_TEST_STDOUT={stdout_fd}\nexec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture >/dev/null\n", shell_escape(&root.to_string_lossy()), shell_escape(&exe.to_string_lossy()));
         fs::write(&path, script)?;
@@ -1229,8 +1225,10 @@ mod tests {
             let source = std::env::var("AOE_TEST_NATIVE_PROFILE").unwrap();
             let action = std::env::var("AOE_TEST_NATIVE_ACTION").unwrap();
             let cwd = std::env::current_dir().unwrap();
-            if matches!(action.as_str(), "adopt" | "workspace-adopt") {
-                let target = if action == "workspace-adopt" {
+            if matches!(action.as_str(), "adopt" | "workspace-adopt" | "reuse") {
+                let target = if action == "reuse" {
+                    PathBuf::from("/unrelated")
+                } else if action == "workspace-adopt" {
                     let target = PathBuf::from(std::env::var_os("AOE_TEST_NATIVE_TARGET").unwrap());
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
@@ -1251,7 +1249,10 @@ mod tests {
                 };
                 let storage = crate::session::Storage::open_unwatched(&source).unwrap();
                 let root = crate::session::storage::acquire_ownership_lock().unwrap();
-                let row = crate::session::Instance::new("adopter", target.to_str().unwrap());
+                let mut row = crate::session::Instance::new("adopter", target.to_str().unwrap());
+                if action == "reuse" {
+                    row.id = std::env::var("AOE_TEST_NATIVE_ID").unwrap();
+                }
                 storage
                     .update_with_ownership(&root, |rows, _| {
                         rows.push(row);
@@ -1280,17 +1281,35 @@ mod tests {
             return;
         }
         if std::env::var_os("AOE_TEST_NATIVE_RUNNER").is_none() {
-            for phase in ["callbacks", "dynamic", "remote", "workspace"] {
+            for phase in ["callbacks", "dynamic", "remote", "workspace", "replaced"] {
                 eprintln!("native callbacks: starting {phase}");
                 let started = std::time::Instant::now();
-                let mut child = Command::new(std::env::current_exe().unwrap());
+                let private_image = tempfile::tempdir().unwrap();
+                let executable = if phase == "replaced" && cfg!(target_os = "linux") {
+                    let image = private_image.path().join("test-image");
+                    fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+                    image
+                } else {
+                    std::env::current_exe().unwrap()
+                };
+                let mut child = Command::new(executable);
+                if phase == "replaced" {
+                    child.env("AOE_TEST_NATIVE_REPLACED_IMAGE", "1");
+                }
                 child
                     .args([
                         "--exact",
                         "git::native_hooks::tests::native_callbacks_reenter_ownership",
                         "--nocapture",
                     ])
-                    .env("AOE_TEST_NATIVE_RUNNER", phase);
+                    .env(
+                        "AOE_TEST_NATIVE_RUNNER",
+                        if phase == "replaced" {
+                            "callbacks"
+                        } else {
+                            phase
+                        },
+                    );
                 let output = crate::process::run_with_timeout_process_group(
                     &mut child,
                     std::time::Duration::from_secs(30),
@@ -1310,6 +1329,14 @@ mod tests {
             return;
         }
         let phase = std::env::var("AOE_TEST_NATIVE_RUNNER").unwrap();
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("AOE_TEST_NATIVE_REPLACED_IMAGE").is_some() {
+            let image = std::env::current_exe().unwrap();
+            let replacement = image.with_extension("replacement");
+            fs::write(&replacement, "#!/bin/sh\nexit 97\n").unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(replacement, &image).unwrap();
+        }
         let _home = crate::session::test_support::isolate_app_dir();
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path().join("source");
@@ -1339,7 +1366,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        let exe = std::env::current_exe().unwrap();
+        let exe = crate::process::running_image().unwrap();
         let git = crate::git::GitWorktree::new(repo.clone())
             .unwrap()
             .with_init_submodules(false);

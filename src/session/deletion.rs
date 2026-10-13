@@ -88,6 +88,9 @@ pub struct PurgeTransaction {
 pub struct CommittedPurge {
     request: DeletionRequest,
     storage: Storage,
+    profile_identity: (u64, u64),
+    generation: u64,
+    stores: std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>,
     _lifecycle_lock: StorageFlock,
 }
 
@@ -350,6 +353,19 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
+        let profile_identity = match self.storage.physical_profile_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(Box::new(DeletionResult::rejected(
+                    id,
+                    DeletionDisposition::Failed,
+                    error.to_string(),
+                    None,
+                )))
+            }
+        };
+        let stores = super::sandbox_store_reclaim::StoreRemoval::capture(&self.request.instance)
+            .map_err(|error| error.to_string());
         if let Err(error) = self.storage.update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
                 commit = Some((CompletionGate::AlreadyGone, None));
@@ -397,6 +413,9 @@ impl PurgeTransaction {
         }
         Ok(CommittedPurge {
             storage: self.storage.clone(),
+            profile_identity,
+            generation,
+            stores,
             request: DeletionRequest {
                 session_id: self.request.session_id.clone(),
                 instance: self.request.instance.clone(),
@@ -450,6 +469,7 @@ impl PurgeTransaction {
             self.lifecycle_lock
                 .as_ref()
                 .expect("exclusive purge lifecycle"),
+            None,
         );
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
@@ -543,38 +563,73 @@ impl PurgeTransaction {
 }
 
 impl CommittedPurge {
-    /// Revalidate profile and path ownership after runtime shutdown, before Git cleanup.
+    /// Committed sidecars survive a lost profile route; Git still requires that original route.
     pub fn finish(self) -> DeletionResult {
         let Self {
             request,
             storage,
+            profile_identity,
+            generation,
+            stores,
             _lifecycle_lock,
         } = self;
         drop(_lifecycle_lock);
-        let guarded = (|| -> Result<(OwnershipGuard, StorageFlock)> {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_COMMITTED_PURGE_RESUME.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        let guarded = (|| -> Result<OwnershipGuard> {
             let ownership = acquire_ownership_lock()?;
-            let lifecycle = storage
-                .acquire_instance_lifecycle_lock_with_ownership(&ownership, &request.session_id)?;
-            let instances = storage.load_strict_for_worktree_ownership()?;
             anyhow::ensure!(
-                !instances.iter().any(|row| row.id == request.session_id),
-                "purged session identity was reused"
+                request
+                    .instance
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation),
+                "committed purge receipt changed"
             );
-            Ok((ownership, lifecycle))
+            ensure_committed_identity_unused(&ownership, &request.session_id)?;
+            Ok(ownership)
         })();
-        let (ownership, _lifecycle) = match guarded {
-            Ok(guards) => guards,
+        let ownership = match guarded {
+            Ok(root) => root,
             Err(error) => {
                 return DeletionResult::rejected(
                     request.session_id,
-                    DeletionDisposition::Failed,
-                    format!("Failed to resume committed purge: {error}"),
+                    DeletionDisposition::Removed,
+                    format!("Committed purge cleanup refused: {error}"),
                     None,
                 )
             }
         };
-        let mut result =
-            perform_deletion_teardown_lifecycle_locked(&request, &ownership, &_lifecycle);
+        let git_authority = (|| -> Result<StorageFlock> {
+            anyhow::ensure!(
+                storage.physical_profile_identity()? == profile_identity,
+                "committed purge profile changed"
+            );
+            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &request.session_id)
+        })();
+        let mut result = match git_authority {
+            Ok(lifecycle) => perform_deletion_teardown_lifecycle_locked(
+                &request,
+                &ownership,
+                &lifecycle,
+                Some(stores),
+            ),
+            Err(error) => {
+                let mut safe = request.clone();
+                safe.delete_worktree = false;
+                safe.delete_branch = false;
+                safe.keep_scratch = true;
+                let mut result =
+                    perform_deletion_core(&safe, Some(&ownership), &[], Some(stores), |id| {
+                        DockerContainer::from_session_id(id).teardown(id)
+                    });
+                result.errors.push(format!(
+                    "Git and scratch resources kept: original purge profile unavailable ({error})"
+                ));
+                result.success = false;
+                result
+            }
+        };
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -657,25 +712,37 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
-/// Every path a session outside `except_ids` works in or will restore to.
-fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathBuf> {
-    instances
-        .iter()
-        .filter(|instance| !except_ids.contains(&instance.id.as_str()))
-        .flat_map(|instance| {
-            std::iter::once(instance.project_path.as_str())
-                .chain(instance.pre_trash_project_path.as_deref())
-                .chain(
-                    instance
-                        .all_repos()
-                        .iter()
-                        .map(|r| r.worktree_path.as_str()),
-                )
-                .map(PathBuf::from)
-        })
-        .collect()
+/// Generic cwd claims protect their ancestors; explicit checkouts also protect descendants.
+pub(crate) struct PathClaim {
+    path: PathBuf,
+    recursive: bool,
 }
 
+fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathClaim> {
+    let mut paths = Vec::new();
+    for instance in instances
+        .iter()
+        .filter(|row| !except_ids.contains(&row.id.as_str()))
+    {
+        let mut add = |path: &str, recursive| {
+            paths.push(PathClaim {
+                path: PathBuf::from(path),
+                recursive,
+            })
+        };
+        add(&instance.project_path, instance.worktree_info.is_some());
+        if let Some(path) = &instance.pre_trash_project_path {
+            add(path, instance.worktree_info.is_some());
+        }
+        if let Some(workspace) = &instance.workspace_info {
+            add(&workspace.workspace_dir, true);
+            for repo in &workspace.repos {
+                add(&repo.worktree_path, true);
+            }
+        }
+    }
+    paths
+}
 /// Resolve absent tails only through components proven missing, never broken aliases.
 pub(crate) fn resolve_claim_path(path: &Path) -> Option<PathBuf> {
     if path.as_os_str().is_empty() {
@@ -708,16 +775,18 @@ pub(crate) fn resolve_claim_path(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
-pub(crate) fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
+pub(crate) fn claim_path_blocks(left: &Path, right: &Path, recursive: bool) -> bool {
     match (resolve_claim_path(left), resolve_claim_path(right)) {
-        (Some(left), Some(right)) => left.starts_with(&right) || right.starts_with(&left),
+        (Some(left), Some(right)) => {
+            left.starts_with(&right) || (recursive && right.starts_with(&left))
+        }
         _ => true,
     }
 }
 
 /// The paths sessions outside a deletion use, across every profile.
 pub(crate) enum PathsInUse {
-    Known(Vec<PathBuf>),
+    Known(Vec<PathClaim>),
     /// Some store could not be read, so every path must be assumed in use.
     Unknown(String),
 }
@@ -729,7 +798,7 @@ impl PathsInUse {
                 resolve_claim_path(root).is_none()
                     || paths
                         .iter()
-                        .any(|path| paths_overlap_destructive(path, root))
+                        .any(|path| claim_path_blocks(&path.path, root, path.recursive))
             }
             Self::Unknown(_) => true,
         }
@@ -741,6 +810,22 @@ impl PathsInUse {
             Self::Unknown(reason) => format!("other sessions could not be checked ({reason})"),
         }
     }
+}
+
+fn ensure_committed_identity_unused(ownership: &OwnershipGuard, id: &str) -> Result<()> {
+    ownership.require_exclusive()?;
+    let (_, storages) =
+        all_profile_storages_with_ownership(ownership).map_err(anyhow::Error::msg)?;
+    for storage in &storages {
+        anyhow::ensure!(
+            !storage
+                .load_strict_for_worktree_ownership()?
+                .iter()
+                .any(|row| row.id == id),
+            "purged session identity was reused"
+        );
+    }
+    Ok(())
 }
 
 fn all_profile_storages_with_ownership(
@@ -801,10 +886,13 @@ fn scan_paths_in_use_qualified(
             }
         };
         for path in other_sessions_paths(&instances, if excluded { except_ids } else { &[] }) {
-            let Some(path) = resolve_claim_path(&path) else {
+            let Some(resolved) = resolve_claim_path(&path.path) else {
                 return PathsInUse::Unknown("a session ownership path cannot be resolved".into());
             };
-            paths.push(path);
+            paths.push(PathClaim {
+                path: resolved,
+                recursive: path.recursive,
+            });
         }
     }
     if !owner_seen {
@@ -880,6 +968,7 @@ pub(crate) fn branch_in_use_with_ownership(
 
 #[cfg(test)]
 thread_local! {
+    static BEFORE_COMMITTED_PURGE_RESUME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_PATHS_IN_USE_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -934,6 +1023,7 @@ fn perform_deletion_teardown_lifecycle_locked(
     request: &DeletionRequest,
     ownership: &OwnershipGuard,
     lifecycle: &StorageFlock,
+    stores: Option<std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>>,
 ) -> DeletionResult {
     let mut guarded_request = None;
     if request.delete_branch {
@@ -967,9 +1057,13 @@ fn perform_deletion_teardown_lifecycle_locked(
         }
     }
     let request = guarded_request.as_ref().unwrap_or(request);
-    perform_deletion_core(request, Some(ownership), &[lifecycle], |session_id| {
-        DockerContainer::from_session_id(session_id).teardown(session_id)
-    })
+    perform_deletion_core(
+        request,
+        Some(ownership),
+        &[lifecycle],
+        stores,
+        |session_id| DockerContainer::from_session_id(session_id).teardown(session_id),
+    )
 }
 
 /// Core deletion routine, parameterized over how the sandbox container is torn down so the
@@ -979,7 +1073,7 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, None, &[], teardown)
+    perform_deletion_core(request, None, &[], None, teardown)
 }
 
 /// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
@@ -987,6 +1081,7 @@ fn perform_deletion_core(
     request: &DeletionRequest,
     ownership: Option<&OwnershipGuard>,
     nested: &[&StorageFlock],
+    stores: Option<std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>>,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -1103,6 +1198,23 @@ fn perform_deletion_core(
         }
     }
 
+    if stores.is_some() {
+        if let Some(root) = ownership {
+            if let Err(error) = ensure_committed_identity_unused(root, &request.session_id) {
+                errors.push(format!("Committed purge continuation refused: {error}"));
+                return DeletionResult {
+                    session_id: request.session_id.clone(),
+                    success: false,
+                    teardown_started: true,
+                    messages,
+                    errors,
+                    disposition: DeletionDisposition::Failed,
+                    retained_instance: None,
+                };
+            }
+        }
+    }
+
     if let Some(ownership) = ownership.filter(|_| request.instance.scratch && !request.keep_scratch)
     {
         let paths = paths_in_use_except_with_ownership(
@@ -1123,7 +1235,7 @@ fn perform_deletion_core(
     // (`PurgeTransaction::complete_inner`), and a session that survives its own purge must survive
     // with the store holding its login and history.
     if container_gone && errors.is_empty() {
-        stage_remove_agent_stores(request, &mut messages);
+        stage_remove_agent_stores(request, &mut messages, stores, &mut errors);
     }
 
     // Stage 6: hook status cleanup
@@ -1670,15 +1782,30 @@ fn stage_cleanup_scratch(
 }
 
 /// Final stage: the session's own agent stores.
-fn stage_remove_agent_stores(request: &DeletionRequest, messages: &mut Vec<String>) {
+fn stage_remove_agent_stores(
+    request: &DeletionRequest,
+    messages: &mut Vec<String>,
+    stores: Option<std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>>,
+    errors: &mut Vec<String>,
+) {
     tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "agent_store_remove", "perform_deletion: stage");
-    match crate::session::sandbox_store_reclaim::remove_stores_for(&request.instance) {
+    let committed = stores.is_some();
+    let removal = match stores {
+        Some(stores) => stores
+            .map_err(anyhow::Error::msg)
+            .and_then(|stores| stores.remove(&request.session_id)),
+        None => crate::session::sandbox_store_reclaim::remove_stores_for(&request.instance),
+    };
+    match removal {
         Ok((removed, _)) if removed.is_empty() => {}
         Ok((_, freed)) => messages.push(format!(
             "Agent store removed ({})",
             crate::migrations::progress::format_bytes(freed)
         )),
         Err(error) => {
+            if committed {
+                errors.push(format!("Committed agent store cleanup failed: {error}"));
+            }
             tracing::warn!(target: "session.store",
                 "leaving the agent store of {}: {error}", request.session_id);
             messages.push(format!(
@@ -1882,7 +2009,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     #[serial]
-    fn raw_alias_ancestor_missing_tail_and_broken_alias_claims_are_protected() {
+    fn raw_point_claims_protect_ancestors_without_reserving_children() {
         let _home = isolate_app_dir();
         let temp = tempfile::tempdir().unwrap();
         let real = temp.path().join("real");
@@ -1898,7 +2025,7 @@ mod tests {
         let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
         let paths = paths_in_use_except_with_ownership(&ownership, "peer", &[]);
         assert!(paths.covers(&real));
-        assert!(paths.covers(&real.join("missing/child")));
+        assert!(!paths.covers(&real.join("missing/child")));
         assert!(paths.covers(temp.path()));
         assert!(!paths.covers(&temp.path().join("unrelated")));
         assert_eq!(
@@ -2140,6 +2267,145 @@ mod tests {
             "rowless cleanup missed a claim published during the SDK await"
         );
         assert!(branch_exists(&repo, "feature/committed"));
+    }
+
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn committed_purge_cleans_sidecars_after_profile_rename() {
+        for change in ["rename", "replacement", "reused", "unreadable"] {
+            let (_hooks, _base, _hooks_dir) = crate::hooks::test_support::BaseGuard::ready();
+            let (temp, _repo, worktree, mut owner) = worktree_fixture("feature/profile-gap");
+            let _home = isolate_app_dir_at(&temp.path().join("home"));
+            let storage = Storage::new_unwatched("owner").unwrap();
+            owner.source_profile = "owner".into();
+            let original_id = owner.id.clone();
+            let sidecar = crate::hooks::ensure_instance_dir_path(&owner.id).unwrap();
+            std::fs::write(sidecar.join("status"), "working").unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(owner.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let transaction = match PurgeTransaction::reserve(
+                storage.clone(),
+                DeletionRequest {
+                    delete_worktree: true,
+                    ..request(owner)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge rejected"),
+            };
+            let committed = transaction
+                .begin_irreversible()
+                .unwrap_or_else(|_| panic!("commit rejected"));
+            BEFORE_COMMITTED_PURGE_RESUME.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let root = acquire_ownership_lock().unwrap();
+                    let old = crate::session::get_profile_dir_path("owner").unwrap();
+                    let renamed = crate::session::get_profile_dir_path("renamed").unwrap();
+                    std::fs::rename(old, renamed).unwrap();
+                    drop(root);
+                    if change == "replacement" {
+                        let replacement = Storage::new_unwatched("owner").unwrap();
+                        replacement
+                            .update(|rows, _| {
+                                rows.push(Instance::new("new owner", "/unrelated"));
+                                Ok(())
+                            })
+                            .unwrap();
+                    } else if change == "reused" {
+                        let replacement = Storage::new_unwatched("owner").unwrap();
+                        let mut row = Instance::new("new owner", "/unrelated");
+                        row.id = original_id.clone();
+                        replacement
+                            .update(|rows, _| {
+                                rows.push(row);
+                                Ok(())
+                            })
+                            .unwrap();
+                    } else if change == "unreadable" {
+                        let peer = Storage::new_unwatched("peer").unwrap();
+                        std::fs::write(peer.sessions_path(), "invalid owner rows").unwrap();
+                    }
+                }))
+            });
+            let result = committed.finish();
+            assert_eq!(result.disposition, DeletionDisposition::Removed);
+            assert!(!result.success);
+            assert_eq!(
+                sidecar.exists(),
+                matches!(change, "reused" | "unreadable"),
+                "{change}: wrong sidecar authority"
+            );
+            if sidecar.exists() {
+                std::fs::remove_dir_all(&sidecar).unwrap();
+            }
+            assert!(
+                worktree.exists(),
+                "lost profile must preserve Git resources"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn committed_purge_preserves_reused_identity_sidecars_after_native_callback() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hooks, _base, _hooks_dir) = crate::hooks::test_support::BaseGuard::ready();
+        let (temp, repo, _worktree, mut owner) = worktree_fixture("feature/identity-callback");
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let peer = Storage::new_unwatched("peer").unwrap();
+        owner.source_profile = "owner".into();
+        let id = owner.id.clone();
+        let sidecar = crate::hooks::ensure_instance_dir_path(&id).unwrap();
+        std::fs::write(sidecar.join("status"), "working").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let transaction = match PurgeTransaction::reserve(
+            storage.clone(),
+            DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                ..request(owner)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("purge rejected"),
+        };
+        let committed = transaction
+            .begin_irreversible()
+            .unwrap_or_else(|_| panic!("commit rejected"));
+        let hook = repo.join(".git/hooks/reference-transaction");
+        let marker = temp.path().join("callback-entered");
+        let escape = crate::session::environment::shell_escape;
+        std::fs::write(&hook, format!("#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n[ ! -e {marker} ] || exit 0\n: > {marker}\nexport AOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE=peer AOE_TEST_NATIVE_ACTION=reuse AOE_TEST_NATIVE_ID={id}\nexec {exe} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture\n", marker=escape(&marker.to_string_lossy()), exe=escape(&crate::process::running_image().unwrap().to_string_lossy()))).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = committed.finish();
+        assert!(
+            marker.exists(),
+            "real reference-transaction callback did not run"
+        );
+        assert_eq!(peer.load().unwrap()[0].id, id);
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
+        assert!(!result.success);
+        assert!(
+            sidecar.exists(),
+            "late reused identity lost its hook sidecars"
+        );
+        std::fs::remove_dir_all(sidecar).unwrap();
     }
 
     #[test]

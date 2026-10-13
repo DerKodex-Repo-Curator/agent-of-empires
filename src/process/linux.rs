@@ -1,6 +1,13 @@
 //! Linux-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
+
+pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(format!(
+        "/proc/{}/exe",
+        std::process::id()
+    )))
+}
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

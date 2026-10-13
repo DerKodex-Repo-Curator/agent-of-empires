@@ -1,6 +1,10 @@
 //! macOS-specific process utilities.
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
+pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
+}
 use std::collections::HashMap;
 use std::process::Command;
 

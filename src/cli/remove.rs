@@ -81,14 +81,14 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     if config.session.delete_to_trash && !args.purge {
-        let ownership = crate::session::storage::acquire_ownership_lock()?;
-        let _identity_lock =
-            crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-        let _lifecycle_lock =
-            storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &removed_id)?;
-        storage.load_strict_for_worktree_ownership()?;
-        let (trash_generation, mut inst) =
-            storage.update_with_ownership(&ownership, |instances, _groups| {
+        let (trash_generation, inst) = {
+            let ownership = crate::session::storage::acquire_ownership_read()?;
+            let _identity_lock =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+            let _lifecycle_lock =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &removed_id)?;
+            storage.load_strict_for_worktree_ownership()?;
+            storage.update_with_ownership(&ownership, |instances, _| {
                 let stored = instances
                     .iter_mut()
                     .find(|instance| instance.id == removed_id)
@@ -102,40 +102,20 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 )?;
                 stored.trash();
                 Ok((generation, stored.clone()))
-            })?;
-        if let Err(error) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {error}");
-        }
-        inst.kill_ancillary_tmux_sessions_locked();
-        inst.release_scope();
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut inst, &ownership);
-        storage.update_with_ownership(&ownership, |instances, _groups| {
-            if matches!(
-                outcome,
-                crate::session::trash::RelocateOutcome::Relocated { .. }
-            ) {
-                let relocation = crate::session::trash::TrashRelocation {
-                    new_project_path: inst.project_path.clone(),
-                    pre_trash_project_path: inst.pre_trash_project_path.clone(),
-                };
-                let commit = crate::session::claim::commit_trash_relocation(
-                    instances,
-                    &removed_id,
-                    trash_generation,
-                    &relocation,
-                );
-                anyhow::ensure!(
-                    commit == crate::session::claim::RelocationCommit::Persisted,
-                    "trash relocation reservation was superseded"
-                );
-            } else {
-                crate::session::claim::release_trash_reservation(
-                    instances,
-                    &removed_id,
-                    trash_generation,
-                );
+            })?
+        };
+        let request = crate::session::trash::TrashRequest {
+            storage: storage.clone(),
+            session_id: removed_id.clone(),
+            instance: inst,
+            generation: trash_generation,
+        };
+        let outcome = crate::session::trash::trash_transition(&request, |inst| {
+            if let Err(error) = inst.kill_locked() {
+                eprintln!("Warning: failed to kill agent tmux session: {error}");
             }
-            Ok(())
+            inst.kill_ancillary_tmux_sessions_locked();
+            inst.release_scope();
         })?;
         if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
             eprintln!("  Note: left worktree in place ({reason}).");
