@@ -65,18 +65,7 @@ where
         "running git"
     );
     let output = if let Some(lease) = lease {
-        super::native_hooks::run_timed(
-            cwd,
-            &argv,
-            lease,
-            super::worktree::WORKTREE_MUTATION_TIMEOUT,
-        )?
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "native Git creation exceeded its mutation deadline",
-            )
-        })?
+        super::native_hooks::run(cwd, &argv, lease)?
     } else {
         let mut command = Command::new("git");
         command.args(&argv).current_dir(cwd).env("LC_ALL", "C");

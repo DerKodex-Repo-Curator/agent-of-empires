@@ -724,6 +724,10 @@ fn initialize(
     Ok((root, descriptor, path))
 }
 
+pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> io::Result<Output> {
+    Ok(run_inner(cwd, args, lease, None)?.expect("native Git without a deadline cannot expire"))
+}
+
 pub(crate) fn run_timed(
     cwd: &Path,
     args: &[OsString],

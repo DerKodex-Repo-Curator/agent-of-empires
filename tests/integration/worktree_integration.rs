@@ -462,13 +462,16 @@ fn reconcile_refuses_a_checkout_another_session_records() {
     assert_eq!(live_row.project_path, live.project_path);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 #[serial_test::parallel]
 fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    for replace in [false, true] {
+    for (replace, long_hook) in [(false, false), (true, false), (false, true)]
+        .into_iter()
+        .filter(|(replace, _)| !replace || cfg!(target_os = "linux"))
+    {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let home = root.join("home");
@@ -493,7 +496,7 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
         let hook = repo.path().join("hooks/post-checkout");
         std::fs::write(
             &hook,
-            "#!/bin/sh\nprintf '%s\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
+            "#!/bin/sh\nif [ \"$AOE_TEST_LONG_HOOK\" = 1 ]; then\n printf started > \"$AOE_TEST_HOOK_STARTED\"\n sleep 35 || exit 97\nfi\nprintf '%s\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -548,6 +551,8 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             )
             .env("AOE_TEST_REAL_GIT", real_git)
             .env("AOE_TEST_HOOK", &marker)
+            .env("AOE_TEST_LONG_HOOK", if long_hook { "1" } else { "0" })
+            .env("AOE_TEST_HOOK_STARTED", root.join("hook-started"))
             .env("AOE_TEST_IMAGE", &executable)
             .env("AOE_TEST_REPLACEMENT", &replacement)
             .env("AOE_TEST_IMAGE_AFTER", &image_after)
@@ -559,36 +564,12 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             .env_remove("CURSOR_CONFIG_DIR")
             .env_remove("COPILOT_CONFIG_DIR")
             .env_remove("KIRO_CONFIG_DIR");
-        let mut create_profile = Command::new(&executable);
-        create_profile
-            .args(["profile", "create", "owner"])
-            .current_dir(root);
-        for (key, value) in command.get_envs() {
-            match value {
-                Some(value) => {
-                    create_profile.env(key, value);
-                }
-                None => {
-                    create_profile.env_remove(key);
-                }
-            }
-        }
-        create_profile.env("AOE_TEST_REPLACE", "0");
-        let created = agent_of_empires::process::run_with_timeout_process_group(
-            &mut create_profile,
-            std::time::Duration::from_secs(10),
-        )
-        .unwrap()
-        .expect("profile creation exceeded its deadline");
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
+        std::fs::create_dir_all(app.join("profiles/owner")).unwrap();
 
+        let started = std::time::Instant::now();
         let output = agent_of_empires::process::run_with_timeout_process_group(
             &mut command,
-            std::time::Duration::from_secs(40),
+            std::time::Duration::from_secs(75),
         )
         .unwrap()
         .expect("native CLI creation exceeded its deadline");
@@ -602,6 +583,13 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             marker.exists(),
             "replace={replace}: real post-checkout hook was skipped"
         );
+        if long_hook {
+            assert_eq!(
+                std::fs::read(root.join("hook-started")).unwrap(),
+                b"started"
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_secs(35));
+        }
         if replace {
             assert!(std::fs::read_to_string(image_after)
                 .unwrap()
