@@ -95,9 +95,10 @@ fn publish_orphaned_turn_stop<S: BroadcastSink>(
     supervisor.synthesize_stopped_for_orphan(session_id, reason);
 }
 
-/// A `Monitor` watch lives inside the agent process, so a replacement process
-/// has lost it; the reminder gives the agent a turn to re-arm it.
-const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch that was armed is no longer running. Re-arm it if it's still needed.";
+/// A `Monitor` watch or background command lives inside the agent process, so
+/// a replacement process has lost it; the reminder gives the agent a turn to
+/// re-arm it.
+const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch or background command that was running is no longer running. Re-arm or re-run it if it's still needed.";
 
 /// Queues the re-arm reminder once a fresh process replaces the session's worker.
 pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &str) {
@@ -813,13 +814,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn requeue_interrupted_monitor_queues_only_over_an_armed_monitor() {
-        for armed in [true, false] {
+        // (armed, description): `None` is how a background command arms.
+        for (armed, description) in [
+            (true, Some("watch for X".to_string())),
+            (true, None),
+            (false, None),
+        ] {
             let id = "sess-monitor";
             let (_home, state, _project) = test_state(id);
             if armed {
-                let event = crate::acp::state::Event::MonitorArmed {
-                    description: Some("watch for X".to_string()),
-                };
+                let event = crate::acp::state::Event::MonitorArmed { description };
                 state.acp_event_store.record(id, 1, &event).unwrap();
             }
 
