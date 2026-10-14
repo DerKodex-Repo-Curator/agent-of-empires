@@ -1082,17 +1082,14 @@ fn apply_group_move(
 
     if plan.move_subtree {
         source_groups.retain(|group| !matches_source(&group.path));
-    } else if !plan.source_path.is_empty() {
-        let source_still_uses_path = source_instances.iter().any(|instance| {
-            instance.group_path == plan.source_path
-                || instance.group_path.starts_with(&source_prefix)
-        });
-        let has_explicit_descendant = source_groups
+    } else if super::groups::group_is_unused(
+        &plan.source_path,
+        source_instances
             .iter()
-            .any(|group| group.path.starts_with(&source_prefix));
-        if !source_still_uses_path && !has_explicit_descendant {
-            source_groups.retain(|group| group.path != plan.source_path);
-        }
+            .map(|instance| instance.group_path.as_str()),
+        source_groups.iter().map(|group| group.path.as_str()),
+    ) {
+        source_groups.retain(|group| group.path != plan.source_path);
     }
 
     // Re-tree both sides so a group implied only by a moved instance's path materialises as

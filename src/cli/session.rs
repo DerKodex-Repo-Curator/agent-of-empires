@@ -1692,8 +1692,8 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 
     let title_requested = args.title.is_some();
     let branch_only = args.branch.is_some();
-    let mut baseline = inst;
-    baseline.source_profile = profile.to_string();
+    let baseline = inst;
+    let branch_rename_requested = args.rename_branch;
     let refresh_tied_status = args.branch.is_none() && (args.title.is_some() || args.rename_branch);
     let result = tokio::task::spawn_blocking(move || {
         crate::session::rename::perform(
@@ -1708,8 +1708,9 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 },
                 file_watch: crate::file_watch::FileWatchService::noop(),
             },
-            |original, _| {
+            |original, moves| {
                 if refresh_tied_status
+                    && (moves || branch_rename_requested)
                     && original.tie_workdir_applies(
                         crate::session::config::profile_config::resolve_config_or_warn(
                             &original.source_profile,
@@ -2250,10 +2251,10 @@ mod rename_tests {
             "{error}"
         );
         assert!(worktree.is_dir());
-        assert_eq!(
-            storage.load().unwrap()[0].project_path,
-            worktree.to_str().unwrap()
-        );
+        let unchanged = storage.load().unwrap().remove(0);
+        assert_eq!(unchanged.project_path, worktree.to_str().unwrap());
+        assert_eq!(unchanged.lifecycle_generation, 0);
+        assert!(unchanged.lifecycle_reservation.is_none());
     }
 
     #[test]
@@ -2287,8 +2288,14 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let mut baseline = inst.clone();
-    baseline.source_profile = profile.to_string();
     let committed = tokio::task::spawn_blocking(move || {
+        // Status polling consumes the profile registry populated by config resolution.
+        crate::session::config::profile_config::resolve_config_or_warn(&baseline.source_profile);
+        crate::tmux::refresh_session_cache();
+        baseline.update_status_with_metadata(None, None);
+        if baseline.status.blocks_worktree_edit() {
+            return Err(crate::session::rename::RenameRejected::Active.into());
+        }
         crate::session::rename::perform(
             crate::session::rename::Request {
                 baseline,

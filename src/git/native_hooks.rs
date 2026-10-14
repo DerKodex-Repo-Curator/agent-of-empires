@@ -2494,7 +2494,7 @@ mod tests {
 
     #[test]
     fn runtime_cleanup_reclaims_only_dead_owned_invocations() {
-        if let Some(app) = std::env::var_os("AOE_TEST_RUNTIME_OWNER") {
+        if let Some(app) = std::env::var_os("AOE_TEST_NATIVE_RUNTIME_OWNER") {
             let app = PathBuf::from(app);
             let (runtime, _, _, _listener) = initialize(&app, &app).unwrap();
             std::os::unix::fs::FileExt::write_all_at(
@@ -2529,7 +2529,7 @@ mod tests {
         fn start(app: &Path) -> (Owner, PathBuf, PathBuf) {
             let child = Command::new(crate::process::running_image().unwrap())
                 .args(["--exact", "git::native_hooks::tests::runtime_cleanup_reclaims_only_dead_owned_invocations", "--nocapture"])
-                .env("AOE_TEST_RUNTIME_OWNER", app).process_group(0)
+                .env("AOE_TEST_NATIVE_RUNTIME_OWNER", app).process_group(0)
                 .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
             let mut owner = Owner(child);
             let ready = app.join(format!("ready-{}", owner.0.id()));

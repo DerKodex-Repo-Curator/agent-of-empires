@@ -1743,7 +1743,6 @@ exit 0
             let temp = tempfile::tempdir().unwrap();
             let profile = "attach-stop-stale";
             let _home = isolated_profile(temp.path(), profile);
-            let (_path, calls) = stop_runtime_fixture(temp.path());
             let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
             reserve_attach(&storage, &mut plan).unwrap();
             storage
@@ -1792,8 +1791,15 @@ exit 0
             )
             .with_generation(73);
             crate::process::worker_registry::save(&record).unwrap();
+            let _ = crate::tmux::fork_probe::take();
+            let probe = crate::tmux::fork_probe::arm();
             assert!(quiesce_for_conversion(&storage, &plan).is_err());
-            assert!(!calls.exists(), "stale quiescence reached the runtime");
+            assert_eq!(
+                crate::tmux::fork_probe::take(),
+                0,
+                "stale quiescence reached tmux"
+            );
+            drop(probe);
             assert_eq!(
                 crate::process::worker_registry::load(&original.id)
                     .unwrap()
@@ -1826,7 +1832,6 @@ exit 0
             let temp = tempfile::tempdir().unwrap();
             let profile = "attach-launch-admission";
             let _home = isolated_profile(temp.path(), profile);
-            let (_path, calls) = stop_runtime_fixture(temp.path());
             let (storage, _, mut plan) = attach_fixture(temp.path(), profile);
             if corrupt_inventory {
                 crate::session::create_profile("attach-unreadable").unwrap();
@@ -1844,8 +1849,15 @@ exit 0
                     })
                     .unwrap();
             }
+            let _ = crate::tmux::fork_probe::take();
+            let probe = crate::tmux::fork_probe::arm();
             assert!(reserve_attach(&storage, &mut plan).is_err());
-            assert!(!calls.exists());
+            assert_eq!(
+                crate::tmux::fork_probe::take(),
+                0,
+                "rejected admission reached tmux"
+            );
+            drop(probe);
             assert!(plan.reservation.is_none());
             let row = storage.load().unwrap().remove(0);
             if corrupt_inventory {

@@ -1328,7 +1328,7 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .filter(|instance| !new_title.is_empty() && instance.title != new_title)
+            .filter(|_| !new_title.is_empty())
             .map(|_| new_title.to_string());
         self.queue_rename(crate::session::rename::Edit::Session {
             title,
@@ -1394,6 +1394,23 @@ impl HomeView {
                                     &committed.baseline
                                 };
                             row.merge_user_action_diff(baseline, current);
+                            if row.source_profile != committed.original.source_profile {
+                                if let Some(tree) =
+                                    self.group_trees.get_mut(&committed.original.source_profile)
+                                {
+                                    tree.prune_empty_group(
+                                        &committed.original.group_path,
+                                        self.instances
+                                            .values()
+                                            .filter(|instance| {
+                                                instance.id != result.session_id
+                                                    && instance.source_profile
+                                                        == committed.original.source_profile
+                                            })
+                                            .map(|instance| instance.group_path.as_str()),
+                                    );
+                                }
+                            }
                             if self
                                 .active_profile
                                 .as_deref()

@@ -300,3 +300,47 @@ fn metadata_rename_uses_canonical_profile_for_an_unstamped_request() {
         durable.lifecycle_generation
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn unchanged_tied_title_still_refuses_a_claimed_derived_workdir() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let (root, storage, mut row) = fixture();
+    row.title = "new".into();
+    let claimed = root.path().join("new");
+    storage
+        .update(|rows, _| {
+            rows[0].title.clone_from(&row.title);
+            rows.push(Instance::new("new", &claimed.to_string_lossy()));
+            Ok(())
+        })
+        .unwrap();
+    let error = perform(
+        Request {
+            baseline: row.clone(),
+            edit: Edit::Session {
+                title: Some("new".into()),
+                group: None,
+                profile: None,
+                rename_branch: false,
+                branch: None,
+            },
+            file_watch: crate::file_watch::FileWatchService::noop(),
+        },
+        |_, _| panic!("duplicate destination must refuse before unlocked preflight"),
+    )
+    .err()
+    .expect("unchanged title must still validate its derived path");
+    assert!(matches!(
+        error.downcast_ref::<RenameRejected>(),
+        Some(RenameRejected::Duplicate(_))
+    ));
+    let durable = storage.load().unwrap();
+    let original = durable.iter().find(|current| current.id == row.id).unwrap();
+    assert_eq!(original.project_path, row.project_path);
+    assert_eq!(original.lifecycle_generation, row.lifecycle_generation);
+    assert!(original.lifecycle_reservation.is_none());
+    assert!(root.path().join("old/tracked").exists());
+    assert!(!claimed.exists());
+}

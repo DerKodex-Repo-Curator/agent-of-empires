@@ -192,6 +192,7 @@ pub(crate) fn perform(
             rename_branch: rename,
             branch,
         } => {
+            let title_requested = title.is_some();
             if let Some(title) = title {
                 candidate.title = title;
             }
@@ -206,7 +207,7 @@ pub(crate) fn perform(
             );
             if let Some(branch) = branch {
                 branch_only = Some(branch);
-            } else if tied && (original.title != candidate.title || rename) {
+            } else if tied && (title_requested || rename) {
                 name = Some(super::worktree_edit::worktree_leaf_from_title(
                     &candidate.title,
                 ));

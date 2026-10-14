@@ -74,6 +74,51 @@ fn real_rename_worktree(root: &std::path::Path, leaf: &str) -> String {
     main.to_string_lossy().into_owned()
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn readonly_rename_routes_reject_malformed_json_before_body_errors() {
+    use axum::body::{to_bytes, Body};
+    use axum::extract::ConnectInfo;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let _app = crate::session::test_support::isolate_app_dir();
+    for read_only in [true, false] {
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        Arc::get_mut(&mut state).unwrap().read_only = read_only;
+        let router = crate::server::test_support::build_router_for_test(state);
+        for uri in [
+            "/api/sessions/missing",
+            "/api/sessions/missing/worktree-name",
+        ] {
+            let mut request = Request::builder()
+                .method("PATCH")
+                .uri(uri)
+                .header("host", "127.0.0.1")
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = router.clone().oneshot(request).await.unwrap();
+            if read_only {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+                let body: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"})
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+            }
+        }
+    }
+}
+
 /// #3411: a rename to a duplicate title, or a tied rename whose derived path
 /// collides with another session's worktree, is refused.
 #[tokio::test]

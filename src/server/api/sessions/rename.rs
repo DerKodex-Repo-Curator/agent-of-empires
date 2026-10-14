@@ -124,6 +124,9 @@ pub async fn rename_session(
     Path(id): Path<String>,
     body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(response) = crate::server::api::read_only_block(&state) {
+        return response;
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(error) => return error.into_response(),
@@ -369,6 +372,9 @@ pub async fn set_worktree_name(
     Path(id): Path<String>,
     body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if let Some(response) = crate::server::api::read_only_block(&state) {
+        return response;
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(error) => return error.into_response(),

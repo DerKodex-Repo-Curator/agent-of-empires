@@ -1198,6 +1198,7 @@ mod tests {
             (Method::PATCH, "/api/projects/myproj"),
             (Method::POST, "/api/push/subscribe"),
             (Method::POST, "/api/push/unsubscribe"),
+            (Method::POST, "/api/plugins/acme/action"),
             // Cosmetic UI state and the update banner grant no capability; the
             // handlers still enforce read_only.
             (Method::POST, "/api/app-state/web-tour-seen"),
