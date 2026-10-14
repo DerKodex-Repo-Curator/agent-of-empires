@@ -512,7 +512,10 @@ mod tests {
                 .into_iter()
                 .find(|row| row.id == inst.id)
                 .unwrap();
-            assert_eq!(persisted.status, Status::Error);
+            assert_eq!(
+                persisted.status,
+                if clean { inst.status } else { Status::Error }
+            );
             assert_eq!(
                 persisted.prime_runtime().unwrap().directory,
                 runtime.directory
