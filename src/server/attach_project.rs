@@ -425,7 +425,13 @@ async fn spawn_worker(
         }
     };
 
-    let spawned = state.acp_supervisor.spawn(request).await;
+    let spawned = state
+        .acp_supervisor
+        .spawn(
+            request,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await;
     let committed = run_blocking(storage, move |storage| {
         complete_worker_restart(storage, &inst).map_err(|error| format!("{error:#}"))
     })
