@@ -322,6 +322,10 @@ pub struct HomeView {
 
     pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
+    rename_worker: crate::tui::worker::TrackedWorker<
+        crate::session::rename::Request,
+        operations::RenameResult,
+    >,
 
     pub(super) creation_poller: CreationPoller,
     /// Cancels the request behind `creating_stub_id`.

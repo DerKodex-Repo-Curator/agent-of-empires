@@ -1506,7 +1506,7 @@ fn test_cursor_follows_session_after_deletion() {
 
 #[test]
 #[serial]
-fn ownership_review_sandbox_pull_releases_root_and_revalidates_creation() {
+fn sandbox_pull_releases_root_and_revalidates_creation() {
     use crate::session::storage::acquire_ownership_lock;
     use crate::tui::creation_poller::{CreationPoller, CreationRequest, CreationResult};
     use std::time::{Duration, Instant};

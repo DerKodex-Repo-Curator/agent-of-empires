@@ -422,7 +422,7 @@ impl BranchOrigin {
         })
     }
 
-    fn verify(&self, destination: Option<&str>) -> Result<()> {
+    pub(crate) fn verify(&self, destination: Option<&str>) -> Result<()> {
         let repo = git2::Repository::open(&self.repo)?;
         self.directory.verify()?;
         self.git.verify_at(repo.path())?;
@@ -663,7 +663,11 @@ impl crate::git::native_hooks::HookLease for BranchLease<'_> {
         self.verify()
             .map_err(|error| io::Error::other(format!("{error:#}")))
     }
-    fn pause(&mut self, _: &Path, _: bool, _: Option<&Path>) -> io::Result<()> {
+    fn pause(&mut self, _: &str, _: &Path, _: bool, _: Option<&Path>) -> io::Result<()> {
+        if self.root_paused {
+            self.resume(None)?;
+            return self.pause_retained();
+        }
         let mut pause = || -> Result<()> {
             self.verify()?;
             let repo = git2::Repository::open(&self.origin.repo)?;
@@ -683,7 +687,23 @@ impl crate::git::native_hooks::HookLease for BranchLease<'_> {
                 .into_iter()
                 .map(PathSnapshot::capture)
                 .collect::<Result<_>>()?;
-            // No storage transaction may enclose this handoff.
+            self.pause_retained().map_err(anyhow::Error::from)
+        };
+        pause().map_err(|error| io::Error::other(format!("{error:#}")))
+    }
+    fn resume(&mut self, _: Option<&str>) -> io::Result<()> {
+        let mut resume = || -> Result<()> {
+            self.restore_locks()?;
+            for path in &self.boundary {
+                path.verify()?;
+            }
+            self.verify()?;
+            Ok(())
+        };
+        resume().map_err(|error| io::Error::other(format!("{error:#}")))
+    }
+    fn pause_retained(&mut self) -> io::Result<()> {
+        let mut pause = || -> Result<()> {
             for lock in self.handoff.nested.iter().rev() {
                 lock.pause_native()?;
                 self.nested_released += 1;
@@ -693,18 +713,6 @@ impl crate::git::native_hooks::HookLease for BranchLease<'_> {
             Ok(())
         };
         pause().map_err(|error| io::Error::other(format!("{error:#}")))
-    }
-    fn resume(&mut self) -> io::Result<()> {
-        let mut resume = || -> Result<()> {
-            self.restore_locks()?;
-            for path in &self.boundary {
-                path.verify()?;
-            }
-            self.verify()?;
-            self.boundary.clear();
-            Ok(())
-        };
-        resume().map_err(|error| io::Error::other(format!("{error:#}")))
     }
 }
 
@@ -777,7 +785,7 @@ pub(crate) struct NativeLease<'a> {
     original_tip: Option<git2::Oid>,
     owned_branch_origin: Option<std::sync::Arc<BranchOrigin>>,
     boundary: Option<CheckoutBoundary>,
-    child_boundary: Option<CheckoutBoundary>,
+    child_boundaries: Vec<(String, CheckoutBoundary)>,
     partial_directories: Vec<(PathBuf, DirectoryWitness)>,
     checkout: Option<CheckoutWitness>,
     children: Vec<(PathBuf, CheckoutWitness)>,
@@ -847,7 +855,7 @@ impl<'a> NativeLease<'a> {
             original_tip: None,
             owned_branch_origin: None,
             boundary: None,
-            child_boundary: None,
+            child_boundaries: Vec::new(),
             partial_directories: Vec::new(),
             checkout: None,
             children: Vec::new(),
@@ -980,20 +988,33 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
 
     fn pause(
         &mut self,
+        callback: &str,
         cwd: &Path,
         checkout_ready: bool,
         git_dir: Option<&Path>,
     ) -> io::Result<()> {
+        let overlapping = self.ownership.is_none();
+        if overlapping {
+            self.resume(None)?;
+        }
         let mut prepare = || -> Result<()> {
             self.verify()?;
             let admin = git_dir.map(|directory| cwd.join(directory));
-            self.boundary = Some(CheckoutBoundary::capture(&self.path, admin.as_deref())?);
-            self.child_boundary = if cwd != self.path && cwd != self.main_repo {
-                Some(CheckoutBoundary::capture(cwd, admin.as_deref())?)
-            } else {
-                None
-            };
-            for boundary in [&self.boundary, &self.child_boundary].into_iter().flatten() {
+            if !overlapping {
+                self.boundary = Some(CheckoutBoundary::capture(&self.path, admin.as_deref())?);
+                self.child_boundaries.clear();
+            }
+            if cwd != self.path && cwd != self.main_repo {
+                self.child_boundaries.push((
+                    callback.to_owned(),
+                    CheckoutBoundary::capture(cwd, admin.as_deref())?,
+                ));
+            }
+            for boundary in self
+                .boundary
+                .iter()
+                .chain(self.child_boundaries.iter().map(|(_, boundary)| boundary))
+            {
                 for path in boundary.paths() {
                     if let Some(EntryPin::Directory(directory)) = &path.pin {
                         if !self
@@ -1024,23 +1045,23 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                 .context("native Git ownership lease missing")?;
             let (_, pins) = inventory(root, self.provisional)?;
             self.profile_pins.extend(pins);
-            if let Some(owner) = &mut self.owner {
-                owner.release(root)?;
-            }
-            drop(self.ownership.take());
-            Ok(())
+            self.pause_retained().map_err(anyhow::Error::from)
         };
         prepare().map_err(|error| io::Error::other(format!("{error:#}")))
     }
 
-    fn resume(&mut self) -> io::Result<()> {
+    fn resume(&mut self, completed: Option<&str>) -> io::Result<()> {
         let mut resume = || -> Result<()> {
             *self.ownership = Some(if self.exclusive {
                 storage::acquire_ownership_lock()?
             } else {
                 storage::acquire_ownership_read()?
             });
-            for boundary in [&self.boundary, &self.child_boundary].into_iter().flatten() {
+            for boundary in self
+                .boundary
+                .iter()
+                .chain(self.child_boundaries.iter().map(|(_, boundary)| boundary))
+            {
                 boundary.verify()?;
             }
             self.verify()?;
@@ -1051,11 +1072,27 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                         .context("native Git ownership lease missing")?,
                 )?;
             }
-            self.boundary = None;
-            self.child_boundary = None;
+            if let Some(completed) = completed {
+                self.child_boundaries
+                    .retain(|(callback, _)| callback != completed);
+            }
             Ok(())
         };
         resume().map_err(|error| io::Error::other(format!("{error:#}")))
+    }
+    fn pause_retained(&mut self) -> io::Result<()> {
+        let mut release = || -> Result<()> {
+            let root = self
+                .ownership
+                .as_ref()
+                .context("native Git ownership lease missing")?;
+            if let Some(owner) = &mut self.owner {
+                owner.release(root)?;
+            }
+            drop(self.ownership.take());
+            Ok(())
+        };
+        release().map_err(|error| io::Error::other(format!("{error:#}")))
     }
 }
 
@@ -1253,7 +1290,7 @@ mod tests {
             if action == "native-progress" {
                 git.rename_branch("original", "renamed").unwrap();
             }
-            lease.pause(&main, false, None).unwrap();
+            lease.pause("callback", &main, false, None).unwrap();
             assert!(
                 root.require_exclusive().is_err(),
                 "suspended root must reject authority: {action}"
@@ -1369,7 +1406,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let accepted = lease.resume().is_ok();
+            let accepted = lease.resume(Some("callback")).is_ok();
             assert_eq!(
                 accepted,
                 matches!(
@@ -1450,7 +1487,7 @@ mod tests {
         )
         .unwrap();
         fs::write(root.app_dir().join("first.lock"), "").unwrap();
-        assert!(lease.pause(&main, false, None).is_err());
+        assert!(lease.pause("callback", &main, false, None).is_err());
         assert_eq!(lease.nested_released, 1);
         drop(lease);
         assert!(root.require_exclusive().is_ok());

@@ -596,6 +596,8 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
 
     view.rename_selected("main branch", None, None, false)
         .unwrap();
+    view.finish_rename_for_test();
+    view.reload().unwrap();
     assert!(view.info_dialog.is_some());
     assert_eq!(view.get_instance(&target_id).unwrap().title, "throwaway");
     assert_eq!(
@@ -605,6 +607,7 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
 
     view.info_dialog = None;
     view.rename_selected("", Some("work"), None, false).unwrap();
+    view.finish_rename_for_test();
     assert!(view.info_dialog.is_none());
     assert_eq!(view.get_instance(&target_id).unwrap().group_path, "work");
     let stored = storage.load().unwrap();
@@ -639,6 +642,7 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     view.info_dialog = None;
     view.rename_selected("main branch", None, None, false)
         .unwrap();
+    view.finish_rename_for_test();
     assert!(
         view.info_dialog.is_some(),
         "tied derived-destination collision must be rejected"
@@ -677,14 +681,13 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     )
     .unwrap();
     unified.selected_session = Some(source_id.clone());
-    let error = unified
+    unified
         .rename_selected("occupied", None, Some("beta"), false)
-        .expect_err("target-profile identity collision must reject the transaction");
+        .unwrap();
+    unified.finish_rename_for_test();
     assert!(
-        error
-            .to_string()
-            .contains("Session already exists with same title and path"),
-        "unexpected collision error: {error:#}"
+        unified.info_dialog.is_some(),
+        "target-profile identity collision must reject the transaction"
     );
     assert_eq!(
         alpha
@@ -734,6 +737,7 @@ fn test_rename_profile_change_prunes_source_group() {
 
     // Move the session alpha -> beta, keeping the same group name.
     view.rename_selected("", None, Some("beta"), false).unwrap();
+    view.finish_rename_for_test();
 
     let moved = view.get_instance(&id).unwrap();
     assert_eq!(moved.source_profile, "beta");
@@ -959,4 +963,104 @@ fn test_session_context_menu_new_session_prefills_from_session() {
         .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn rename_submission_keeps_help_responsive_while_root_is_contended() {
+    let mut row = Instance::new("before rename", "/tmp/metadata-rename");
+    row.view = crate::session::View::Structured;
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    let (ready, entered) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _root = crate::session::storage::acquire_ownership_lock().unwrap();
+        ready.send(()).unwrap();
+        let _ = gate.recv_timeout(std::time::Duration::from_secs(1));
+    });
+    entered
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let started = std::time::Instant::now();
+    env.view
+        .rename_selected("after rename", None, None, false)
+        .unwrap();
+    let returned_promptly = started.elapsed() < std::time::Duration::from_millis(200);
+    let pending = env.view.rename_worker.is_pending(&id);
+    env.view.handle_key(key(KeyCode::Char('?')), None);
+    let help_opened = env.view.show_help;
+    let _ = release.send(());
+    holder.join().unwrap();
+    env.view.finish_rename_for_test();
+    assert!(
+        returned_promptly,
+        "submitting a rename must not wait for root ownership"
+    );
+    assert!(pending);
+    assert!(
+        help_opened,
+        "input must remain live while the rename worker waits"
+    );
+    assert_eq!(env.view.get_instance(&id).unwrap().title, "after rename");
+    assert_eq!(
+        Storage::open_unwatched("test").unwrap().load().unwrap()[0].title,
+        "after rename"
+    );
+}
+
+#[test]
+#[serial]
+fn rename_result_preserves_a_newer_authoritative_generation_without_stale_save() {
+    let mut row = Instance::new("before rename", "/tmp/generation-rename");
+    row.view = crate::session::View::Structured;
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    let storage = Storage::open_unwatched("test").unwrap();
+    env.view
+        .rename_selected("worker title", None, None, false)
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if storage.load().unwrap()[0].title == "worker title" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker did not commit"
+        );
+        std::thread::yield_now();
+    }
+    let generation = {
+        let root = crate::session::storage::acquire_ownership_read().unwrap();
+        let _identity =
+            crate::session::storage::acquire_session_identity_lock_with_ownership(&root).unwrap();
+        let _title =
+            crate::session::storage::acquire_session_title_lock_with_ownership(&root, &id).unwrap();
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+            .unwrap();
+        storage
+            .update_with_ownership(&root, |rows, _| {
+                let row = &mut rows[0];
+                row.title = "newer title".into();
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Launch,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .unwrap()
+    };
+    env.view.reload().unwrap();
+    env.view.finish_rename_for_test();
+    let current = env.view.get_instance(&id).unwrap();
+    assert_eq!(current.title, "newer title");
+    assert_eq!(current.lifecycle_generation, generation);
+    let durable = storage.load().unwrap().remove(0);
+    assert_eq!(durable.title, "newer title");
+    assert_eq!(durable.lifecycle_generation, generation);
 }

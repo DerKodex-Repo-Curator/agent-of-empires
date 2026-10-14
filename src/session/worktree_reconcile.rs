@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn ownership_review_current_returns_while_an_unrelated_root_lease_is_held() {
+    fn current_checkout_returns_while_an_unrelated_root_lease_is_held() {
         let _home = crate::session::test_support::isolate_app_dir();
         let temp = tempfile::tempdir().unwrap();
         let existing = temp.path().join("exists");

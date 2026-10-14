@@ -468,9 +468,9 @@ fn reconcile_refuses_a_checkout_another_session_records() {
 fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    for (replace, long_hook) in [(false, false), (true, false), (false, true)]
+    for replace in [false, true]
         .into_iter()
-        .filter(|(replace, _)| !replace || cfg!(target_os = "linux"))
+        .filter(|replace| !replace || cfg!(target_os = "linux"))
     {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -496,7 +496,7 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
         let hook = repo.path().join("hooks/post-checkout");
         std::fs::write(
             &hook,
-            "#!/bin/sh\nif [ \"$AOE_TEST_LONG_HOOK\" = 1 ]; then\n printf started > \"$AOE_TEST_HOOK_STARTED\"\n sleep 35 || exit 97\nfi\nprintf '%s\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -551,8 +551,6 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             )
             .env("AOE_TEST_REAL_GIT", real_git)
             .env("AOE_TEST_HOOK", &marker)
-            .env("AOE_TEST_LONG_HOOK", if long_hook { "1" } else { "0" })
-            .env("AOE_TEST_HOOK_STARTED", root.join("hook-started"))
             .env("AOE_TEST_IMAGE", &executable)
             .env("AOE_TEST_REPLACEMENT", &replacement)
             .env("AOE_TEST_IMAGE_AFTER", &image_after)
@@ -566,7 +564,6 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             .env_remove("KIRO_CONFIG_DIR");
         std::fs::create_dir_all(app.join("profiles/owner")).unwrap();
 
-        let started = std::time::Instant::now();
         let output = agent_of_empires::process::run_with_timeout_process_group(
             &mut command,
             std::time::Duration::from_secs(75),
@@ -583,13 +580,6 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
             marker.exists(),
             "replace={replace}: real post-checkout hook was skipped"
         );
-        if long_hook {
-            assert_eq!(
-                std::fs::read(root.join("hook-started")).unwrap(),
-                b"started"
-            );
-            assert!(started.elapsed() >= std::time::Duration::from_secs(35));
-        }
         if replace {
             assert!(std::fs::read_to_string(image_after)
                 .unwrap()
@@ -606,5 +596,30 @@ fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
         assert!(repo
             .find_branch("native-proof", git2::BranchType::Local)
             .is_ok());
+    }
+}
+
+#[test]
+fn ordinary_cli_ignores_stale_native_context_under_renamed_and_symlink_names() {
+    let fixture = tempfile::tempdir().unwrap();
+    for name in ["aoe", "renamed-aoe", "git"] {
+        let executable = fixture.path().join(name);
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_aoe"), &executable).unwrap();
+        let output = std::process::Command::new(&executable)
+            .arg("--version")
+            .env("HOME", fixture.path())
+            .env("XDG_CONFIG_HOME", fixture.path())
+            .env(
+                "AOE_NATIVE_GIT_CONTEXT",
+                fixture.path().join("gone/scope.json"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
     }
 }

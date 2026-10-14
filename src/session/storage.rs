@@ -1706,6 +1706,22 @@ impl Storage {
                     .iter()
                     .find(|instance| instance.id == before.id)
                     .ok_or_else(|| anyhow!("Session not found in source profile"))?;
+                anyhow::ensure!(
+                    source.created_at == before.created_at,
+                    "Session incarnation changed before profile move"
+                );
+                if source.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
+                    anyhow::ensure!(
+                        before.lifecycle_reservation_is_owned(
+                            super::LifecycleOperation::Rename,
+                            before.lifecycle_generation
+                        ) && source.lifecycle_reservation_is_owned(
+                            super::LifecycleOperation::Rename,
+                            before.lifecycle_generation
+                        ),
+                        "Cannot move a session while a lifecycle operation is in progress"
+                    );
+                }
                 if target_instances
                     .iter()
                     .any(|instance| instance.id == before.id)
@@ -1717,6 +1733,22 @@ impl Storage {
                     candidate.merge_profile_move_diff(before, after, plan.account_swap);
                 } else {
                     candidate.merge_user_action_diff(before, after);
+                }
+                if before.lifecycle_reservation_is_owned(
+                    super::LifecycleOperation::Rename,
+                    before.lifecycle_generation,
+                ) {
+                    anyhow::ensure!(
+                        source.lifecycle_reservation_is_owned(
+                            super::LifecycleOperation::Rename,
+                            before.lifecycle_generation
+                        ),
+                        "Profile move rename reservation was superseded"
+                    );
+                    candidate.release_lifecycle_reservation_if_owned(
+                        super::LifecycleOperation::Rename,
+                        before.lifecycle_generation,
+                    );
                 }
                 candidate.source_profile.clone_from(&target.profile);
                 moved.push(candidate);

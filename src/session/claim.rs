@@ -40,7 +40,7 @@ impl<'a> ReservationCleanup<'a> {
             && instance.lifecycle_reservation_is_owned(self.operation, self.generation)
     }
 
-    fn release(&self) -> anyhow::Result<()> {
+    pub(crate) fn release(&self) -> anyhow::Result<()> {
         let ownership = super::storage::acquire_ownership_read()?;
         let _lifecycle = self
             .storage
@@ -226,8 +226,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn ownership_review_abandonment_only_releases_the_original_reservation() {
-        for operation in [LifecycleOperation::Trash, LifecycleOperation::Launch] {
+    fn abandonment_only_releases_the_original_reservation() {
+        for operation in [
+            LifecycleOperation::Trash,
+            LifecycleOperation::Launch,
+            LifecycleOperation::Rename,
+        ] {
             for change in [
                 "checkout",
                 "generation",

@@ -51,6 +51,29 @@ fn build_rename_test_state(
     (storage, state)
 }
 
+fn real_rename_worktree(root: &std::path::Path, leaf: &str) -> String {
+    let main = root.join("repo");
+    let repo = git2::Repository::init(&main).unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+    let tree = repo.index().unwrap().write_tree().unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "base",
+        &repo.find_tree(tree).unwrap(),
+        &[],
+    )
+    .unwrap();
+    let base = repo.head().unwrap().shorthand().unwrap().to_string();
+    crate::git::GitWorktree::new(main.clone())
+        .unwrap()
+        .with_init_submodules(false)
+        .create_worktree(leaf, &root.join(leaf), true, Some(&base))
+        .unwrap();
+    main.to_string_lossy().into_owned()
+}
+
 /// #3411: a rename to a duplicate title, or a tied rename whose derived path
 /// collides with another session's worktree, is refused.
 #[tokio::test]
@@ -1737,11 +1760,7 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
 #[serial_test::serial]
 async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
     {
-        // Invariant #2260: a live structured worker is pinned to its cwd, so a
-        // tied rename that MOVES the worktree must stop the worker first, while one
-        // that leaves the cwd in place must not interrupt it. The quiesce runs
-        // before the git edit, so the assertion holds even though the edit then
-        // fails on a fixture with no real worktree to move.
+        // A structured worker's cwd changes only after authoritative admission (#2260).
         let _app_dir = crate::session::test_support::isolate_app_dir();
 
         struct Case {
@@ -1772,6 +1791,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         for case in cases {
             let paths = tempfile::tempdir().unwrap();
             let project_path = paths.path().join(case.leaf);
+            let main_repo = real_rename_worktree(paths.path(), case.leaf);
             let mut inst = Instance::new(
                 "Original title",
                 project_path.to_str().expect("UTF-8 temp path"),
@@ -1782,15 +1802,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             // misses and quiesce closes.
             inst.status = Status::Idle;
             inst.view = crate::session::View::Structured;
-            inst.worktree_info = Some(worktree(
-                case.leaf,
-                paths
-                    .path()
-                    .join("missing-repo")
-                    .to_string_lossy()
-                    .into_owned(),
-                None,
-            ));
+            inst.worktree_info = Some(worktree(case.leaf, main_repo, None));
 
             let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
@@ -1821,10 +1833,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         }
     }
     {
-        // The standalone-endpoint mirror of the rename_session gate above: both
-        // stop a live structured worker only when the edit actually moves the cwd
-        // (#2260). The quiesce precedes the git edit, so the assertion holds even
-        // though the edit then fails on a fixture with no real worktree.
+        // The standalone route shares the same reservation and quiescence phase.
         let _app_dir = crate::session::test_support::isolate_app_dir();
         // set_worktree_name refuses a tied managed worktree (tied callers must
         // go through rename_session), so untie the profile to reach the worker
@@ -1870,6 +1879,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
         for case in cases {
             let paths = tempfile::tempdir().unwrap();
             let project_path = paths.path().join(case.leaf);
+            let main_repo = real_rename_worktree(paths.path(), case.leaf);
             let mut inst = Instance::new(
                 "Original title",
                 project_path.to_str().expect("UTF-8 temp path"),
@@ -1878,15 +1888,7 @@ async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
             inst.source_profile = "test".to_string();
             inst.status = Status::Idle;
             inst.view = crate::session::View::Structured;
-            inst.worktree_info = Some(worktree(
-                case.leaf,
-                paths
-                    .path()
-                    .join("missing-repo")
-                    .to_string_lossy()
-                    .into_owned(),
-                None,
-            ));
+            inst.worktree_info = Some(worktree(case.leaf, main_repo, None));
 
             let storage = Storage::new_unwatched("test").unwrap();
             storage
@@ -3968,11 +3970,23 @@ fn rename_persistence_reports_missing_authoritative_row() {
     let _ = crate::session::get_app_dir().expect("isolated app dir");
     let storage = Storage::new_unwatched("rename-missing").unwrap();
 
-    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
-    let outcome =
-        persist_rename_metadata(&storage, &ownership, "missing-id", "New title", None, None)
-            .unwrap();
-    assert_eq!(outcome, RenamePersistOutcome::Missing);
+    let mut baseline = Instance::new("missing", "/tmp/missing");
+    baseline.source_profile = storage.profile().to_string();
+    let outcome = crate::session::rename::perform(
+        crate::session::rename::Request {
+            baseline,
+            edit: crate::session::rename::Edit::Session {
+                title: Some("New title".into()),
+                group: None,
+                profile: None,
+                rename_branch: false,
+                branch: None,
+            },
+            file_watch: crate::file_watch::FileWatchService::noop(),
+        },
+        |_, _| Ok(()),
+    );
+    assert!(outcome.is_err());
     assert!(
         storage.load().unwrap().is_empty(),
         "a missing row must not be synthesized by rename persistence"

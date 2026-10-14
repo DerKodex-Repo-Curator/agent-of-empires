@@ -392,6 +392,10 @@ impl HomeView {
             store_move_bypass: None,
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
+            rename_worker: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-rename",
+                super::operations::perform_rename,
+            ),
             creation_poller: CreationPoller::new(),
             creation_cancel: None,
             on_launch_hooks_ran: HashSet::new(),

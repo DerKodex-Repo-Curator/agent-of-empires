@@ -4,19 +4,27 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, PermissionsExt};
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use fs2::FileExt;
 
 use serde::{Deserialize, Serialize};
 
 const CONTEXT: &str = "AOE_NATIVE_GIT_CONTEXT";
 const PRIVATE_PREFIX: &str = "AOE_NATIVE_GIT_";
+const REAL_EXEC: &str = "AOE_NATIVE_GIT_REAL_EXEC";
+const PROXY_EXEC: &str = "AOE_NATIVE_GIT_PROXY_EXEC";
 
 const LIVE_HOOKS: [&str; 4] = [
     "post-index-change",
@@ -59,10 +67,17 @@ fn hooked_command(name: Option<&OsStr>) -> bool {
 pub(crate) trait HookLease {
     fn runtime_dir(&self) -> &Path;
     fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()>;
-    fn pause(&mut self, cwd: &Path, checkout_ready: bool, git_dir: Option<&Path>)
-        -> io::Result<()>;
-    fn resume(&mut self) -> io::Result<()>;
+    fn pause(
+        &mut self,
+        callback: &str,
+        cwd: &Path,
+        checkout_ready: bool,
+        git_dir: Option<&Path>,
+    ) -> io::Result<()>;
+    fn resume(&mut self, completed: Option<&str>) -> io::Result<()>;
     fn checkpoint(&mut self) -> io::Result<()>;
+    // Release restored locks without refreshing the original callback-group boundary.
+    fn pause_retained(&mut self) -> io::Result<()>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,8 +87,10 @@ struct Scope {
     real_exec: PathBuf,
     proxy_exec: PathBuf,
     program_prefix: String,
-    fd: RawFd,
-    owner_group: i32,
+    socket: PathBuf,
+    socket_device: u64,
+    socket_inode: u64,
+    capability: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,6 +114,8 @@ struct Descriptor {
 #[derive(Serialize, Deserialize)]
 enum Frame {
     Enter {
+        capability: String,
+        parent: Option<String>,
         cwd: Vec<u8>,
         checkout_ready: bool,
         git_dir: Option<Vec<u8>>,
@@ -105,8 +124,16 @@ enum Frame {
 }
 
 enum Event {
-    Frame(Frame),
-    ReadError(io::Error),
+    Frame {
+        id: String,
+        frame: Frame,
+        control: UnixStream,
+    },
+    ReadError {
+        id: String,
+        authenticated: bool,
+        error: io::Error,
+    },
     Exit(io::Result<Output>),
 }
 
@@ -128,7 +155,7 @@ fn invalid(message: impl std::fmt::Display) -> io::Error {
 }
 
 fn inheritable(fd: RawFd, inherit: bool) -> io::Result<()> {
-    // SAFETY: fcntl operates on this process's live control descriptor.
+    // SAFETY: fcntl operates on this process's live liveness descriptor.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 {
         return Err(io::Error::last_os_error());
@@ -669,6 +696,12 @@ fn configured_git(
     command
         .env("GIT_EXEC_PATH", &descriptor.scope.proxy_exec)
         .env(CONTEXT, path);
+    command
+        .env(REAL_EXEC, &descriptor.scope.real_exec)
+        .env(PROXY_EXEC, &descriptor.scope.proxy_exec);
+    if let Some(parent) = std::env::var_os("AOE_NATIVE_GIT_PARENT") {
+        command.env("AOE_NATIVE_GIT_PARENT", parent);
+    }
     Ok(command)
 }
 
@@ -677,18 +710,204 @@ fn routing_git(descriptor: &Descriptor, args: &[OsString], path: &Path) -> io::R
     command
         .env("GIT_EXEC_PATH", &descriptor.scope.proxy_exec)
         .env(CONTEXT, path);
+    command
+        .env(REAL_EXEC, &descriptor.scope.real_exec)
+        .env(PROXY_EXEC, &descriptor.scope.proxy_exec);
+    if let Some(parent) = std::env::var_os("AOE_NATIVE_GIT_PARENT") {
+        command.env("AOE_NATIVE_GIT_PARENT", parent);
+    }
     Ok(command)
+}
+
+// Retain the app marker until its short socket route has been removed.
+struct Runtime {
+    _socket_root: tempfile::TempDir,
+    _root: tempfile::TempDir,
+    owner: fs::File,
+    group: fs::File,
+}
+
+const RUNTIME_MARKER: &str = "aoe-native-git-runtime-v1";
+
+#[derive(Serialize, Deserialize)]
+struct RuntimeMarker {
+    kind: String,
+    socket_root: PathBuf,
+    socket_device: u64,
+    socket_inode: u64,
+    token: String,
+}
+
+fn sweep_runtime(app_dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(app_dir)? {
+        let entry = entry?;
+        if !entry.file_name().as_bytes().starts_with(b"native-git-") {
+            continue;
+        }
+        let path = entry.path();
+        let directory = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(directory) => directory,
+            Err(_) => continue,
+        };
+        let before = directory.metadata()?;
+        if !before.is_dir()
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o777 != 0o700
+        {
+            continue;
+        }
+        let mut owner = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path.join("owner"))
+        {
+            Ok(owner) => owner,
+            Err(_) => continue,
+        };
+        let metadata = owner.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != before.uid()
+            || metadata.mode() & 0o777 != 0o600
+            || owner.try_lock_exclusive().is_err()
+        {
+            continue;
+        }
+        let mut marker = Vec::new();
+        owner.read_to_end(&mut marker)?;
+        let Ok(marker) = serde_json::from_slice::<RuntimeMarker>(&marker) else {
+            continue;
+        };
+        if marker.kind != RUNTIME_MARKER {
+            continue;
+        }
+        let Ok(group) = runtime_group(&path) else {
+            continue;
+        };
+        // A close-fds wrapper can discard the inherited liveness lock.
+        // Never reclaim while an original Git group member can still execute.
+        if group != 0 {
+            if unsafe { libc::kill(-group, 0) } == 0 {
+                // Unreaped zombies cannot use the route; reuse the owned-runner census.
+                if !matches!(
+                    crate::process::runner_group_executing(group as u32),
+                    Ok(false)
+                ) {
+                    continue;
+                }
+            } else if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                continue;
+            }
+        }
+        let after = fs::symlink_metadata(&path)?;
+        if before.dev() == after.dev() && before.ino() == after.ino() {
+            match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                .open(&marker.socket_root)
+            {
+                Ok(socket_directory) => {
+                    if verify_socket_runtime(&marker, &socket_directory.metadata()?).is_err() {
+                        continue;
+                    }
+                    fs::remove_dir_all(&marker.socket_root)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_socket_runtime(marker: &RuntimeMarker, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+        || metadata.dev() != marker.socket_device
+        || metadata.ino() != marker.socket_inode
+        || fs::read(marker.socket_root.join("owner"))? != marker.token.as_bytes()
+    {
+        return Err(invalid("native runtime socket ownership changed"));
+    }
+    Ok(())
+}
+
+fn runtime_group(root: &Path) -> io::Result<i32> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root.join("group"))?;
+    let mut bytes = [0; 4];
+    file.read_exact(&mut bytes)?;
+    let group = i32::from_ne_bytes(bytes);
+    if group < 0 || group == 1 {
+        return Err(invalid("invalid native runtime process group"));
+    }
+    Ok(group)
+}
+
+fn publish_group(fd: RawFd) -> io::Result<()> {
+    // SAFETY: this is the child before exec, writing its PID to our open marker.
+    let group = unsafe { libc::getpid() }.to_ne_bytes();
+    let written = unsafe { libc::pwrite(fd, group.as_ptr().cast(), group.len(), 0) };
+    if written != group.len() as isize {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn initialize(
     cwd: &Path,
-    lease: &dyn HookLease,
-    fd: RawFd,
-) -> io::Result<(tempfile::TempDir, Descriptor, PathBuf)> {
+    app_dir: &Path,
+) -> io::Result<(Runtime, Descriptor, PathBuf, UnixListener)> {
+    sweep_runtime(app_dir)?;
     let root = tempfile::Builder::new()
         .prefix("native-git-")
-        .tempdir_in(lease.runtime_dir())?;
+        .tempdir_in(app_dir)?;
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+    let mut owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.path().join("owner"))?;
+    owner.lock_exclusive()?;
+    let mut group = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(root.path().join("group"))?;
+    group.write_all(&0i32.to_ne_bytes())?;
+    // sun_path is only 104 bytes on macOS, independently of the app path.
+    let socket_root = tempfile::Builder::new()
+        .prefix("aoe-git-")
+        .tempdir_in("/tmp")?;
+    fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700))?;
+    let socket_directory = fs::metadata(socket_root.path())?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut socket_owner = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(socket_root.path().join("owner"))?;
+    socket_owner.write_all(token.as_bytes())?;
+    let marker = RuntimeMarker {
+        kind: RUNTIME_MARKER.into(),
+        socket_root: socket_root.path().to_path_buf(),
+        socket_device: socket_directory.dev(),
+        socket_inode: socket_directory.ino(),
+        token,
+    };
+    owner.write_all(&serde_json::to_vec(&marker).map_err(invalid)?)?;
+    let socket = socket_root.path().join("control");
+    let listener = UnixListener::bind(&socket)?;
+    let socket_metadata = fs::symlink_metadata(&socket)?;
     let real_git = which::which("git").map_err(invalid)?;
     let mut command = Command::new(&real_git);
     command.current_dir(cwd).arg("--exec-path");
@@ -701,7 +920,7 @@ fn initialize(
             symlink(entry.path(), proxy_exec.join(entry.file_name()))?;
         }
     }
-    let program = helper_program(root.path(), fd)?;
+    let program = helper_program(root.path())?;
     symlink(program, proxy_exec.join("git"))?;
     let descriptor = Descriptor {
         scope: Scope {
@@ -710,8 +929,10 @@ fn initialize(
             real_exec,
             proxy_exec,
             program_prefix: format!("aoe-native-{}", uuid::Uuid::new_v4()),
-            fd,
-            owner_group: unsafe { libc::getpgrp() },
+            socket,
+            socket_device: socket_metadata.dev(),
+            socket_inode: socket_metadata.ino(),
+            capability: uuid::Uuid::new_v4().to_string(),
         },
         hooks: PathBuf::new(),
         original_hooks: None,
@@ -721,11 +942,45 @@ fn initialize(
     };
     let path = root.path().join("scope.json");
     fs::write(&path, serde_json::to_vec(&descriptor).map_err(invalid)?)?;
-    Ok((root, descriptor, path))
+    Ok((
+        Runtime {
+            _root: root,
+            owner,
+            _socket_root: socket_root,
+            group,
+        },
+        descriptor,
+        path,
+        listener,
+    ))
 }
 
 pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> io::Result<Output> {
     Ok(run_inner(cwd, args, lease, None)?.expect("native Git without a deadline cannot expire"))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MUTATION_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn creation_test_timeout(
+    args: &[OsString],
+    timeout: std::time::Duration,
+) -> std::time::Duration {
+    MUTATION_TIMEOUT.with(|value| {
+        value
+            .get()
+            .filter(|_| {
+                let Ok(prefix) = global_prefix(args) else {
+                    return false;
+                };
+                args.get(prefix).is_some_and(|arg| arg == "worktree")
+                    && args.get(prefix + 1).is_some_and(|arg| arg == "add")
+            })
+            .unwrap_or(timeout)
+    })
 }
 
 pub(crate) fn run_timed(
@@ -734,6 +989,8 @@ pub(crate) fn run_timed(
     lease: &mut dyn HookLease,
     timeout: std::time::Duration,
 ) -> io::Result<Option<Output>> {
+    #[cfg(test)]
+    let timeout = creation_test_timeout(args, timeout);
     run_inner(cwd, args, lease, Some(timeout))
 }
 
@@ -743,8 +1000,9 @@ fn run_inner(
     lease: &mut dyn HookLease,
     timeout: Option<std::time::Duration>,
 ) -> io::Result<Option<Output>> {
-    let (mut control, child_control) = UnixStream::pair()?;
-    let (_root, descriptor, routing_path) = initialize(cwd, lease, child_control.as_raw_fd())?;
+    let (runtime, descriptor, routing_path, listener) = initialize(cwd, lease.runtime_dir())?;
+    let capability = Arc::<str>::from(descriptor.scope.capability.as_str());
+    let socket_path = descriptor.scope.socket.clone();
     let prefix_len = global_prefix(args)?;
     let eligible = hooked_command(args.get(prefix_len).map(OsString::as_os_str));
     let mut command = if eligible {
@@ -767,11 +1025,15 @@ fn run_inner(
     } else {
         None
     };
-    let fd = child_control.as_raw_fd();
+    let fd = runtime.owner.as_raw_fd();
+    let group_fd = runtime.group.as_raw_fd();
     command.process_group(0);
-    // SAFETY: the child only changes a descriptor flag before exec.
+    // The liveness lock, never a protocol descriptor, survives supervisor death.
     unsafe {
-        command.pre_exec(move || inheritable(fd, true));
+        command.pre_exec(move || {
+            inheritable(fd, true)?;
+            publish_group(group_fd)
+        });
     }
     let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
     let mut child = command.spawn()?;
@@ -779,33 +1041,74 @@ fn run_inner(
         pid: child.id(),
         complete: false,
     };
-    drop(child_control);
     let (sender, receiver) = mpsc::channel();
-    let input = control.try_clone()?;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stop_reader = Arc::clone(&stopping);
     let reader_sender = sender.clone();
+    let connections = Arc::new(parking_lot::Mutex::new(
+        BTreeMap::<String, UnixStream>::new(),
+    ));
+    let reader_connections = Arc::clone(&connections);
+    let reader_capability = capability;
     let reader = std::thread::spawn(move || {
-        let mut input = BufReader::new(input);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match input.read_until(b'\n', &mut line) {
-                Ok(0) => break,
-                Ok(_) => match serde_json::from_slice(&line) {
-                    Ok(frame) => {
-                        if reader_sender.send(Event::Frame(frame)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = reader_sender.send(Event::ReadError(invalid(error)));
-                        break;
-                    }
-                },
-                Err(error) => {
-                    let _ = reader_sender.send(Event::ReadError(error));
+        let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        for connection in listener.incoming() {
+            if stop_reader.load(Ordering::Acquire) {
+                break;
+            }
+            let Ok(control) = connection else { break };
+            let Ok(connection) = control.try_clone() else {
+                continue;
+            };
+            let id = uuid::Uuid::new_v4().to_string();
+            {
+                let mut connections = reader_connections.lock();
+                if stop_reader.load(Ordering::Acquire) {
                     break;
                 }
+                connections.insert(id.clone(), connection);
             }
+            let sender = reader_sender.clone();
+            let capability = Arc::clone(&reader_capability);
+            let connections = Arc::clone(&reader_connections);
+            readers.retain(|reader| !reader.is_finished());
+            readers.push(std::thread::spawn(move || {
+                let mut authenticated = false;
+                let result = (|| -> io::Result<()> {
+                    control.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                    let mut input = BufReader::new(control.try_clone()?);
+                    let mut line = Vec::new();
+                    input.read_until(b'\n', &mut line)?;
+                    let frame: Frame = serde_json::from_slice(&line)
+                        .map_err(|_| invalid("invalid native callback frame"))?;
+                    if !matches!(&frame, Frame::Enter { capability: supplied, .. } if supplied.as_str() == capability.as_ref()) {
+                        return Err(invalid("native callback authentication failed"));
+                    }
+                    authenticated = true;
+                    writeln!(&control, "{capability}")?;
+                    control.set_read_timeout(None)?;
+                    sender.send(Event::Frame { id: id.clone(), frame, control: control.try_clone()? })
+                        .map_err(invalid)?;
+                    line.clear();
+                    if input.read_until(b'\n', &mut line)? == 0 {
+                        return Err(invalid("native callback disconnected before completion"));
+                    }
+                    let frame = serde_json::from_slice(&line)
+                        .map_err(|_| invalid("invalid native callback completion frame"))?;
+                    if !matches!(frame, Frame::Done) {
+                        return Err(invalid("invalid native callback completion"));
+                    }
+                    sender.send(Event::Frame { id: id.clone(), frame, control }).map_err(invalid)?;
+                    Ok(())
+                })();
+                connections.lock().remove(&id);
+                if let Err(error) = result {
+                    let _ = sender.send(Event::ReadError { id, authenticated, error });
+                }
+            }));
+        }
+        for reader in readers {
+            let _ = reader.join();
         }
     });
     let waiter = std::thread::spawn(move || {
@@ -827,7 +1130,7 @@ fn run_inner(
         })();
         let _ = sender.send(Event::Exit(output));
     });
-    let mut paused = false;
+    let mut callbacks: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut expired = false;
     let mut failure = None;
     let output = loop {
@@ -850,15 +1153,26 @@ fn run_inner(
             }
         };
         match event {
-            Event::Frame(Frame::Enter {
-                cwd,
-                checkout_ready,
-                git_dir,
-            }) if failure.is_none() && !expired => {
-                let result = if paused {
-                    Err(invalid("overlapping native hook callbacks"))
+            Event::Frame {
+                id,
+                frame:
+                    Frame::Enter {
+                        parent,
+                        cwd,
+                        checkout_ready,
+                        git_dir,
+                        ..
+                    },
+                mut control,
+            } if failure.is_none() && !expired => {
+                let result = if parent
+                    .as_ref()
+                    .is_some_and(|parent| !callbacks.contains_key(parent))
+                {
+                    Err(invalid("native callback parent is no longer active"))
                 } else {
                     lease.pause(
+                        &id,
                         Path::new(OsStr::from_bytes(&cwd)),
                         checkout_ready,
                         git_dir
@@ -867,36 +1181,63 @@ fn run_inner(
                     )
                 };
                 if let Err(error) = result {
+                    tracing::warn!(target: "git.native_hooks", phase = "enter", %error, "native callback refused");
                     failure = Some(error);
                     crate::process::worker::kill_process_group(family.pid);
                 } else {
-                    paused = true;
-                    if let Err(error) = control.write_all(&[1]) {
+                    callbacks.insert(id.clone(), parent);
+                    if let Err(error) = writeln!(control, "{id}") {
                         failure = Some(error);
                         crate::process::worker::kill_process_group(family.pid);
                     }
                 }
             }
-            Event::Frame(Frame::Done) if failure.is_none() && !expired => {
-                let result = if paused {
-                    lease.resume()
+            Event::Frame {
+                id,
+                frame: Frame::Done,
+                mut control,
+            } if failure.is_none() && !expired => {
+                let result = if !callbacks.contains_key(&id)
+                    || callbacks
+                        .values()
+                        .any(|parent| parent.as_ref() == Some(&id))
+                {
+                    Err(invalid(
+                        "native callback completed outside its callback tree",
+                    ))
                 } else {
-                    Err(invalid("native callback completed without a handoff"))
+                    lease.resume(Some(&id))
                 };
                 if let Err(error) = result {
+                    tracing::warn!(target: "git.native_hooks", phase = "continue", %error, "native continuation refused");
                     failure = Some(error);
                     crate::process::worker::kill_process_group(family.pid);
                 } else {
-                    paused = false;
+                    callbacks.remove(&id);
+                    if !callbacks.is_empty() {
+                        if let Err(error) = lease.pause_retained() {
+                            failure = Some(error);
+                            crate::process::worker::kill_process_group(family.pid);
+                            continue;
+                        }
+                    }
                     if let Err(error) = control.write_all(&[1]) {
                         failure = Some(error);
                         crate::process::worker::kill_process_group(family.pid);
                     }
                 }
             }
-            Event::ReadError(error) if failure.is_none() && !expired => {
-                failure = Some(error);
-                crate::process::worker::kill_process_group(family.pid);
+            Event::ReadError {
+                id,
+                authenticated,
+                error,
+            } if failure.is_none() && !expired => {
+                // An unknown connector cannot cancel this owned Git family.
+                if authenticated || callbacks.contains_key(&id) {
+                    tracing::warn!(target: "git.native_hooks", phase = "transport", %error, "authenticated native callback connection failed");
+                    failure = Some(error);
+                    crate::process::worker::kill_process_group(family.pid);
+                }
             }
             Event::Exit(output) => break output,
             _ => {}
@@ -905,8 +1246,11 @@ fn run_inner(
     if output.is_err() {
         crate::process::worker::kill_process_group(family.pid);
     }
-    let _ = control.shutdown(std::net::Shutdown::Read);
-    drop(control);
+    stopping.store(true, Ordering::Release);
+    for connection in connections.lock().values() {
+        let _ = connection.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = UnixStream::connect(socket_path);
     let _ = waiter.join();
     if reader.join().is_err() && failure.is_none() && !expired {
         failure = Some(invalid("native Git control reader panicked"));
@@ -914,9 +1258,13 @@ fn run_inner(
     if !expired {
         for event in receiver.try_iter() {
             let error = match event {
-                Event::ReadError(error) => Some(error),
-                Event::Frame(_) => Some(invalid("native Git exited with a pending callback")),
-                Event::Exit(_) => None,
+                Event::ReadError {
+                    id,
+                    authenticated,
+                    error,
+                } if authenticated || callbacks.contains_key(&id) => Some(error),
+                Event::Frame { .. } => Some(invalid("native Git exited with a pending callback")),
+                Event::ReadError { .. } | Event::Exit(_) => None,
             };
             if failure.is_none() {
                 failure = error;
@@ -927,9 +1275,9 @@ fn run_inner(
         crate::process::worker::kill_process_group(family.pid);
     }
     family.complete = true;
-    if paused && failure.is_none() {
+    if !callbacks.is_empty() && failure.is_none() {
         failure = if expired {
-            lease.resume().err()
+            lease.resume(None).err()
         } else {
             Some(invalid(
                 "native hook exited before its lease was reacquired",
@@ -962,7 +1310,7 @@ fn descriptor_for_in(
 fn load_descriptor() -> io::Result<Descriptor> {
     let path = std::env::var_os(CONTEXT)
         .ok_or_else(|| invalid("native Git gateway context is missing"))?;
-    serde_json::from_slice(&fs::read(path)?).map_err(invalid)
+    serde_json::from_slice(&fs::read(path)?).map_err(|_| invalid("invalid native Git descriptor"))
 }
 
 fn is_post_checkout(args: &[OsString]) -> bool {
@@ -985,6 +1333,72 @@ fn send_frame(control: &mut UnixStream, frame: &Frame) -> io::Result<()> {
     } else {
         Err(invalid("native Git continuation was refused"))
     }
+}
+
+fn connect_callback(descriptor: &Descriptor) -> io::Result<UnixStream> {
+    let metadata = fs::symlink_metadata(&descriptor.scope.socket)?;
+    if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
+        || metadata.dev() != descriptor.scope.socket_device
+        || metadata.ino() != descriptor.scope.socket_inode
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(invalid("native callback endpoint changed"));
+    }
+    let control = UnixStream::connect(&descriptor.scope.socket)?;
+    control.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    Ok(control)
+}
+
+fn enter_callback(
+    control: &mut UnixStream,
+    descriptor: &Descriptor,
+    checkout_ready: bool,
+) -> io::Result<String> {
+    let frame = Frame::Enter {
+        capability: descriptor.scope.capability.clone(),
+        parent: std::env::var("AOE_NATIVE_GIT_PARENT").ok(),
+        cwd: std::env::current_dir()?.into_os_string().into_vec(),
+        checkout_ready,
+        git_dir: std::env::var_os("GIT_DIR").map(OsString::into_vec),
+    };
+    serde_json::to_writer(&mut *control, &frame).map_err(invalid)?;
+    control.write_all(b"\n")?;
+    let mut input = BufReader::new(control);
+    let mut ack = String::new();
+    input.read_line(&mut ack)?;
+    if ack.trim_end() != descriptor.scope.capability {
+        return Err(invalid("native callback server authentication failed"));
+    }
+    input.get_ref().set_read_timeout(None)?;
+    ack.clear();
+    input.read_line(&mut ack)?;
+    let id = ack.trim_end();
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(invalid("invalid native callback acknowledgement"));
+    }
+    Ok(id.to_string())
+}
+
+fn configure_callback(
+    command: &mut Command,
+    descriptor: &Descriptor,
+    callback: &str,
+) -> io::Result<()> {
+    let context =
+        std::env::var_os(CONTEXT).ok_or_else(|| invalid("native callback context is missing"))?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(descriptor.scope.proxy_exec.clone()).chain(std::env::split_paths(&path)),
+    )
+    .map_err(invalid)?;
+    command
+        .env(CONTEXT, context)
+        .env("AOE_NATIVE_GIT_PARENT", callback)
+        .env(REAL_EXEC, &descriptor.scope.real_exec)
+        .env(PROXY_EXEC, &descriptor.scope.proxy_exec)
+        .env("GIT_EXEC_PATH", &descriptor.scope.proxy_exec)
+        .env("PATH", path);
+    Ok(())
 }
 
 fn hook_command(
@@ -1078,24 +1492,17 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
         return Ok(0);
     }
     let checkout_ready = post_checkout && is_post_checkout(args);
-    // SAFETY: this descriptor was deliberately inherited from the supervising Git process.
-    let mut control = unsafe { UnixStream::from_raw_fd(descriptor.scope.fd) };
-    inheritable(control.as_raw_fd(), false)?;
-    send_frame(
-        &mut control,
-        &Frame::Enter {
-            cwd: std::env::current_dir()?.into_os_string().into_vec(),
-            checkout_ready,
-            git_dir: std::env::var_os("GIT_DIR").map(OsString::into_vec),
-        },
-    )?;
+    let mut control = connect_callback(descriptor)?;
+    let callback = enter_callback(&mut control, descriptor, checkout_ready)?;
     let mut command = hook_command(descriptor, &original, args, configured.is_some())?;
+    configure_callback(&mut command, descriptor, &callback)?;
     let status = match command.status() {
         Ok(status) => Some(status),
         Err(error) if error.raw_os_error() == Some(libc::ENOEXEC) => {
             let mut fallback = Command::new(&descriptor.shell);
             fallback.arg(&original).args(args);
             env_delta(&mut fallback, descriptor)?;
+            configure_callback(&mut fallback, descriptor, &callback)?;
             Some(fallback.status()?)
         }
         Err(error) => {
@@ -1114,17 +1521,40 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
     }))
 }
 
+fn global_exec_path_action(args: &[OsString], prefix: usize) -> bool {
+    let mut cursor = 0;
+    while cursor < prefix {
+        if args[cursor] == "--exec-path" {
+            return true;
+        }
+        cursor += if [
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "--config-env",
+        ]
+        .iter()
+        .any(|option| args[cursor] == *option)
+        {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
 fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
     let prefix = global_prefix(args)?;
     let name = args.get(prefix).map(OsString::as_os_str);
-    if args.iter().any(|arg| arg == "--exec-path") {
+    if global_exec_path_action(args, prefix) {
         io::stdout().write_all(descriptor.scope.proxy_exec.as_os_str().as_bytes())?;
         io::stdout().write_all(b"\n")?;
         return Ok(0);
     }
     let eligible = hooked_command(name);
-    let fd = descriptor.scope.fd;
-    inheritable(fd, false)?;
     let mut command = if eligible {
         let (descriptor, prefix, path) = descriptor_for(descriptor, args)?;
         configured_git(&descriptor, args, prefix, &path)?
@@ -1133,60 +1563,145 @@ fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("native Git routing context is missing"))?;
         routing_git(&descriptor, args, Path::new(&path))?
     };
-    inheritable(fd, true)?;
 
     Err(command.exec())
 }
 
 /// Handle native Git helpers before initializing a binary's CLI or runtime.
-/// Binaries using guarded session creation or attachment must call this at entry.
+/// Call before starting threads or the CLI/runtime.
 pub fn try_proxy_entry() -> Option<io::Result<i32>> {
-    std::env::var_os(CONTEXT)?;
+    let context = std::env::var_os(CONTEXT)?;
     let argv: Vec<OsString> = std::env::args_os().collect();
-    proxy_entry(&argv)
+    let result = proxy_entry(&argv);
+    if result.is_none() {
+        clear_normal_routing(Path::new(&context));
+    }
+    result
+}
+
+fn context_root(context: &Path) -> Option<&Path> {
+    match context.file_name()?.to_str()? {
+        "scope.json" => context.parent(),
+        "descriptor.json" => context.parent()?.parent(),
+        _ => None,
+    }
+}
+
+fn clear_normal_routing(context: &Path) {
+    let proxy = std::env::var_os(PROXY_EXEC)
+        .map(PathBuf::from)
+        .or_else(|| context_root(context).map(|root| root.join("exec")));
+    let real_exec = std::env::var_os(REAL_EXEC);
+    let path = std::env::var_os("PATH").and_then(|path| {
+        proxy.as_ref().map(|proxy| {
+            std::env::join_paths(std::env::split_paths(&path).filter(|entry| entry != proxy))
+                .expect("split PATH entries contain no separator")
+        })
+    });
+    // SAFETY: entry runs before any threads. Ordinary AoE children must start
+    // independent Git supervisors, not reenter their caller's paused lease.
+    unsafe {
+        if let Some(path) = path {
+            std::env::set_var("PATH", path);
+        }
+        if let Some(real_exec) = real_exec {
+            std::env::set_var("GIT_EXEC_PATH", real_exec);
+        } else if proxy.as_ref().is_some_and(|proxy| {
+            std::env::var_os("GIT_EXEC_PATH").as_deref() == Some(proxy.as_os_str())
+        }) {
+            std::env::remove_var("GIT_EXEC_PATH");
+        }
+        for (key, _) in std::env::vars_os() {
+            if key.as_bytes().starts_with(PRIVATE_PREFIX.as_bytes()) {
+                std::env::remove_var(key);
+            }
+        }
+    }
 }
 
 fn proxy_entry(argv: &[OsString]) -> Option<io::Result<i32>> {
+    let argument = argv.first()?;
+    let program = Path::new(argument).file_name()?;
+    let invoked = if Path::new(argument).components().count() == 1 {
+        which::which(argument).ok()?
+    } else if Path::new(argument).is_absolute() {
+        PathBuf::from(argument)
+    } else {
+        std::env::current_dir().ok()?.join(argument)
+    };
+    let context = PathBuf::from(std::env::var_os(CONTEXT)?);
+    let root = context_root(&context)?;
+    // Route only our physical helper paths. Ordinary renamed/symlinked AoE
+    // invocations must never read an inherited, possibly stale descriptor.
+    let proxy = invoked.parent() == Some(root.join("exec").as_path())
+        && (program == "git" || program.as_bytes().starts_with(b"aoe-native-"));
+    let hook = context.file_name() == Some(OsStr::new("descriptor.json"))
+        && invoked.parent()
+            == context
+                .parent()
+                .map(|parent| parent.join("hooks"))
+                .as_deref();
+    if !invoked.is_absolute() || (!proxy && !hook) {
+        return None;
+    }
     let descriptor = match load_descriptor() {
         Ok(descriptor) => descriptor,
         Err(error) => return Some(Err(error)),
     };
-    let program = Path::new(argv.first()?).file_name()?;
     let hook = program
         .as_bytes()
         .starts_with(descriptor.scope.program_prefix.as_bytes())
-        || Path::new(&argv[0]).parent() == Some(descriptor.hooks.as_path());
+        || invoked.parent() == Some(descriptor.hooks.as_path());
     if program != "git" && !hook {
         return None;
     }
-    let owner_group = descriptor.scope.owner_group;
+    let owned_group = (|| -> io::Result<Option<u32>> {
+        let metadata = fs::symlink_metadata(&descriptor.scope.root)?;
+        if !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o777 != 0o700
+        {
+            return Ok(None);
+        }
+        let marker: RuntimeMarker =
+            serde_json::from_slice(&fs::read(descriptor.scope.root.join("owner"))?)
+                .map_err(|_| invalid("invalid native runtime owner"))?;
+        let group = unsafe { libc::getpgrp() };
+        Ok((marker.kind == RUNTIME_MARKER
+            && group > 1
+            && runtime_group(&descriptor.scope.root)? == group)
+            .then_some(group as u32))
+    })()
+    .ok()
+    .flatten();
     let result = if program == "git" {
         proxy_git(descriptor, &argv[1..])
     } else {
         run_hook(&descriptor, argv)
     };
+    if let Err(error) = &result {
+        tracing::warn!(target: "git.native_hooks", phase = "helper", kind = ?error.kind(), "native Git helper failed");
+    }
     if result.is_err() {
-        // A gateway error cannot fall through Git's ordinary hook-warning path.
-        let group = unsafe { libc::getpgrp() };
-        if group != owner_group && group > 1 {
-            crate::process::worker::kill_process_group(group as u32);
+        if let Some(group) = owned_group {
+            crate::process::worker::kill_process_group(group);
         }
     }
     Some(result)
 }
 
 #[cfg(not(test))]
-fn helper_program(_: &Path, _: RawFd) -> io::Result<PathBuf> {
+fn helper_program(_: &Path) -> io::Result<PathBuf> {
     crate::process::running_image()
 }
 
 #[cfg(test)]
-fn helper_program(root: &Path, control_fd: RawFd) -> io::Result<PathBuf> {
+fn helper_program(root: &Path) -> io::Result<PathBuf> {
     use crate::session::environment::shell_escape;
     let path = root.join("helper");
     if !path.exists() {
         let exe = crate::process::running_image()?;
-        let stdout_fd = if control_fd == 9 { 8 } else { 9 };
+        let stdout_fd = 9;
         let script = format!("#!/bin/sh\nargs=$(mktemp {}/argv.XXXXXX) || exit 1\nprintf '%s\\0' \"$0\" \"$@\" >\"$args\"\nexec {stdout_fd}>&1\nexport AOE_NATIVE_GIT_TEST_ARGS=\"$args\" AOE_NATIVE_GIT_TEST_STDOUT={stdout_fd}\nexec {} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture >/dev/null\n", shell_escape(&root.to_string_lossy()), shell_escape(&exe.to_string_lossy()));
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
@@ -1222,6 +1737,41 @@ mod tests {
                 .split(|byte| *byte == 0)
                 .map(|arg| OsString::from_vec(arg.to_vec()))
                 .collect();
+            if std::env::var_os("AOE_TEST_NATIVE_CLOSE_FDS").is_some() {
+                let mut command =
+                    Command::new(std::env::var_os("AOE_TEST_NATIVE_REAL_GIT").unwrap());
+                command
+                    .args(&argv[1..])
+                    .env_remove("AOE_TEST_NATIVE_CLOSE_FDS")
+                    .env_remove("AOE_TEST_CLOSE_FDS_ONCE");
+                let descriptors: Vec<i32> = fs::read_dir("/dev/fd")
+                    .unwrap()
+                    .filter_map(|entry| {
+                        entry
+                            .ok()?
+                            .file_name()
+                            .to_str()?
+                            .parse()
+                            .ok()
+                            .filter(|fd| *fd > 2)
+                    })
+                    .collect();
+                for fd in descriptors {
+                    // SAFETY: this isolated helper is about to exec real Git.
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+                fs::write(
+                    std::env::var_os("AOE_TEST_NATIVE_FDS_CLOSED").unwrap(),
+                    "closed",
+                )
+                .unwrap();
+                panic!(
+                    "real Git exec failed after closing descriptors: {}",
+                    command.exec()
+                );
+            }
             let result = proxy_entry(&argv).expect("native helper invocation");
             std::process::exit(result.unwrap());
         }
@@ -1285,7 +1835,14 @@ mod tests {
             return;
         }
         if std::env::var_os("AOE_TEST_NATIVE_RUNNER").is_none() {
-            for phase in ["callbacks", "dynamic", "remote", "workspace", "replaced"] {
+            for phase in [
+                "callbacks",
+                "protocol",
+                "dynamic",
+                "remote",
+                "workspace",
+                "replaced",
+            ] {
                 eprintln!("native callbacks: starting {phase}");
                 let started = std::time::Instant::now();
                 let private_image = tempfile::tempdir().unwrap();
@@ -1374,6 +1931,106 @@ mod tests {
         let git = crate::git::GitWorktree::new(repo.clone())
             .unwrap()
             .with_init_submodules(false);
+        if phase == "protocol" {
+            use crate::session::environment::shell_escape;
+            let other = fixture.path().join("other");
+            assert!(Command::new("git")
+                .arg("clone")
+                .arg(&repo)
+                .arg(&other)
+                .status()
+                .unwrap()
+                .success());
+            let owner = crate::session::Storage::new_unwatched("protocol-owner").unwrap();
+            let real_git = which::which("git").unwrap();
+            let bin = fixture.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let wrapper = bin.join("git");
+            fs::write(&wrapper, "#!/bin/sh\nif [ \"$AOE_TEST_CLOSE_FDS_ONCE\" = 1 ] && [ -n \"$AOE_NATIVE_GIT_CONTEXT\" ]; then\n case \" $* \" in *\" worktree add \"*) export AOE_TEST_NATIVE_CLOSE_FDS=1; exec \"$GIT_EXEC_PATH/git\" \"$@\";; esac\nfi\nexec \"$AOE_TEST_NATIVE_REAL_GIT\" \"$@\"\n").unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+            for mode in ["long", "nested", "parallel", "argv", "closed-fds"] {
+                let marker = fixture.path().join(format!("{mode}-completed"));
+                let source_entered = fixture.path().join("entered-source");
+                let other_entered = fixture.path().join("entered-other");
+                let body = match mode {
+                    "long" => format!("printf entered > {}\nsleep 0.1 || exit 91\n", shell_escape(&fixture.path().join("long-entered").to_string_lossy())),
+                    "nested" => format!("if [ \"$AOE_TEST_CALLBACK_DEPTH\" != 1 ]; then\n export AOE_TEST_CALLBACK_DEPTH=1\n unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n git -C {} checkout -- tracked || exit 92\nfi\n", shell_escape(&repo.to_string_lossy())),
+                    "parallel" => format!(
+                        "if [ \"$AOE_TEST_CALLBACK_DEPTH\" = 1 ]; then\n : > {root}/entered-$(basename \"$PWD\")\n n=0\n while [ ! -e {source_entered} ] || [ ! -e {other_entered} ]; do\n n=$((n + 1)); [ \"$n\" -lt 200 ] || exit 93\n sleep 0.005\n done\nelse\n export AOE_TEST_CALLBACK_DEPTH=1\n unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n git -C {source} checkout -- tracked & a=$!\n git -C {other} checkout -- tracked & b=$!\n wait \"$a\" || exit 94\n wait \"$b\" || exit 95\nfi\n",
+                        root = shell_escape(&fixture.path().to_string_lossy()),
+                        source_entered = shell_escape(&source_entered.to_string_lossy()),
+                        other_entered = shell_escape(&other_entered.to_string_lossy()),
+                        source = shell_escape(&repo.to_string_lossy()),
+                        other = shell_escape(&other.to_string_lossy()),
+                    ),
+                    "argv" => "test -z \"$(git log --format=%s --grep --exec-path)\" || exit 96\ntest \"$(git --exec-path)\" = \"$GIT_EXEC_PATH\" || exit 97\n".to_string(),
+                    "closed-fds" => format!("test -e {} || exit 98\n", shell_escape(&fixture.path().join("fds-closed").to_string_lossy())),
+                    _ => unreachable!(),
+                };
+                let script = format!(
+                    "#!/bin/sh\n{body}printf complete > {}\n",
+                    shell_escape(&marker.to_string_lossy())
+                );
+                for source in [&repo, &other] {
+                    let hook = source.join(".git/hooks/post-checkout");
+                    fs::write(&hook, &script).unwrap();
+                    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+                let target = fixture.path().join(format!("checkout-{mode}"));
+                let branch = format!("topic-{mode}");
+                let routing = if mode == "closed-fds" {
+                    let path = std::env::var_os("PATH").unwrap_or_default();
+                    let path = std::env::join_paths(
+                        std::iter::once(bin.clone()).chain(std::env::split_paths(&path)),
+                    )
+                    .unwrap();
+                    Some(crate::session::test_support::EnvGuard::set(&[
+                        ("PATH", path),
+                        ("AOE_TEST_CLOSE_FDS_ONCE", OsString::from("1")),
+                        ("AOE_TEST_NATIVE_REAL_GIT", real_git.as_os_str().to_owned()),
+                        (
+                            "AOE_TEST_NATIVE_FDS_CLOSED",
+                            fixture.path().join("fds-closed").into_os_string(),
+                        ),
+                    ]))
+                } else {
+                    None
+                };
+                let previous = MUTATION_TIMEOUT
+                    .replace((mode == "long").then_some(std::time::Duration::from_millis(40)));
+                let mut ownership =
+                    Some(crate::session::storage::acquire_ownership_read().unwrap());
+                let result = crate::session::native_hooks::create_worktree(
+                    &mut ownership,
+                    Some(&owner),
+                    &git,
+                    (&repo, &target, &branch),
+                    true,
+                    Some("main"),
+                    None,
+                );
+                MUTATION_TIMEOUT.set(previous);
+                drop(routing);
+                let (_, witness) = result.unwrap_or_else(|error| panic!("{mode}: {error:#}"));
+                witness.verify().unwrap();
+                assert_eq!(fs::read(&marker).unwrap(), b"complete", "{mode}");
+                assert!(target.join("tracked").exists(), "{mode}");
+                assert_eq!(
+                    crate::git::GitWorktree::get_current_branch(&target).unwrap(),
+                    branch
+                );
+                if mode == "long" {
+                    assert_eq!(
+                        fs::read(fixture.path().join("long-entered")).unwrap(),
+                        b"entered"
+                    );
+                }
+                if mode == "parallel" {
+                    assert!(source_entered.exists() && other_entered.exists());
+                }
+            }
+            return;
+        }
         if phase == "callbacks" {
             let mut previous_hook = None;
             for (hook_name, action) in [
@@ -1833,5 +2490,99 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn runtime_cleanup_reclaims_only_dead_owned_invocations() {
+        if let Some(app) = std::env::var_os("AOE_TEST_RUNTIME_OWNER") {
+            let app = PathBuf::from(app);
+            let (runtime, _, _, _listener) = initialize(&app, &app).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(
+                &runtime.group,
+                &(std::process::id() as i32).to_ne_bytes(),
+                0,
+            )
+            .unwrap();
+            let ready = app.join(format!("ready-{}", std::process::id()));
+            let pending = ready.with_extension("pending");
+            fs::write(
+                &pending,
+                format!(
+                    "{}\n{}",
+                    runtime._root.path().display(),
+                    runtime._socket_root.path().display()
+                ),
+            )
+            .unwrap();
+            fs::rename(pending, ready).unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        struct Owner(std::process::Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn start(app: &Path) -> (Owner, PathBuf, PathBuf) {
+            let child = Command::new(crate::process::running_image().unwrap())
+                .args(["--exact", "git::native_hooks::tests::runtime_cleanup_reclaims_only_dead_owned_invocations", "--nocapture"])
+                .env("AOE_TEST_RUNTIME_OWNER", app).process_group(0)
+                .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut owner = Owner(child);
+            let ready = app.join(format!("ready-{}", owner.0.id()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ready.exists() {
+                assert!(
+                    owner.0.try_wait().unwrap().is_none(),
+                    "runtime owner exited before publishing its marker"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "runtime owner did not initialize"
+                );
+                std::thread::yield_now();
+            }
+            let routes = fs::read_to_string(ready).unwrap();
+            let (root, socket) = routes.split_once('\n').unwrap();
+            (owner, root.into(), socket.into())
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let app = fixture.path().join("a".repeat(120));
+        fs::create_dir(&app).unwrap();
+        let (mut stale, stale_root, stale_socket) = start(&app);
+        let (active, active_root, active_socket) = start(&app);
+        let foreign = app.join("native-git-foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(foreign.join("sentinel"), "keep").unwrap();
+        stale.0.kill().unwrap();
+        stale.0.wait().unwrap();
+        let (_next, _, _, _) = initialize(&app, &app).unwrap();
+        assert!(!stale_root.exists() && !stale_socket.exists());
+        assert!(active_root.exists() && active_socket.exists());
+        assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"keep");
+        drop(active);
+        sweep_runtime(&app).unwrap();
+        assert!(!active_root.exists() && !active_socket.exists());
+    }
+
+    #[test]
+    fn callback_refuses_a_replaced_foreign_socket_without_connecting() {
+        let app = tempfile::tempdir().unwrap();
+        let (_runtime, descriptor, _, listener) = initialize(app.path(), app.path()).unwrap();
+        let foreign_path = descriptor.scope.socket.with_extension("foreign");
+        let foreign = UnixListener::bind(&foreign_path).unwrap();
+        fs::remove_file(&descriptor.scope.socket).unwrap();
+        fs::rename(foreign_path, &descriptor.scope.socket).unwrap();
+        drop(listener);
+        foreign.set_nonblocking(true).unwrap();
+        assert!(connect_callback(&descriptor).is_err());
+        assert_eq!(
+            foreign.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 }

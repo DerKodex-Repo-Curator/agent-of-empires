@@ -243,7 +243,7 @@ pub struct TrashResult {
     pub relocation: Option<TrashRelocation>,
     pub relocate_warning: Option<String>,
 }
-/// Stop under shared ownership, then revalidate before exclusive relocation/publication.
+/// Reserve, stop without metadata flocks, then revalidate before relocation.
 pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     match trash_transition(request, Instance::kill_all_tmux_sessions_locked) {
         Ok(outcome) => TrashResult {
@@ -309,6 +309,9 @@ pub(crate) fn trash_transition(
     } else {
         None
     };
+    drop(lifecycle);
+    drop(identity);
+    drop(ownership);
     teardown(&inst);
     if let Err(error) =
         crate::session::worktree_edit::stop_sandbox_container(&inst.id, is_sandboxed(&inst))
@@ -316,9 +319,6 @@ pub(crate) fn trash_transition(
         tracing::warn!(target: "session.trash", session = %inst.id, "stopping sandbox container before trash relocation failed: {error}");
     }
     let container_held = ensure_sandbox_container_released(&inst.id, is_sandboxed(&inst));
-    drop(lifecycle);
-    drop(identity);
-    drop(ownership);
     #[cfg(test)]
     if let Some(hook) = BEFORE_TRASH_EXCLUSIVE.with(|slot| slot.borrow_mut().take()) {
         hook();
@@ -1603,7 +1603,7 @@ mod tests {
 
     #[test]
     fn trash_revalidates_recreated_owner_and_adoption_after_shared_phase() {
-        for change in ["identity", "adoption", "checkout", "profile"] {
+        for change in ["identity", "generation", "adoption", "checkout", "profile"] {
             let _app_guard = crate::session::test_support::isolate_app_dir();
             let storage = crate::session::Storage::new_unwatched("default").unwrap();
             let peer = crate::session::Storage::new_unwatched("peer").unwrap();
@@ -1621,6 +1621,24 @@ mod tests {
                             .update(|rows, _| {
                                 let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                                 row.created_at += chrono::Duration::seconds(1);
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    "generation" => {
+                        owner
+                            .update(|rows, _| {
+                                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                                let generation = row.lifecycle_generation;
+                                row.release_lifecycle_reservation_if_owned(
+                                    crate::session::LifecycleOperation::Trash,
+                                    generation,
+                                );
+                                row.try_acquire_lifecycle_reservation(
+                                    crate::session::LifecycleOperation::Restore,
+                                    Instance::LIFECYCLE_RESERVATION_TTL,
+                                    Utc::now(),
+                                )?;
                                 Ok(())
                             })
                             .unwrap();
@@ -1660,9 +1678,59 @@ mod tests {
             assert!(!trash_holding_path(&original, &request.session_id)
                 .unwrap()
                 .exists());
+            if change == "generation" {
+                assert!(storage.load().unwrap()[0].lifecycle_reservation_is_owned(
+                    crate::session::LifecycleOperation::Restore,
+                    request.generation + 1,
+                ));
+            }
         }
     }
 
+    #[test]
+    fn trash_teardown_releases_identity_and_lifecycle_for_an_unrelated_identity_writer() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let peer = crate::session::Storage::new_unwatched("peer").unwrap();
+        let (_tmp, instance) = real_worktree_instance();
+        let request = reserved_request(&storage, instance);
+        let (done, completed) = std::sync::mpsc::channel();
+        let id = request.session_id.clone();
+        let source = storage.clone();
+        let mut writer = None;
+        let mut progressed = false;
+        let outcome = trash_transition(&request, |_| {
+            writer = Some(std::thread::spawn(move || {
+                let root = crate::session::storage::acquire_ownership_read().unwrap();
+                let _identity = acquire_session_identity_lock_with_ownership(&root).unwrap();
+                let _lifecycle = source
+                    .acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+                    .unwrap();
+                assert!(source
+                    .load()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .has_fresh_lifecycle_reservation(Utc::now()));
+                peer.update_with_ownership(&root, |rows, _| {
+                    rows.push(Instance::new("unrelated identity", "/unrelated"));
+                    Ok(())
+                })
+                .unwrap();
+                done.send(()).unwrap();
+            }));
+            progressed = completed
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok();
+        });
+        writer.unwrap().join().unwrap();
+        assert!(
+            progressed,
+            "identity/lifecycle writer remained blocked throughout teardown"
+        );
+        assert!(matches!(outcome, Ok(RelocateOutcome::Relocated { .. })));
+    }
     fn reserved_request(storage: &crate::session::Storage, mut instance: Instance) -> TrashRequest {
         instance.source_profile = storage.profile().to_string();
         instance.trash();

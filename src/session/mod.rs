@@ -27,6 +27,7 @@ pub(crate) mod native_hooks;
 pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
+pub(crate) mod rename;
 pub mod restart;
 pub mod sandbox_store_reclaim;
 pub mod scope;

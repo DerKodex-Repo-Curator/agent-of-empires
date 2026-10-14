@@ -170,7 +170,6 @@ impl<Req: Send + 'static, Res: SessionScoped + Send + 'static> TrackedWorker<Req
         self.pending.drain().collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn is_pending(&self, id: &str) -> bool {
         self.pending.contains(id)
     }

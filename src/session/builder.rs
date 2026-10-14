@@ -3119,7 +3119,7 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
-    fn ownership_review_cleanup_retires_unpublished_tmux_with_unknown_claims() {
+    fn cleanup_retires_unpublished_tmux_with_unknown_claims() {
         if which::which("tmux").is_err() {
             eprintln!("tmux unavailable; runtime cleanup scenario skipped");
             return;

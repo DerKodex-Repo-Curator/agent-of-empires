@@ -6,8 +6,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::session::{
-    duplicate_session_error, is_duplicate_session, GroupTree, Instance, LifecycleOperation,
-    ResumeIntent, StartOutcome, Storage,
+    GroupTree, Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -1691,286 +1690,79 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         }
     };
 
-    let id = inst.id.clone();
     let title_requested = args.title.is_some();
-    let session_lock_required = title_requested || args.rename_branch || args.branch.is_some();
-
-    let ownership = crate::session::storage::acquire_ownership_lock()?;
-    let _identity_lock =
-        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-    let _session_title_lock = if session_lock_required {
-        Some(
-            crate::session::storage::acquire_session_title_lock_with_ownership(&ownership, &id)
-                .context("failed to acquire session title lock")?,
-        )
-    } else {
-        None
-    };
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)
-        .context("failed to acquire session lifecycle lock")?;
-    let native_locks = [
-        &_identity_lock,
-        _session_title_lock.as_ref().unwrap_or(&_lifecycle_lock),
-        &_lifecycle_lock,
-    ];
-    let native_locks = &native_locks[..if _session_title_lock.is_some() { 3 } else { 2 }];
-    let (authoritative_instances, _groups) = storage.load_with_groups()?;
-    let inst = authoritative_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_with_ownership(
-        &storage,
-        &ownership,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
-    }
-    let old_title = inst.title.clone();
-    let effective_title = args
-        .title
-        .clone()
-        .unwrap_or_else(|| old_title.clone())
-        .trim()
-        .to_string();
-    let new_group = args.group.as_ref().map(|g| g.trim().to_string());
-    let title_changed = old_title != effective_title;
-
-    let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
-    let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
-    let tied_edit = args.branch.is_none() && tied && (args.title.is_some() || args.rename_branch);
-    let duplicate_path = if tied_edit {
-        crate::session::worktree_edit::derived_worktree_path(
-            std::path::Path::new(&inst.project_path),
-            &effective_title,
-        )
-    } else {
-        inst.project_path.clone()
-    };
-    let pair_changed = title_changed
-        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
-    if pair_changed
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &effective_title,
-            &duplicate_path,
-            Some(&id),
-        )
-    {
-        return Err(duplicate_session_error(&effective_title));
-    }
-
-    let mut new_path: Option<String> = None;
-    let mut new_branch: Option<String> = None;
-    if let Some(branch) = &args.branch {
-        let info = inst
-            .worktree_info
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Branch-only rename requires a managed worktree"))?;
-        if branch != &info.branch {
-            crate::session::worktree_edit::ensure_worktree_unshared(
-                &ownership,
-                profile,
-                &id,
-                std::path::Path::new(&inst.project_path),
-                info,
-                None,
-                true,
-            )?;
-        }
-        if crate::session::worktree_edit::rename_worktree_branch_with_ownership(
-            &ownership,
-            native_locks,
-            profile,
-            &id,
-            info,
-            std::path::Path::new(&inst.project_path),
-            branch,
-        )? {
-            new_branch = Some(branch.clone());
-        }
-    } else if tied_edit {
-        let current_path = inst.project_path.clone();
-        let worktree_info = inst
-            .worktree_info
-            .clone()
-            .expect("tie_workdir_applies implies worktree_info is Some");
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-            std::path::Path::new(&current_path),
-            &leaf,
-        );
-        let renames_branch = crate::session::worktree_edit::worktree_branch_rename_required(
-            &worktree_info,
-            &leaf,
-            args.rename_branch,
-        );
-        let is_sandboxed = inst.is_sandboxed();
-        if moves_worktree || renames_branch {
-            let mut live = inst.clone();
-            live.source_profile = profile.to_string();
-            crate::tmux::refresh_session_cache();
-            live.update_status_with_metadata(None, None);
-            let container_holds = !live.status.blocks_worktree_edit()
-                && moves_worktree
-                && crate::session::worktree_edit::ensure_sandbox_container_released(
-                    &id,
-                    is_sandboxed,
-                );
-            if live.status.blocks_worktree_edit() || container_holds {
-                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
-            }
-        }
-        match crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
-            &ownership,
-            native_locks,
-            profile,
-            &id,
-            crate::session::worktree_edit::WorktreeEditRequest {
-                worktree_info: &worktree_info,
-                current_path: std::path::Path::new(&current_path),
-                new_name: &leaf,
-                rename_branch: args.rename_branch,
+    let branch_only = args.branch.is_some();
+    let mut baseline = inst;
+    baseline.source_profile = profile.to_string();
+    let refresh_tied_status = args.branch.is_none() && (args.title.is_some() || args.rename_branch);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::rename::perform(
+            crate::session::rename::Request {
+                baseline,
+                edit: crate::session::rename::Edit::Session {
+                    title: args.title.map(|title| title.trim().to_string()),
+                    group: args.group.map(|group| group.trim().to_string()),
+                    profile: None,
+                    rename_branch: args.rename_branch,
+                    branch: args.branch,
+                },
+                file_watch: crate::file_watch::FileWatchService::noop(),
             },
-        ) {
-            Ok(outcome) => {
-                if outcome.new_path != std::path::Path::new(&current_path) {
-                    crate::session::worktree_edit::discard_sandbox_container_after_move(
-                        &id,
-                        is_sandboxed,
-                    );
-                }
-                new_path = Some(outcome.new_path.to_string_lossy().to_string());
-                new_branch = outcome.new_branch;
-            }
-            Err(crate::session::worktree_edit::WorktreeEditError::Unchanged) => {}
-            Err(e) => return Err(e.into()),
-        }
-    } else if args.rename_branch {
-        bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
-    }
-
-    let persist = storage.update_with_ownership(&ownership, |instances, groups| {
-        if title_requested || new_path.is_some() {
-            let current = instances
-                .iter()
-                .find(|row| row.id == id)
-                .context("Session disappeared before rename publication")?;
-            let title = if title_requested {
-                &effective_title
-            } else {
-                &current.title
-            };
-            let path = new_path.as_deref().unwrap_or(&current.project_path);
-            if is_duplicate_session(instances.iter(), title, path, Some(&id)) {
-                return Err(duplicate_session_error(title));
-            }
-        }
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-        let persisted_old_title = inst.title.clone();
-        if title_requested {
-            inst.title = effective_title.clone();
-        }
-        if let Some(path) = &new_path {
-            inst.project_path = path.clone();
-        }
-        if let Some(branch) = &new_branch {
-            if let Some(wt) = inst.worktree_info.as_mut() {
-                wt.branch = branch.clone();
-            }
-        }
-        if let Some(group) = &new_group {
-            inst.group_path = group.clone();
-        }
-        let committed_title = inst.title.clone();
-        let group_path = inst.group_path.clone();
-        if !group_path.is_empty() {
-            let mut group_tree = GroupTree::new_with_groups(instances, groups);
-            group_tree.create_group(&group_path);
-            *groups = group_tree.get_all_groups();
-        }
-        Ok((persisted_old_title, committed_title))
-    });
-    let (persisted_old_title, committed_title) = match persist {
-        Ok(titles) => titles,
-        Err(error) => {
-            if args.branch.is_some() {
-                if let Some(branch) = &new_branch {
-                    let info = inst
-                        .worktree_info
-                        .as_ref()
-                        .expect("branch rename checked worktree metadata");
-                    let stored = storage.load().map_err(|_| anyhow::anyhow!("Session metadata write failed ({error}) and its state cannot be read. Branch is {branch}; directory unchanged. Inspect before retrying."))?;
-                    let persisted_branch = stored
-                        .iter()
-                        .find(|row| row.id == id)
-                        .and_then(|row| row.worktree_info.as_ref())
-                        .map(|wt| wt.branch.as_str());
-                    if persisted_branch == Some(info.branch.as_str()) {
-                        if let Err(rollback) =
-                            crate::session::worktree_edit::rollback_worktree_branch_with_ownership(
-                                &ownership,
-                                native_locks,
-                                profile,
-                                &id,
-                                info,
-                                std::path::Path::new(&inst.project_path),
-                                branch,
-                            )
-                        {
-                            bail!("Session metadata failed: {error}; branch rollback also failed: {rollback}. The directory is unchanged; inspect Git and session metadata before continuing.");
-                        }
-                    } else if persisted_branch != Some(branch.as_str()) {
-                        bail!("Session metadata failed: {error}; its branch changed concurrently. Directory unchanged; inspect before continuing.");
+            |original, _| {
+                if refresh_tied_status
+                    && original.tie_workdir_applies(
+                        crate::session::config::profile_config::resolve_config_or_warn(
+                            &original.source_profile,
+                        )
+                        .session
+                        .tie_workdir_to_name,
+                    )
+                {
+                    let mut live = original.clone();
+                    crate::tmux::refresh_session_cache();
+                    live.update_status_with_metadata(None, None);
+                    if live.status.blocks_worktree_edit() {
+                        return Err(crate::session::rename::RenameRejected::Active.into());
                     }
                 }
-            }
-            if let Some(path) = &new_path {
-                bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {error}. Re-run to retry.");
-            }
-            return Err(error);
-        }
-    };
-    drop(_identity_lock);
-
-    let committed_title_changed = title_requested && persisted_old_title != committed_title;
-    if committed_title_changed {
-        let rekey_id = id.clone();
-        let rekey_old_title = persisted_old_title.clone();
-        let rekey_new_title = committed_title.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
-        })
-        .await
-        {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
-            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
-        }
+                Ok(())
+            },
+        )
+    })
+    .await??;
+    if let Some(warning) = result.warning {
+        eprintln!("Warning: {warning}");
     }
-
-    if args.branch.is_some() {
-        if let Some(branch) = &new_branch {
-            println!("✓ Branch renamed to: {branch} (worktree directory unchanged)");
-        }
+    let new_branch = result
+        .instance
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch);
+    let old_branch = result
+        .original
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch);
+    if branch_only && new_branch != old_branch {
+        println!(
+            "✓ Branch renamed to: {} (worktree directory unchanged)",
+            new_branch.unwrap()
+        );
     }
-    if let Some(path) = &new_path {
-        println!("✓ Worktree moved to: {}", path);
-        if let Some(branch) = &new_branch {
-            println!("  Branch renamed to: {}", branch);
+    if result.instance.project_path != result.original.project_path {
+        println!("✓ Worktree moved to: {}", result.instance.project_path);
+        if new_branch != old_branch {
+            println!("  Branch renamed to: {}", new_branch.unwrap());
         }
     }
     println!(
         "{}",
-        rename_success_message(&persisted_old_title, &committed_title, title_requested,)
+        rename_success_message(
+            &result.original.title,
+            &result.instance.title,
+            title_requested
+        )
     );
-
     Ok(())
 }
 
@@ -2494,118 +2286,49 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         }
     };
 
-    let id = inst.id.clone();
-    let ownership = crate::session::storage::acquire_ownership_lock()?;
-    let _identity_lock =
-        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock_with_ownership(&ownership, &id)
-        .context("failed to acquire worktree rename lifecycle lock")?;
-    let authoritative_instances = storage.load()?;
-    let inst = authoritative_instances
-        .iter()
-        .find(|instance| instance.id == id)
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-    let mut inst = inst.clone();
-    if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist_with_ownership(
-        &storage,
-        &ownership,
-        &mut inst,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
-    }
-    let current_path = inst.project_path.clone();
-    let Some(worktree_info) = inst.worktree_info.clone() else {
-        bail!("Session does not use a worktree");
-    };
-    if inst.tie_workdir_applies(
-        crate::session::config::profile_config::resolve_config_or_warn(profile)
-            .session
-            .tie_workdir_to_name,
-    ) {
-        bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
-    }
-    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
-        std::path::Path::new(&current_path),
-        args.name.trim(),
-    )
-    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
-    .to_string_lossy()
-    .into_owned();
-    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
-        && is_duplicate_session(
-            authoritative_instances.iter(),
-            &inst.title,
-            &duplicate_path,
-            Some(&id),
+    let mut baseline = inst.clone();
+    baseline.source_profile = profile.to_string();
+    let committed = tokio::task::spawn_blocking(move || {
+        crate::session::rename::perform(
+            crate::session::rename::Request {
+                baseline,
+                edit: crate::session::rename::Edit::Workdir {
+                    name: args.name.trim().to_string(),
+                    rename_branch: args.rename_branch,
+                },
+                file_watch: crate::file_watch::FileWatchService::noop(),
+            },
+            |original, _| {
+                let mut live = original.clone();
+                crate::tmux::refresh_session_cache();
+                live.update_status_with_metadata(None, None);
+                if live.status.blocks_worktree_edit() {
+                    return Err(crate::session::rename::RenameRejected::Active.into());
+                }
+                Ok(())
+            },
         )
+    })
+    .await??;
+    println!("✓ Worktree moved to: {}", committed.instance.project_path);
+    if committed
+        .original
+        .worktree_info
+        .as_ref()
+        .map(|info| &info.branch)
+        != committed
+            .instance
+            .worktree_info
+            .as_ref()
+            .map(|info| &info.branch)
     {
-        return Err(duplicate_session_error(&inst.title));
-    }
-    let mut live = inst.clone();
-    live.source_profile = profile.to_string();
-    crate::tmux::refresh_session_cache();
-    live.update_status_with_metadata(None, None);
-    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
-        std::path::Path::new(&current_path),
-        args.name.trim(),
-    );
-    if live.status.blocks_worktree_edit()
-        || (moves_worktree
-            && crate::session::worktree_edit::ensure_sandbox_container_released(
-                &id,
-                live.is_sandboxed(),
-            ))
-    {
-        bail!("Cannot edit the workdir name while the session is active; stop it first");
-    }
-
-    let outcome = crate::session::worktree_edit::edit_worktree_workdir_with_ownership(
-        &ownership,
-        &[&_identity_lock, &_lifecycle_lock],
-        profile,
-        &id,
-        crate::session::worktree_edit::WorktreeEditRequest {
-            worktree_info: &worktree_info,
-            current_path: std::path::Path::new(&current_path),
-            new_name: args.name.trim(),
-            rename_branch: args.rename_branch,
-        },
-    )?;
-    if outcome.new_path != std::path::Path::new(&current_path) {
-        crate::session::worktree_edit::discard_sandbox_container_after_move(
-            &id,
-            live.is_sandboxed(),
+        println!(
+            "  Branch renamed to: {}",
+            committed.instance.worktree_info.as_ref().unwrap().branch
         );
     }
-    let new_path = outcome.new_path.to_string_lossy().to_string();
-    let new_branch = outcome.new_branch.clone();
-
-    storage
-        .update_with_ownership(&ownership, |instances, _groups| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-            inst.project_path = new_path.clone();
-            if let Some(branch) = &new_branch {
-                if let Some(wt) = inst.worktree_info.as_mut() {
-                    wt.branch = branch.clone();
-                }
-            }
-            Ok(())
-        })
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
-            )
-        })?;
-    drop(_identity_lock);
-
-    println!("✓ Worktree moved to: {}", new_path);
-    if let Some(branch) = &new_branch {
-        println!("  Branch renamed to: {}", branch);
+    if let Some(warning) = committed.warning {
+        eprintln!("Warning: {warning}");
     }
     Ok(())
 }

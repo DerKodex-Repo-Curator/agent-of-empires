@@ -527,15 +527,10 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         })
         .unwrap();
 
-    let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
-    let requested = view.get_instance(&id).cloned().unwrap();
-    let error = view
-        .move_to_profile(&id, "target", requested, None, false)
-        .expect_err("reserved session must not move profiles");
-
-    assert!(error
-        .to_string()
-        .contains("lifecycle operation is in progress"));
+    assert!(
+        view.lock_session_mutation_and_reload(&id).is_err(),
+        "a fresh reservation must reject profile-move admission"
+    );
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
     assert!(view
         .pending_deletions
@@ -936,8 +931,10 @@ fn rename_profile_move_validates_complete_candidate_before_commit() {
     view.storages.insert("target".to_string(), target);
     view.selected_session = Some(id.clone());
 
-    let result = view.rename_selected("new-name", Some("renamed/group"), Some("target"), false);
-    assert!(result.is_err());
+    view.rename_selected("new-name", Some("renamed/group"), Some("target"), false)
+        .unwrap();
+    view.finish_rename_for_test();
+    assert!(view.info_dialog.is_some());
 
     let (source_rows, source_groups) = Storage::new_unwatched("test")
         .unwrap()
@@ -1005,9 +1002,10 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     view.storages.insert("target".to_string(), target);
     view.selected_session = Some(id.clone());
 
-    let result = view.rename_selected("new-name", None, Some("target"), true);
-
-    assert!(result.is_err());
+    view.rename_selected("new-name", None, Some("target"), true)
+        .unwrap();
+    view.finish_rename_for_test();
+    assert!(view.info_dialog.is_some());
     assert!(old_path.exists());
     assert_eq!(
         std::fs::read(old_path.join("sentinel")).unwrap(),

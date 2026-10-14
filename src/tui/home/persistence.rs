@@ -301,6 +301,10 @@ impl HomeView {
             .into_iter()
             .find(|instance| instance.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
+        anyhow::ensure!(
+            !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),
+            "Session has a lifecycle operation in progress"
+        );
         let authoritative_generation = authoritative.lifecycle_generation;
         let authoritative_status = authoritative.status;
         let authoritative_idle_entered_at = authoritative.idle_entered_at;

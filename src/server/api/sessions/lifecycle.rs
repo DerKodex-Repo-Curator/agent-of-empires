@@ -3,6 +3,33 @@
 
 use super::*;
 
+async fn release_unmirrored_trash(
+    storage: Storage,
+    snapshot: Instance,
+    generation: u64,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some(sender) = BEFORE_TRASH_CLEANUP_LOCK.lock().take() {
+            let _ = sender.send(());
+        }
+        let mut cleanup = crate::session::claim::ReservationCleanup::new(
+            &storage,
+            &snapshot,
+            LifecycleOperation::Trash,
+            generation,
+        );
+        let result = cleanup.release();
+        cleanup.disarm();
+        result
+    })
+    .await?
+}
+
+#[cfg(test)]
+static BEFORE_TRASH_CLEANUP_LOCK: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    parking_lot::Mutex::new(None);
+
 #[derive(Deserialize)]
 pub struct UpdatePinBody {
     pub pinned: bool,
@@ -437,21 +464,28 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
-    let mut cleanup = crate::session::claim::ReservationCleanup::new(
-        &storage,
-        &snapshot,
-        LifecycleOperation::Trash,
-        generation,
-    );
 
     let was_structured_view = snapshot.is_structured();
-    {
+    let mirrored = {
         let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.trash();
-        instance.lifecycle_generation = generation;
+        if let Some(instance) = instances
+            .iter_mut()
+            .find(|instance| instance.id == id && instance.created_at == snapshot.created_at)
+        {
+            instance.trash();
+            instance.lifecycle_generation = generation;
+            true
+        } else {
+            false
+        }
+    };
+    if !mirrored {
+        drop(_guard);
+        drop(_submission);
+        if let Err(error) = release_unmirrored_trash(storage, snapshot, generation).await {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation cleanup failed: {error:#}");
+        }
+        return crate::server::api::session_gone_after_persist();
     }
 
     if was_structured_view {
@@ -465,8 +499,6 @@ pub async fn trash_session(
         }
     }
 
-    cleanup.disarm();
-    drop(cleanup);
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1507,4 +1539,75 @@ pub async fn update_session_unread(
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+#[cfg(test)]
+mod reservation_cleanup_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn unmirrored_trash_cleanup_keeps_tokio_responsive_and_preserves_newer_generation() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("default").unwrap();
+        for superseded in [false, true] {
+            let mut row = Instance::new("trashed", "/unmirrored");
+            row.trash();
+            let generation = row
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            if superseded {
+                storage
+                    .update(|rows, _| {
+                        rows[0].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                        rows[0].try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Launch,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            let (entered, gate) = tokio::sync::oneshot::channel();
+            *BEFORE_TRASH_CLEANUP_LOCK.lock() = Some(entered);
+            let cleanup = tokio::spawn(release_unmirrored_trash(storage.clone(), row, generation));
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate)
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("cleanup must not block the Tokio worker while waiting for root ownership");
+            assert!(!cleanup.is_finished());
+            drop(root);
+            cleanup.await.unwrap().unwrap();
+            let current = storage.load().unwrap().remove(0);
+            if superseded {
+                assert_eq!(
+                    current.lifecycle_reservation.unwrap().op,
+                    LifecycleOperation::Launch
+                );
+                assert_eq!(current.lifecycle_generation, generation + 1);
+            } else {
+                assert!(current.lifecycle_reservation.is_none());
+            }
+        }
+    }
 }

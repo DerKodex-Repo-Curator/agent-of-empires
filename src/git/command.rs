@@ -68,6 +68,7 @@ where
         super::native_hooks::run(cwd, &argv, lease)?
     } else {
         let mut command = Command::new("git");
+        // Stable English diagnostics are parsed by the worktree error classifiers.
         command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
         if throttled {
             crate::process::throttle_child(&mut command);
@@ -154,6 +155,8 @@ where
     S: AsRef<OsStr>,
 {
     let argv: Vec<std::ffi::OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+    #[cfg(test)]
+    let timeout = super::native_hooks::creation_test_timeout(&argv, timeout);
     let redacted: Vec<String> = argv.iter().map(|a| redact(a.as_os_str())).collect();
     let start = Instant::now();
     tracing::debug!(

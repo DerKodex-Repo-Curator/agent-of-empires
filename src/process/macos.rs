@@ -2,9 +2,6 @@
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 
-pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
-    std::env::current_exe()
-}
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::process::Command;
@@ -12,6 +9,9 @@ use std::process::Command;
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
+pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
+}
 pub(super) fn rename_exclusive(
     source_dir: &std::os::fd::OwnedFd,
     source: &std::ffi::OsStr,

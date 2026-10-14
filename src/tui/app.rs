@@ -1225,6 +1225,7 @@ impl App {
                 full = true;
             }
             full |= self.home.apply_attach_project_results();
+            full |= self.home.apply_rename_results();
 
             let store_move = self.home.poll_store_move();
             full |= store_move.changed;

@@ -22,17 +22,6 @@ pub(crate) fn target_worktree_path(current_path: &Path, new_name: &str) -> Optio
     Some(parent.join(new_leaf))
 }
 
-/// The tied-rename destination directory for `title`, as a string: the path
-/// [`edit_worktree_workdir`] would move `current_path` to, or `current_path` unchanged when it has
-/// no parent to rename within.
-pub(crate) fn derived_worktree_path(current_path: &Path, title: &str) -> String {
-    let leaf = worktree_leaf_from_title(title);
-    target_worktree_path(current_path, &leaf)
-        .unwrap_or_else(|| current_path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// Whether a workdir edit for `new_name` would actually move the worktree directory.
 pub fn worktree_move_required(current_path: &Path, new_name: &str) -> bool {
     if new_name.trim().is_empty() {
@@ -413,6 +402,18 @@ fn rename_worktree_branch_inner(
         &str,
     )>,
 ) -> anyhow::Result<bool> {
+    let Some(git) = prepare_worktree_branch_rename(info, path, branch)? else {
+        return Ok(false);
+    };
+    rename_branch_effect(&git, path, &info.branch, branch, None, ownership)?;
+    Ok(true)
+}
+
+pub(crate) fn prepare_worktree_branch_rename(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<Option<GitWorktree>> {
     anyhow::ensure!(
         info.managed_by_aoe,
         "Branch-only rename requires a managed worktree"
@@ -444,7 +445,7 @@ fn rename_worktree_branch_inner(
         "Worktree branch changed; refresh session metadata before renaming"
     );
     if branch == info.branch {
-        return Ok(false);
+        return Ok(None);
     }
     let protected = git.protected_default_branch_names()?;
     anyhow::ensure!(
@@ -462,8 +463,7 @@ fn rename_worktree_branch_inner(
         !git.branch_exists(branch)?,
         "Target branch already exists: {branch}"
     );
-    rename_branch_effect(&git, path, &info.branch, branch, None, ownership)?;
-    Ok(true)
+    Ok(Some(git))
 }
 
 /// Roll back a branch rename only while the worktree still uses the renamed branch.

@@ -287,7 +287,6 @@ async fn mirror_conversion(
     outcome: &AttachOutcome,
     quiesced: crate::session::attach_project::Quiesced,
 ) -> Result<(), AttachError> {
-    let mut instances = state.instances.write().await;
     let mut expected = original.clone();
     expected.workspace_info = Some(outcome.workspace_info.clone());
     if let Some(path) = &outcome.moved_to {
@@ -300,6 +299,10 @@ async fn mirror_conversion(
         quiesced.attach_generation
     };
     let current = run_blocking(storage, move |storage| {
+        #[cfg(test)]
+        if let Some(sender) = BEFORE_MIRROR_ROOT.lock().take() {
+            let _ = sender.send(());
+        }
         let root = crate::session::storage::acquire_ownership_read()
             .map_err(|error| format!("{error:#}"))?;
         let _lifecycle = storage
@@ -320,15 +323,27 @@ async fn mirror_conversion(
     })
     .await
     .map_err(AttachError::Rejected)?;
+    let mut instances = state.instances.write().await;
     let inst = instances
         .iter_mut()
         .find(|inst| inst.id == current.id && inst.created_at == current.created_at)
         .ok_or(AttachError::NotFound)?;
+    if inst.lifecycle_generation > current.lifecycle_generation
+        || inst.source_profile != original.source_profile
+    {
+        return Err(AttachError::Rejected(
+            "session changed after attach".to_owned(),
+        ));
+    }
     inst.workspace_info = current.workspace_info;
     inst.project_path = current.project_path;
     inst.worktree_info = current.worktree_info;
     Ok(())
 }
+
+#[cfg(test)]
+static BEFORE_MIRROR_ROOT: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>> =
+    parking_lot::Mutex::new(None);
 
 /// Start the session's worker again, in the workspace the conversion produced.
 async fn spawn_worker(
@@ -541,7 +556,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn ownership_review_restart_commit_releases_changed_checkout_but_not_replacement() {
+    fn restart_commit_releases_changed_checkout_but_not_replacement() {
         for change in ["checkout", "generation", "incarnation", "corrupt"] {
             let _home = crate::session::test_support::isolate_app_dir();
             let storage = Storage::new_unwatched("default").unwrap();
@@ -599,6 +614,102 @@ mod tests {
                     before,
                     "{change}"
                 );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn mirror_conversion_waits_for_root_without_holding_cache_and_rejects_newer_identity() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = Arc::new(Storage::new_unwatched("default").unwrap());
+        for replacement in ["none", "incarnation", "generation", "profile"] {
+            let mut original = crate::session::Instance::new("cache title", "/before");
+            original.source_profile = "default".into();
+            let repo = crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: "/repo".into(),
+                branch: "topic".into(),
+                worktree_path: "/after/repo".into(),
+                main_repo_path: "/repo".into(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            };
+            let workspace = crate::session::WorkspaceInfo {
+                branch: "topic".into(),
+                workspace_dir: "/after".into(),
+                repos: vec![repo.clone()],
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            };
+            let outcome = AttachOutcome {
+                repo,
+                warnings: Vec::new(),
+                moved_to: Some("/after".into()),
+                workspace_info: workspace.clone(),
+            };
+            let mut durable = original.clone();
+            durable.title = "disk title".into();
+            durable.project_path = "/after".into();
+            durable.workspace_info = Some(workspace);
+            storage
+                .update(|rows, _| {
+                    *rows = vec![durable];
+                    Ok(())
+                })
+                .unwrap();
+            let state = support::build_test_app_state(vec![original.clone()]);
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            let (entered, gate) = tokio::sync::oneshot::channel();
+            *BEFORE_MIRROR_ROOT.lock() = Some(entered);
+            let task = tokio::spawn({
+                let state = Arc::clone(&state);
+                let storage = Arc::clone(&storage);
+                async move {
+                    mirror_conversion(&state, storage, &original, &outcome, Default::default())
+                        .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), gate)
+                .await
+                .unwrap()
+                .unwrap();
+            let cache = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.instances.read(),
+            )
+            .await
+            .expect("cache readers must progress while mirror waits on filesystem ownership");
+            assert_eq!(cache[0].project_path, "/before");
+            drop(cache);
+            if replacement != "none" {
+                let mut cache = state.instances.write().await;
+                match replacement {
+                    "incarnation" => cache[0].created_at += chrono::Duration::seconds(1),
+                    "generation" => cache[0].lifecycle_generation += 1,
+                    "profile" => cache[0].source_profile = "new-profile".into(),
+                    _ => unreachable!(),
+                }
+                cache[0].title = "replacement".into();
+            }
+            drop(root);
+            let result = task.await.unwrap();
+            let cache = state.instances.read().await;
+            if replacement != "none" {
+                if replacement == "incarnation" {
+                    assert!(matches!(result, Err(AttachError::NotFound)));
+                } else {
+                    assert!(matches!(result, Err(AttachError::Rejected(_))));
+                }
+                assert_eq!(cache[0].project_path, "/before");
+                assert_eq!(cache[0].title, "replacement");
+            } else {
+                result.unwrap();
+                assert_eq!(cache[0].project_path, "/after");
+                assert_eq!(cache[0].title, "cache title");
+                assert!(cache[0].workspace_info.is_some());
             }
         }
     }
