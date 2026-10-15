@@ -66,8 +66,8 @@ use super::stop_poller::StopPoller;
 use self::creation::SessionMutationGuards;
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD, UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
@@ -409,6 +409,13 @@ pub struct HomeView {
     pub(super) preview_copy_text: Option<String>,
 
     pub(super) show_preview_info: bool,
+
+    /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
+    pub(super) split_terminal: bool,
+    /// Captures whichever split half is not focused; the focused half uses
+    /// `preview_capture_worker` like a single preview.
+    pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,
+    pub(super) split_capture_target: Option<String>,
 
     pub(super) archived_section_collapsed: bool,
 
