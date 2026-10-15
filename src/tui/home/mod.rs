@@ -277,6 +277,7 @@ pub struct HomeView {
 
     pub(super) show_diagnostics: bool,
     pub(super) show_shortcut_bar: bool,
+    pub(super) preview_link_prefixes: Vec<String>,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
@@ -428,6 +429,8 @@ pub struct HomeView {
     pub(super) trashed_section_collapsed: bool,
 
     recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
+    /// Non-web links handed to the system opener, until each exit status arrives.
+    pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
     /// Held while recovery workers run so a later daemon cannot duplicate cascades.
     recovery_lock: Option<crate::session::recovery::RecoveryLock>,
 

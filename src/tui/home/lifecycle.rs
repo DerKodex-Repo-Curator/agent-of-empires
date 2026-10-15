@@ -165,6 +165,7 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
+        crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -198,6 +199,7 @@ impl HomeView {
 
         let config_watch = ConfigWatchState {
             dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            link_policy_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handles: HashMap::new(),
         };
 
@@ -349,6 +351,7 @@ impl HomeView {
             pending_status_refresh: false,
             show_diagnostics: resolved.session.show_diagnostics_pane,
             show_shortcut_bar: resolved.session.show_shortcut_bar,
+            preview_link_prefixes: resolved.session.preview_link_prefixes.clone(),
             metrics_poller: crate::tui::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
@@ -468,6 +471,7 @@ impl HomeView {
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             recovery_rx: None,
+            opener_exits: Vec::new(),
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
