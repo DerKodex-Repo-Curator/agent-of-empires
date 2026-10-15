@@ -1451,10 +1451,37 @@ struct PendingBranchDeletion {
 fn capture_branch_origin(
     repo: &Path,
     branch: &str,
+    checkout: &Path,
+    recovery_owner: Option<&Instance>,
 ) -> Result<Option<super::native_hooks::BranchOrigin>> {
     let git = GitWorktree::new(repo.to_path_buf())?;
     if !git.branch_exists(branch)? {
         return Ok(None);
+    }
+    // A display label on detached HEAD is not authority over a same-named local ref.
+    let Some(registered) = git.worktree_path_for_branch(branch)? else {
+        return Ok(None);
+    };
+    let registered =
+        resolve_claim_path(&registered).context("unresolved registered branch checkout")?;
+    let checkout = resolve_claim_path(checkout).context("unresolved branch cleanup checkout")?;
+    if registered != checkout {
+        // Only this session's missing trash holding can replace a diverged metadata path.
+        let Some(owner) = recovery_owner.filter(|owner| owner.is_trashed()) else {
+            return Ok(None);
+        };
+        let Some(recovery) = owner
+            .pre_trash_project_path
+            .as_deref()
+            .and_then(|original| super::trash::trash_holding_path(Path::new(original), &owner.id))
+        else {
+            return Ok(None);
+        };
+        let recovery =
+            resolve_claim_path(&recovery).context("unresolved trashed branch checkout")?;
+        if registered != recovery || registered.try_exists()? {
+            return Ok(None);
+        }
     }
     super::native_hooks::BranchOrigin::capture(repo, branch).map(Some)
 }
@@ -1479,7 +1506,9 @@ fn queue_branch_deletion(
             branch,
             label,
         }),
-        Some(Ok(None)) => messages.push(format!("Branch '{branch}' already absent")),
+        Some(Ok(None)) => messages.push(format!(
+            "Branch '{branch}' kept if present; no registered checkout ownership"
+        )),
         Some(Err(error)) => errors.push(format!("{label}: {error:#}")),
         None => errors.push(format!("{label}: original branch authority missing")),
     }
@@ -1513,7 +1542,12 @@ fn stage_remove_worktrees_and_branches(
     if let Some((branch, repo)) = &branch_to_delete {
         origins.insert(
             (repo.clone(), branch.clone()),
-            capture_branch_origin(repo, branch),
+            capture_branch_origin(
+                repo,
+                branch,
+                Path::new(&request.instance.project_path),
+                Some(&request.instance),
+            ),
         );
     }
     if request.delete_branch {
@@ -1521,7 +1555,9 @@ fn stage_remove_worktrees_and_branches(
             let main = PathBuf::from(&repo.main_repo_path);
             origins
                 .entry((main.clone(), repo.branch.clone()))
-                .or_insert_with(|| capture_branch_origin(&main, &repo.branch));
+                .or_insert_with(|| {
+                    capture_branch_origin(&main, &repo.branch, Path::new(&repo.worktree_path), None)
+                });
         }
     }
 
@@ -2638,6 +2674,102 @@ mod tests {
         let mut instance = Instance::new("Test", worktree);
         instance.worktree_info = Some(worktree_info(branch, &main_repo));
         (tmp, main_repo, worktree_path, instance)
+    }
+
+    #[test]
+    #[serial]
+    fn branch_cleanup_recovers_only_the_sessions_registered_missing_holding() {
+        let _home = isolate_app_dir();
+        let storage = Storage::new_unwatched("default").unwrap();
+        let (fixture, main, original, mut owner) = worktree_fixture("feature/recovery");
+        let _tmux = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            fixture.path().join("tmux.sock"),
+        )]);
+        let branch = owner.worktree_info.as_ref().unwrap().branch.clone();
+        owner.source_profile = storage.profile().to_owned();
+        owner.trash();
+        let generation = owner
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let result = super::super::trash::perform_trash(&super::super::trash::TrashRequest {
+            storage: storage.clone(),
+            session_id: owner.id.clone(),
+            instance: owner.clone(),
+            generation,
+        });
+        assert!(result.relocate_warning.is_none(), "{result:?}");
+        assert!(
+            result.relocation.is_some(),
+            "public trash must relocate the real checkout"
+        );
+        let mut owner = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == owner.id)
+            .unwrap();
+        let root = acquire_ownership_lock().unwrap();
+        let holding = super::super::trash::trash_holding_path(&original, &owner.id).unwrap();
+        assert_eq!(Path::new(&owner.project_path), holding.as_path());
+        owner.project_path = original.to_string_lossy().into_owned();
+        storage
+            .update_with_ownership(&root, |rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == owner.id)
+                    .unwrap()
+                    .project_path = owner.project_path.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            capture_branch_origin(&main, &branch, &original, Some(&owner))
+                .unwrap()
+                .is_none(),
+            "a different live checkout cannot supply recovery authority"
+        );
+        std::fs::remove_dir_all(&holding).unwrap();
+        assert!(capture_branch_origin(&main, &branch, &original, None)
+            .unwrap()
+            .is_none());
+        let mut other = owner.clone();
+        other.id.push_str("-peer");
+        assert!(
+            capture_branch_origin(&main, &branch, &original, Some(&other))
+                .unwrap()
+                .is_none(),
+            "an arbitrary missing registered checkout is not this session's holding"
+        );
+        let mut restored = owner.clone();
+        restored.trashed_at = None;
+        assert!(
+            capture_branch_origin(&main, &branch, &original, Some(&restored))
+                .unwrap()
+                .is_none()
+        );
+        let origin = capture_branch_origin(&main, &branch, &original, Some(&owner))
+            .unwrap()
+            .unwrap();
+        origin.verify(None).unwrap();
+        git_in(&main, &["worktree", "unlock", holding.to_str().unwrap()]);
+        git_in(&main, &["worktree", "prune", "--expire", "now"]);
+        assert!(
+            capture_branch_origin(&main, &branch, &original, Some(&owner))
+                .unwrap()
+                .is_none(),
+            "a label with no surviving registration cannot authorize branch deletion"
+        );
+        assert!(branch_exists(&main, &branch));
     }
 
     fn reserve(profile: &str, instance: Instance) -> PurgeTransaction {

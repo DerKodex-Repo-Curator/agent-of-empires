@@ -25,6 +25,8 @@ const CONTEXT: &str = "AOE_NATIVE_GIT_CONTEXT";
 const PRIVATE_PREFIX: &str = "AOE_NATIVE_GIT_";
 const REAL_EXEC: &str = "AOE_NATIVE_GIT_REAL_EXEC";
 const PROXY_EXEC: &str = "AOE_NATIVE_GIT_PROXY_EXEC";
+const PROGRAM_PREFIX: &str = "AOE_NATIVE_GIT_PROGRAM_PREFIX";
+const PARAMETERS_PRESENT: &str = "AOE_NATIVE_GIT_PARAMETERS_PRESENT";
 
 const LIVE_HOOKS: [&str; 4] = [
     "post-index-change",
@@ -176,7 +178,8 @@ fn env_delta(command: &mut Command, descriptor: &Descriptor) -> io::Result<Optio
     let parameters = match std::env::var_os("GIT_CONFIG_PARAMETERS") {
         Some(value) => strip_parameters(
             value.as_bytes(),
-            &descriptor.scope,
+            &descriptor.scope.root,
+            descriptor.scope.program_prefix.as_bytes(),
             descriptor.parameters_present,
         )?,
         None => None,
@@ -209,7 +212,12 @@ fn env_delta(command: &mut Command, descriptor: &Descriptor) -> io::Result<Optio
     Ok(parameters)
 }
 
-fn strip_parameters(bytes: &[u8], scope: &Scope, present: bool) -> io::Result<Option<OsString>> {
+fn strip_parameters(
+    bytes: &[u8],
+    root: &Path,
+    program_prefix: &[u8],
+    present: bool,
+) -> io::Result<Option<OsString>> {
     let mut output = Vec::with_capacity(bytes.len());
     let mut copied = 0;
     let mut cursor = 0;
@@ -245,11 +253,10 @@ fn strip_parameters(bytes: &[u8], scope: &Scope, present: bool) -> io::Result<Op
             return Err(invalid("unterminated Git configuration quoting"));
         }
         let remove = split_once_byte(&decoded, b'=').is_some_and(|(key, value)| {
-            (key == b"core.hooksPath"
-                && Path::new(OsStr::from_bytes(value)).starts_with(&scope.root))
+            (key == b"core.hooksPath" && Path::new(OsStr::from_bytes(value)).starts_with(root))
                 || (key.starts_with(b"hook.")
                     && key.ends_with(b".command")
-                    && value.starts_with(scope.program_prefix.as_bytes()))
+                    && value.starts_with(program_prefix))
         });
         if remove {
             // Git adds exactly one separator before each injected -c pair.
@@ -698,7 +705,16 @@ fn configured_git(
         .env(CONTEXT, path);
     command
         .env(REAL_EXEC, &descriptor.scope.real_exec)
-        .env(PROXY_EXEC, &descriptor.scope.proxy_exec);
+        .env(PROXY_EXEC, &descriptor.scope.proxy_exec)
+        .env(PROGRAM_PREFIX, &descriptor.scope.program_prefix)
+        .env(
+            PARAMETERS_PRESENT,
+            if descriptor.parameters_present {
+                "1"
+            } else {
+                "0"
+            },
+        );
     if let Some(parent) = std::env::var_os("AOE_NATIVE_GIT_PARENT") {
         command.env("AOE_NATIVE_GIT_PARENT", parent);
     }
@@ -712,7 +728,16 @@ fn routing_git(descriptor: &Descriptor, args: &[OsString], path: &Path) -> io::R
         .env(CONTEXT, path);
     command
         .env(REAL_EXEC, &descriptor.scope.real_exec)
-        .env(PROXY_EXEC, &descriptor.scope.proxy_exec);
+        .env(PROXY_EXEC, &descriptor.scope.proxy_exec)
+        .env(PROGRAM_PREFIX, &descriptor.scope.program_prefix)
+        .env(
+            PARAMETERS_PRESENT,
+            if descriptor.parameters_present {
+                "1"
+            } else {
+                "0"
+            },
+        );
     if let Some(parent) = std::env::var_os("AOE_NATIVE_GIT_PARENT") {
         command.env("AOE_NATIVE_GIT_PARENT", parent);
     }
@@ -1396,6 +1421,15 @@ fn configure_callback(
         .env("AOE_NATIVE_GIT_PARENT", callback)
         .env(REAL_EXEC, &descriptor.scope.real_exec)
         .env(PROXY_EXEC, &descriptor.scope.proxy_exec)
+        .env(PROGRAM_PREFIX, &descriptor.scope.program_prefix)
+        .env(
+            PARAMETERS_PRESENT,
+            if descriptor.parameters_present {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("GIT_EXEC_PATH", &descriptor.scope.proxy_exec)
         .env("PATH", path);
     Ok(())
@@ -1574,7 +1608,9 @@ pub fn try_proxy_entry() -> Option<io::Result<i32>> {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let result = proxy_entry(&argv);
     if result.is_none() {
-        clear_normal_routing(Path::new(&context));
+        if let Err(error) = clear_normal_routing(Path::new(&context)) {
+            return Some(Err(error));
+        }
     }
     result
 }
@@ -1587,7 +1623,33 @@ fn context_root(context: &Path) -> Option<&Path> {
     }
 }
 
-fn clear_normal_routing(context: &Path) {
+fn clear_normal_routing(context: &Path) -> io::Result<()> {
+    let parameters = match std::env::var_os("GIT_CONFIG_PARAMETERS") {
+        Some(value) => match (
+            context_root(context),
+            std::env::var_os(PROGRAM_PREFIX),
+            std::env::var_os(PARAMETERS_PRESENT),
+        ) {
+            (Some(root), Some(prefix), Some(present)) => {
+                if prefix.is_empty() || !root.is_absolute() {
+                    return Err(invalid("invalid native Git routing identity"));
+                }
+                let present = match present.as_bytes() {
+                    b"0" => false,
+                    b"1" => true,
+                    _ => return Err(invalid("invalid native Git parameter provenance")),
+                };
+                Some(strip_parameters(
+                    value.as_bytes(),
+                    root,
+                    prefix.as_bytes(),
+                    present,
+                )?)
+            }
+            _ => None,
+        },
+        None => None,
+    };
     let proxy = std::env::var_os(PROXY_EXEC)
         .map(PathBuf::from)
         .or_else(|| context_root(context).map(|root| root.join("exec")));
@@ -1601,6 +1663,12 @@ fn clear_normal_routing(context: &Path) {
     // SAFETY: entry runs before any threads. Ordinary AoE children must start
     // independent Git supervisors, not reenter their caller's paused lease.
     unsafe {
+        if let Some(parameters) = parameters {
+            match parameters {
+                Some(value) => std::env::set_var("GIT_CONFIG_PARAMETERS", value),
+                None => std::env::remove_var("GIT_CONFIG_PARAMETERS"),
+            }
+        }
         if let Some(path) = path {
             std::env::set_var("PATH", path);
         }
@@ -1617,6 +1685,7 @@ fn clear_normal_routing(context: &Path) {
             }
         }
     }
+    Ok(())
 }
 
 fn proxy_entry(argv: &[OsString]) -> Option<io::Result<i32>> {
@@ -1835,6 +1904,14 @@ mod tests {
             return;
         }
         if std::env::var_os("AOE_TEST_NATIVE_RUNNER").is_none() {
+            // Child commands must not inherit another test's temporary process environment.
+            let (environment, phase_root) = {
+                let _env = crate::session::test_support::EnvGuard::read_lock();
+                (
+                    std::env::vars_os().collect::<Vec<_>>(),
+                    tempfile::tempdir().unwrap(),
+                )
+            };
             for phase in [
                 "callbacks",
                 "protocol",
@@ -1845,7 +1922,7 @@ mod tests {
             ] {
                 eprintln!("native callbacks: starting {phase}");
                 let started = std::time::Instant::now();
-                let private_image = tempfile::tempdir().unwrap();
+                let private_image = tempfile::tempdir_in(phase_root.path()).unwrap();
                 let executable = if phase == "replaced" && cfg!(target_os = "linux") {
                     let image = private_image.path().join("test-image");
                     fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
@@ -1854,6 +1931,10 @@ mod tests {
                     std::env::current_exe().unwrap()
                 };
                 let mut child = Command::new(executable);
+                child
+                    .env_clear()
+                    .envs(environment.iter().map(|(key, value)| (key, value)))
+                    .env("TMPDIR", private_image.path());
                 if phase == "replaced" {
                     child.env("AOE_TEST_NATIVE_REPLACED_IMAGE", "1");
                 }
@@ -2584,5 +2665,83 @@ mod tests {
             foreign.accept().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+    #[test]
+    fn ordinary_entry_removes_only_its_inherited_git_parameters() {
+        const CHILD: &str = "AOE_TEST_NATIVE_NORMAL_ENTRY";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(crate::process::running_image().unwrap())
+                .args(["--exact", "git::native_hooks::tests::ordinary_entry_removes_only_its_inherited_git_parameters", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let context = root.path().join("node/descriptor.json");
+        let proxy = root.path().join("exec");
+        let prefix = "aoe-native-precise-fixture";
+        let injected = format!(
+            "'core.hooksPath={}/node/hooks' 'hook.post-checkout.command={prefix}-post-checkout'",
+            root.path().display()
+        )
+        .into_bytes();
+        let user_before = b"'fixture.duplicate=first' 'hook.external.command=aoe-native-foreign' 'core.hooksPath=/foreign/hooks'";
+        let user_after = b" 'fixture.duplicate=last' 'fixture.bytes=can'\\''t \xff'";
+        for (present, with_user) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut parameters = Vec::new();
+            let mut expected = Vec::new();
+            if with_user {
+                parameters.extend_from_slice(user_before);
+                parameters.push(b' ');
+                expected.extend_from_slice(user_before);
+            }
+            parameters.extend_from_slice(&injected);
+            if with_user {
+                parameters.extend_from_slice(user_after);
+                expected.extend_from_slice(user_after);
+            }
+            let path = std::env::join_paths(std::iter::once(proxy.clone()).chain(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+            ))
+            .unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                (CONTEXT, context.clone().into_os_string()),
+                (PROXY_EXEC, proxy.clone().into_os_string()),
+                (REAL_EXEC, OsString::from("/real/git-exec")),
+                (PROGRAM_PREFIX, OsString::from(prefix)),
+                (
+                    PARAMETERS_PRESENT,
+                    OsString::from(if present { "1" } else { "0" }),
+                ),
+                ("GIT_EXEC_PATH", proxy.clone().into_os_string()),
+                ("PATH", path),
+                ("GIT_CONFIG_PARAMETERS", OsString::from_vec(parameters)),
+            ]);
+            assert!(!context.exists());
+            assert!(try_proxy_entry().is_none());
+            assert_eq!(
+                std::env::var_os("GIT_CONFIG_PARAMETERS"),
+                (present || with_user).then(|| OsString::from_vec(expected))
+            );
+            assert!(std::env::var_os(CONTEXT).is_none());
+            assert_eq!(
+                std::env::var_os("GIT_EXEC_PATH"),
+                Some(OsString::from("/real/git-exec"))
+            );
+        }
+        let malformed = OsString::from("'unterminated");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            (CONTEXT, context.clone().into_os_string()),
+            (PROGRAM_PREFIX, OsString::from(prefix)),
+            (PARAMETERS_PRESENT, OsString::from("0")),
+            ("GIT_CONFIG_PARAMETERS", malformed.clone()),
+        ]);
+        assert!(try_proxy_entry().unwrap().is_err());
+        assert_eq!(std::env::var_os(CONTEXT), Some(context.into_os_string()));
+        assert_eq!(std::env::var_os("GIT_CONFIG_PARAMETERS"), Some(malformed));
     }
 }

@@ -200,29 +200,59 @@ impl DirectoryWitness {
 }
 
 #[derive(Debug, Clone)]
+enum CheckoutIdentity {
+    Attached(String),
+    Detached {
+        requested: String,
+        source: Option<std::sync::Arc<super::native_hooks::BranchOrigin>>,
+        final_head: Option<std::sync::Arc<super::native_hooks::PathSnapshot>>,
+        final_tip: Option<git2::Oid>,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CheckoutWitness {
     checkout: DirectoryWitness,
     git_directory: DirectoryWitness,
     common_git_directory: DirectoryWitness,
     original_tip: git2::Oid,
-    branch: Option<String>,
+    identity: CheckoutIdentity,
     created_branch: Option<std::sync::Arc<super::native_hooks::BranchOrigin>>,
 }
 
 impl CheckoutWitness {
     pub(crate) fn capture(path: &Path) -> Result<Self> {
         let repo = git2::Repository::open(path)?;
-        let branch = Some(repo.head()?.name()?.to_owned());
-        let original_tip = repo.head()?.peel_to_commit()?.id();
+        let head = repo.head()?;
+        let identity = if repo.head_detached()? {
+            CheckoutIdentity::Detached {
+                requested: "HEAD".to_owned(),
+                source: None,
+                final_head: None,
+                final_tip: None,
+            }
+        } else {
+            CheckoutIdentity::Attached(
+                head.name()
+                    .context("checkout reference name is not UTF-8")?
+                    .to_owned(),
+            )
+        };
+        let original_tip = head.peel_to_commit()?.id();
         Ok(Self {
             checkout: DirectoryWitness::capture(path)?,
             git_directory: DirectoryWitness::capture(repo.path())?,
             common_git_directory: DirectoryWitness::capture(repo.commondir())?,
             original_tip,
-            branch,
+            identity,
             created_branch: None,
         })
     }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        matches!(self.identity, CheckoutIdentity::Detached { .. })
+    }
+
     pub(crate) fn record_created_branch(
         &mut self,
         origin: Option<std::sync::Arc<super::native_hooks::BranchOrigin>>,
@@ -257,24 +287,67 @@ impl CheckoutWitness {
         branch: &str,
         detached: bool,
         original_tip: Option<git2::Oid>,
+        source: Option<std::sync::Arc<super::native_hooks::BranchOrigin>>,
     ) -> Result<Self> {
         let mut witness = Self::capture(path)?;
         anyhow::ensure!(
-            if detached {
-                witness.branch.as_deref() == Some("HEAD")
-            } else {
-                witness
-                    .branch
-                    .as_deref()
-                    .and_then(|name| name.strip_prefix("refs/heads/"))
-                    == Some(branch)
-            },
-            "Native checkout changed the requested branch"
+            witness.is_detached() == detached,
+            "Native checkout changed the requested branch mode"
         );
+        match &mut witness.identity {
+            CheckoutIdentity::Attached(reference) => {
+                anyhow::ensure!(
+                    reference.strip_prefix("refs/heads/") == Some(branch),
+                    "Native checkout changed the requested branch"
+                );
+            }
+            CheckoutIdentity::Detached {
+                requested,
+                source: retained,
+                ..
+            } => {
+                branch.clone_into(requested);
+                *retained = source;
+            }
+        }
         if let Some(tip) = original_tip {
             witness.original_tip = tip;
         }
+        witness.verify()?;
         Ok(witness)
+    }
+
+    fn capture_existing(path: &Path, requested: &str) -> Result<Self> {
+        let mut witness = Self::capture(path)?;
+        // Existing detached labels are historical; only native receipts prove a source ref.
+        if let CheckoutIdentity::Detached {
+            requested: label, ..
+        } = &mut witness.identity
+        {
+            requested.clone_into(label);
+        }
+        witness.finalize()?;
+        Ok(witness)
+    }
+
+    pub(crate) fn finalize(&mut self) -> Result<()> {
+        self.verify()?;
+        if let CheckoutIdentity::Detached {
+            final_head,
+            final_tip,
+            ..
+        } = &mut self.identity
+        {
+            if final_head.is_none() {
+                let repo = git2::Repository::open(&self.checkout.path)?;
+                let tip = repo.head()?.peel_to_commit()?.id();
+                let head = super::native_hooks::PathSnapshot::capture(repo.path().join("HEAD"))?;
+                head.verify()?;
+                *final_head = Some(std::sync::Arc::new(head));
+                *final_tip = Some(tip);
+            }
+        }
+        self.verify()
     }
 
     pub(crate) fn verify(&self) -> Result<()> {
@@ -282,27 +355,56 @@ impl CheckoutWitness {
         self.git_directory.verify()?;
         self.common_git_directory.verify()?;
         let repo = git2::Repository::open(&self.checkout.path)?;
-        anyhow::ensure!(
-            Some(repo.head()?.name()?) == self.branch.as_deref(),
-            "Session checkout branch changed before publication or cleanup"
-        );
-        anyhow::ensure!(
-            super::storage::filesystem_identity(&std::fs::metadata(repo.path())?)
-                == super::storage::filesystem_identity(&self.git_directory.directory.metadata()?),
-            "Session Git checkout changed before publication or cleanup"
-        );
-        anyhow::ensure!(
-            super::storage::filesystem_identity(&std::fs::metadata(repo.commondir())?)
-                == super::storage::filesystem_identity(
-                    &self.common_git_directory.directory.metadata()?
-                ),
-            "Session Git repository changed before publication or cleanup"
-        );
+        match &self.identity {
+            CheckoutIdentity::Attached(reference) => {
+                anyhow::ensure!(
+                    !repo.head_detached()? && repo.head()?.name()? == reference.as_str(),
+                    "Session checkout branch changed before publication or cleanup"
+                );
+            }
+            CheckoutIdentity::Detached {
+                source,
+                final_head,
+                final_tip,
+                ..
+            } => {
+                anyhow::ensure!(
+                    repo.head_detached()?,
+                    "Session checkout is no longer detached"
+                );
+                if let Some(source) = source {
+                    source.verify_source()?;
+                }
+                if let Some(head) = final_head {
+                    head.verify()?;
+                }
+                if let Some(tip) = final_tip {
+                    anyhow::ensure!(
+                        repo.head()?.peel_to_commit()?.id() == *tip,
+                        "Final detached checkout changed before publication or cleanup"
+                    );
+                }
+            }
+        }
+        self.git_directory.verify_at(repo.path())?;
+        self.common_git_directory.verify_at(repo.commondir())?;
         Ok(())
     }
 
+    fn matches_requested(&self, requested: &str) -> bool {
+        match &self.identity {
+            CheckoutIdentity::Attached(reference) => {
+                reference.strip_prefix("refs/heads/") == Some(requested)
+            }
+            CheckoutIdentity::Detached {
+                requested: original,
+                ..
+            } => original == requested,
+        }
+    }
+
     fn detached_tip_changed(&self) -> bool {
-        self.branch.as_deref() == Some("HEAD")
+        self.is_detached()
             && !git2::Repository::open(&self.checkout.path)
                 .and_then(|repo| {
                     repo.head()?
@@ -331,33 +433,96 @@ pub struct CreationWitness {
 }
 
 impl CreationWitness {
-    pub(crate) fn capture(instance: &Instance) -> Result<Self> {
-        validate_creation_paths(instance)?;
+    pub(crate) fn capture<'a>(
+        instance: &Instance,
+        created: impl Iterator<Item = &'a CreatedWorktree> + Clone,
+        workspace_root: Option<&DirectoryWitness>,
+    ) -> Result<Self> {
+        if let Some(root) = workspace_root {
+            let workspace = instance
+                .workspace_info
+                .as_ref()
+                .context("created workspace receipt has no metadata")?;
+            anyhow::ensure!(
+                Self::same_path(&root.path, Path::new(&workspace.workspace_dir)),
+                "created workspace receipt does not match publication"
+            );
+            root.verify()?;
+        }
+        let capture_directory = |path: &Path| {
+            if let Some(root) = workspace_root.filter(|root| Self::same_path(&root.path, path)) {
+                Ok(root.clone())
+            } else {
+                DirectoryWitness::capture(path)
+            }
+        };
         let mut witness = Self {
-            directories: vec![DirectoryWitness::capture(Path::new(
-                &instance.project_path,
-            ))?],
+            directories: vec![capture_directory(Path::new(&instance.project_path))?],
             checkouts: Vec::new(),
         };
         if let Some(workspace) = &instance.workspace_info {
             if workspace.workspace_dir != instance.project_path {
                 witness
                     .directories
-                    .push(DirectoryWitness::capture(Path::new(
-                        &workspace.workspace_dir,
-                    ))?);
+                    .push(capture_directory(Path::new(&workspace.workspace_dir))?);
             }
             for repo in &workspace.repos {
+                witness.checkouts.push(Self::capture_checkout(
+                    &repo.main_repo_path,
+                    &repo.worktree_path,
+                    &repo.branch,
+                    created.clone(),
+                )?);
+            }
+        } else if let Some(info) = &instance.worktree_info {
+            witness.checkouts.push(Self::capture_checkout(
+                &info.main_repo_path,
+                &instance.project_path,
+                &info.branch,
+                created.clone(),
+            )?);
+        }
+        for receipt in created {
+            anyhow::ensure!(
                 witness
                     .checkouts
-                    .push(CheckoutWitness::capture(Path::new(&repo.worktree_path))?);
-            }
-        } else if instance.worktree_info.is_some() {
-            witness
-                .checkouts
-                .push(CheckoutWitness::capture(Path::new(&instance.project_path))?);
+                    .iter()
+                    .any(|checkout| Self::same_path(&checkout.checkout.path, &receipt.path)),
+                "created checkout is missing from publication witnesses"
+            );
         }
+        witness.validate(instance)?;
         Ok(witness)
+    }
+
+    fn same_path(left: &Path, right: &Path) -> bool {
+        super::deletion::resolve_claim_path(left)
+            .zip(super::deletion::resolve_claim_path(right))
+            .is_some_and(|(left, right)| left == right)
+    }
+
+    fn capture_checkout<'a>(
+        main_repo: &str,
+        path: &str,
+        branch: &str,
+        created: impl Iterator<Item = &'a CreatedWorktree>,
+    ) -> Result<CheckoutWitness> {
+        let path = Path::new(path);
+        let mut receipts = created.filter(|receipt| Self::same_path(path, &receipt.path));
+        if let Some(receipt) = receipts.next() {
+            anyhow::ensure!(
+                receipts.next().is_none(),
+                "ambiguous created checkout receipts"
+            );
+            anyhow::ensure!(
+                Self::same_path(Path::new(main_repo), &receipt.main_repo_path)
+                    && receipt.witness.matches_requested(branch),
+                "created checkout receipt does not match publication"
+            );
+            Ok(receipt.witness.clone())
+        } else {
+            CheckoutWitness::capture_existing(path, branch)
+        }
     }
 
     pub(crate) fn original_project_path(&self) -> &Path {
@@ -371,7 +536,7 @@ impl CreationWitness {
         for checkout in &self.checkouts {
             checkout.verify()?;
         }
-        validate_creation_paths(instance)
+        validate_creation_paths(instance, &self.checkouts)
     }
 
     pub(crate) fn checkout(&self, path: &Path) -> Option<CheckoutWitness> {
@@ -379,17 +544,6 @@ impl CreationWitness {
             .iter()
             .find(|checkout| checkout.checkout.path == path)
             .cloned()
-    }
-
-    pub(crate) fn retain_created(&mut self, created: &CreatedWorktree) -> Result<()> {
-        created.witness.verify()?;
-        let checkout = self
-            .checkouts
-            .iter_mut()
-            .find(|checkout| checkout.checkout.path == created.path)
-            .context("created checkout is missing from publication witnesses")?;
-        *checkout = created.witness.clone();
-        Ok(())
     }
 
     fn original_directory(&self, path: &Path) -> bool {
@@ -404,6 +558,7 @@ pub struct WorkspaceResult {
     pub workspace_info: WorkspaceInfo,
     pub created_worktrees: Vec<CreatedWorktree>,
     pub workspace_path: PathBuf,
+    pub(crate) workspace_witness: DirectoryWitness,
     /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
     /// failures where the worktree itself was created successfully).
     pub warnings: Vec<String>,
@@ -588,7 +743,7 @@ pub(crate) fn create_workspace_with_ownership(
             .unwrap_or_else(|| "repo".to_string());
         if !seen_names.insert(name.clone()) {
             drop(ownership.take());
-            cleanup_workspace_resources(&[], &workspace_path, &workspace_witness);
+            cleanup_creation_receipts(std::iter::empty(), Some(&workspace_witness));
             bail!(
                 "Duplicate repository name '{}' in workspace\n\
                  Tip: Rename one of the directories to avoid the collision",
@@ -611,7 +766,7 @@ pub(crate) fn create_workspace_with_ownership(
     for (repo_path, base_branch) in &all_repos {
         if !GitWorktree::is_git_repo(repo_path) {
             drop(ownership.take());
-            cleanup_workspace_resources(&[], &workspace_path, &workspace_witness);
+            cleanup_creation_receipts(std::iter::empty(), Some(&workspace_witness));
             bail!(
                 "Path is not in a git repository: {}\n\
                  Tip: All --repo paths must be git repositories",
@@ -723,7 +878,8 @@ pub(crate) fn create_workspace_with_ownership(
                 created_worktrees.push(CreatedWorktree {
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
-                    owned_branch: create_new_branch.then(|| branch.to_string()),
+                    owned_branch: (create_new_branch && !witness.is_detached())
+                        .then(|| branch.to_string()),
                     witness,
                 });
                 repos.push(WorkspaceRepo {
@@ -760,7 +916,7 @@ pub(crate) fn create_workspace_with_ownership(
                     .context("workspace ownership lease missing")?,
                 &worktree.main_repo_path,
                 &worktree.path,
-                branch,
+                (!worktree.witness.is_detached()).then_some(branch),
                 provisional,
             )?;
         }
@@ -772,7 +928,7 @@ pub(crate) fn create_workspace_with_ownership(
 
     if !errors.is_empty() {
         drop(ownership.take());
-        cleanup_workspace_resources(&created_worktrees, &workspace_path, &workspace_witness);
+        cleanup_creation_receipts(created_worktrees.iter(), Some(&workspace_witness));
         if errors.len() == 1 {
             bail!("Failed to create worktree for {}", errors.remove(0));
         } else {
@@ -794,6 +950,7 @@ pub(crate) fn create_workspace_with_ownership(
         },
         created_worktrees,
         workspace_path,
+        workspace_witness,
         warnings,
     })
 }
@@ -876,6 +1033,7 @@ pub fn build_instance(
     let mut created_worktree = None;
     let mut workspace_info = None;
     let mut created_workspace_worktrees: Vec<CreatedWorktree> = Vec::new();
+    let mut workspace_witness = None;
     let mut warnings: Vec<String> = Vec::new();
     let taken_branches = collect_taken_branches_for_derived_dedupe(
         existing_branches,
@@ -964,6 +1122,7 @@ pub fn build_instance(
             )?;
 
             final_path = ws_result.workspace_path.to_string_lossy().to_string();
+            workspace_witness = Some(ws_result.workspace_witness);
             workspace_info = Some(ws_result.workspace_info);
             created_workspace_worktrees = ws_result.created_worktrees;
             warnings.extend(ws_result.warnings);
@@ -1216,13 +1375,25 @@ pub fn build_instance(
         }
     }
 
-    let mut witness = CreationWitness::capture(&instance)?;
-    if let Some(created) = &created_worktree {
-        witness.retain_created(created)?;
-    }
-    for created in &created_workspace_worktrees {
-        witness.retain_created(created)?;
-    }
+    let witness = match CreationWitness::capture(
+        &instance,
+        created_worktree
+            .iter()
+            .chain(created_workspace_worktrees.iter()),
+        workspace_witness.as_ref(),
+    ) {
+        Ok(witness) => witness,
+        Err(error) => {
+            drop(ownership.take());
+            cleanup_creation_receipts(
+                created_worktree
+                    .iter()
+                    .chain(created_workspace_worktrees.iter()),
+                workspace_witness.as_ref(),
+            );
+            return Err(error.context("Creation witness capture failed"));
+        }
+    };
     Ok(BuildResult {
         ownership,
         profile_storage,
@@ -1234,36 +1405,61 @@ pub fn build_instance(
     })
 }
 
-pub(crate) fn validate_creation_paths(instance: &Instance) -> Result<()> {
+fn validate_creation_paths(instance: &Instance, checkouts: &[CheckoutWitness]) -> Result<()> {
     if !Path::new(&instance.project_path).is_dir() {
         bail!("Session working directory disappeared before publication");
     }
+    let checkout = |path: &str| {
+        checkouts
+            .iter()
+            .find(|checkout| CreationWitness::same_path(Path::new(path), &checkout.checkout.path))
+            .context("Session checkout is missing from publication witnesses")
+    };
     if let Some(workspace) = &instance.workspace_info {
         if !Path::new(&workspace.workspace_dir).is_dir() {
             bail!("Session workspace disappeared before publication");
         }
         for repo in &workspace.repos {
-            validate_checkout(&repo.main_repo_path, &repo.worktree_path, &repo.branch)?;
+            validate_checkout(
+                &repo.main_repo_path,
+                &repo.worktree_path,
+                &repo.branch,
+                checkout(&repo.worktree_path)?,
+            )?;
         }
     } else if let Some(worktree) = &instance.worktree_info {
         validate_checkout(
             &worktree.main_repo_path,
             &instance.project_path,
             &worktree.branch,
+            checkout(&instance.project_path)?,
         )?;
     }
     Ok(())
 }
 
-fn validate_checkout(main_repo: &str, path: &str, branch: &str) -> Result<()> {
+fn validate_checkout(
+    main_repo: &str,
+    path: &str,
+    branch: &str,
+    witness: &CheckoutWitness,
+) -> Result<()> {
+    anyhow::ensure!(
+        witness.matches_requested(branch),
+        "Session checkout branch changed before publication"
+    );
+    witness
+        .common_git_directory
+        .verify_at(git2::Repository::open(main_repo)?.commondir())?;
     let path = Path::new(path).canonicalize()?;
     let worktrees = GitWorktree::new(PathBuf::from(main_repo))?.list_worktrees()?;
-    if !worktrees.iter().any(|entry| {
-        entry.branch.as_deref() == Some(branch)
-            && entry.path.canonicalize().ok().as_ref() == Some(&path)
-    }) {
-        bail!("Session checkout or branch changed before publication");
-    }
+    anyhow::ensure!(
+        worktrees.iter().any(
+            |entry| entry.path.canonicalize().ok().as_ref() == Some(&path)
+                && entry.is_detached == witness.is_detached()
+        ),
+        "Session checkout registration changed before publication"
+    );
     Ok(())
 }
 
@@ -1279,10 +1475,9 @@ pub(crate) fn cleanup_owners(ownership: &super::storage::OwnershipGuard) -> Resu
     Ok(owners)
 }
 
-fn cleanup_workspace_resources(
-    created: &[CreatedWorktree],
-    workspace_path: &Path,
-    witness: &DirectoryWitness,
+pub(crate) fn cleanup_creation_receipts<'a>(
+    created: impl Iterator<Item = &'a CreatedWorktree> + Clone,
+    workspace: Option<&DirectoryWitness>,
 ) {
     let Ok(ownership) = super::storage::acquire_ownership_lock() else {
         return;
@@ -1295,17 +1490,20 @@ fn cleanup_workspace_resources(
         owners,
         workspace_owner: None,
     };
-    let originals_intact = created
-        .iter()
-        .all(|worktree| worktree.witness.verify().is_ok());
+    let originals_intact = workspace.is_some()
+        && created
+            .clone()
+            .all(|worktree| worktree.witness.verify().is_ok());
     for worktree in created {
         cleanup_created_worktree(
             worktree,
-            "workspace worktree",
+            "unpublished worktree",
             &protection,
             super::native_hooks::BranchHandoff::unpublished(&ownership),
         );
     }
+    let Some(witness) = workspace else { return };
+    let workspace_path = &witness.path;
     let Ok(owners) = cleanup_owners(&ownership) else {
         return;
     };
@@ -1970,7 +2168,7 @@ mod tests {
             created_at: Utc::now(),
             base_branch: None,
         });
-        let witness = CreationWitness::capture(&instance).unwrap();
+        let witness = CreationWitness::capture(&instance, std::iter::empty(), None).unwrap();
         witness.validate(&instance).unwrap();
         git.remove_worktree(&path, false).unwrap();
         assert!(witness.validate(&instance).is_err());
@@ -2004,7 +2202,8 @@ mod tests {
             owned_branch: Some("claimed-branch".to_string()),
             witness: CheckoutWitness::capture_owned(&path, &main, "claimed-branch").unwrap(),
         };
-        let witness = CreationWitness::capture(&unpublished).unwrap();
+        let witness =
+            CreationWitness::capture(&unpublished, std::iter::once(&created), None).unwrap();
         let storage = super::super::Storage::new_unwatched("later-owner").unwrap();
         let owner = unpublished.clone();
         storage
@@ -2059,7 +2258,8 @@ mod tests {
                 witness: CheckoutWitness::capture_owned(&path, &main, "claimed-branch").unwrap(),
                 main_repo_path: main,
             };
-            let witness = CreationWitness::capture(&unpublished).unwrap();
+            let witness =
+                CreationWitness::capture(&unpublished, std::iter::once(&created), None).unwrap();
             if claim == "replaced-ref" {
                 let reference = created
                     .main_repo_path
@@ -2614,7 +2814,12 @@ mod tests {
         let worktree_path = workspace.created_worktrees[0].path.clone();
         let mut instance = Instance::new("rollback", workspace.workspace_path.to_str().unwrap());
         instance.workspace_info = Some(workspace.workspace_info);
-        let witness = CreationWitness::capture(&instance).unwrap();
+        let witness = CreationWitness::capture(
+            &instance,
+            workspace.created_worktrees.iter(),
+            Some(&workspace.workspace_witness),
+        )
+        .unwrap();
         std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
         cleanup_unpublished_instance(
             &instance,
@@ -3130,7 +3335,7 @@ mod tests {
         let scratch = super::super::scratch::provision_scratch_dir(&instance.id).unwrap();
         instance.project_path = scratch.to_string_lossy().into_owned();
         instance.scratch = true;
-        let witness = CreationWitness::capture(&instance).unwrap();
+        let witness = CreationWitness::capture(&instance, std::iter::empty(), None).unwrap();
         struct RuntimeCleanup<'a>(&'a Instance);
         impl Drop for RuntimeCleanup<'_> {
             fn drop(&mut self) {
@@ -3158,5 +3363,406 @@ mod tests {
             !scratch.exists(),
             "a known unclaimed original scratch directory can be rolled back"
         );
+    }
+    fn detached_candidate(main: &Path, path: &Path, requested: &str) -> Instance {
+        let mut instance = Instance::new("detached", &path.to_string_lossy());
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: requested.to_owned(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        instance
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn detached_receipts_publish_multiple_remote_refs_without_local_branches() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("detached-specs", "release");
+        let main = parent.path().join("detached-specs");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let base_tip = repo.find_commit(tip).unwrap().parent_id(0).unwrap();
+        repo.reference("refs/remotes/upstream/topic", base_tip, true, "fixture")
+            .unwrap();
+        let git = GitWorktree::new(main.clone())
+            .unwrap()
+            .with_init_submodules(false);
+        for (index, requested) in ["origin/main", "upstream/topic"].into_iter().enumerate() {
+            let expected = repo
+                .revparse_single(requested)
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id();
+            let path = parent.path().join(format!("checkout-{index}"));
+            let mut ownership = Some(super::super::storage::acquire_ownership_read().unwrap());
+            let (_, witness) = super::super::native_hooks::create_worktree(
+                &mut ownership,
+                None,
+                &git,
+                (&main, &path, requested),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(witness.is_detached(), "{requested}");
+            let created = CreatedWorktree {
+                path: path.clone(),
+                main_repo_path: main.clone(),
+                owned_branch: None,
+                witness,
+            };
+            let instance = detached_candidate(&main, &path, requested);
+            let publication =
+                CreationWitness::capture(&instance, std::iter::once(&created), None).unwrap();
+            publication.validate(&instance).unwrap();
+            assert_eq!(instance.worktree_info.as_ref().unwrap().branch, requested);
+            let checkout = git2::Repository::open(&path).unwrap();
+            assert!(checkout.head_detached().unwrap());
+            assert_eq!(
+                checkout.head().unwrap().peel_to_commit().unwrap().id(),
+                expected
+            );
+            drop(checkout);
+            drop(ownership.take());
+            cleanup_creation_receipts(std::iter::once(&created), None);
+            assert!(
+                !path.exists(),
+                "{requested}: pristine detached receipt was not cleaned"
+            );
+        }
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert!(repo.find_reference("refs/heads/origin/main").is_err());
+        assert_eq!(
+            repo.find_reference("refs/remotes/upstream/topic")
+                .unwrap()
+                .target(),
+            Some(base_tip)
+        );
+        assert!(repo.find_reference("refs/heads/upstream/topic").is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_suffix_and_explicit_remote_publish_their_actual_checkout_kinds() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("remote-mode", "release");
+        let main = parent.path().join("remote-mode");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.remote("origin", main.to_str().unwrap()).unwrap();
+        repo.reference("refs/remotes/origin/remote-topic", tip, true, "fixture")
+            .unwrap();
+        let git = GitWorktree::new(main.clone())
+            .unwrap()
+            .with_init_submodules(false);
+        for (index, (requested, detached)) in
+            [("origin/remote-topic", true), ("remote-topic", false)]
+                .into_iter()
+                .enumerate()
+        {
+            let path = parent.path().join(format!("checkout-{index}"));
+            let mut ownership = Some(super::super::storage::acquire_ownership_read().unwrap());
+            let (_, witness) = super::super::native_hooks::create_worktree(
+                &mut ownership,
+                None,
+                &git,
+                (&main, &path, requested),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(witness.is_detached(), detached, "{requested}");
+            let created = CreatedWorktree {
+                path: path.clone(),
+                main_repo_path: main.clone(),
+                owned_branch: None,
+                witness,
+            };
+            let instance = detached_candidate(&main, &path, requested);
+            let publication =
+                CreationWitness::capture(&instance, std::iter::once(&created), None).unwrap();
+            publication.validate(&instance).unwrap();
+            let checkout = git2::Repository::open(&path).unwrap();
+            assert_eq!(checkout.head_detached().unwrap(), detached, "{requested}");
+            assert_eq!(checkout.head().unwrap().peel_to_commit().unwrap().id(), tip);
+            if !detached {
+                assert_eq!(
+                    checkout.head().unwrap().name().unwrap(),
+                    "refs/heads/remote-topic"
+                );
+            }
+            drop(checkout);
+            drop(ownership.take());
+            cleanup_creation_receipts(std::iter::once(&created), None);
+            assert!(
+                !path.exists(),
+                "{requested}: pristine checkout was not cleaned"
+            );
+        }
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/remote-topic")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert_eq!(
+            repo.find_reference("refs/heads/remote-topic")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert!(repo
+            .find_reference("refs/heads/origin/remote-topic")
+            .is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn existing_detached_checkout_pins_head_not_a_pruned_historical_label() {
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("existing-detached", "release");
+        let main = parent.path().join("existing-detached");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let path = parent.path().join("checkout");
+        let git = GitWorktree::new(main.clone())
+            .unwrap()
+            .with_init_submodules(false);
+        let mut ownership = Some(super::super::storage::acquire_ownership_read().unwrap());
+        let (_, native) = super::super::native_hooks::create_worktree(
+            &mut ownership,
+            None,
+            &git,
+            (&main, &path, "origin/main"),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(ownership.take());
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert!(
+            native.verify().is_err(),
+            "new native receipts still require their original source"
+        );
+        let _ownership = super::super::storage::acquire_ownership_read().unwrap();
+        let instance = detached_candidate(&main, &path, "origin/main");
+        let existing = CreationWitness::capture(&instance, std::iter::empty(), None).unwrap();
+        existing.validate(&instance).unwrap();
+        let checkout = git2::Repository::open(&path).unwrap();
+        let head = checkout.path().join("HEAD");
+        let bytes = std::fs::read(&head).unwrap();
+        std::fs::rename(&head, head.with_extension("retired")).unwrap();
+        std::fs::write(&head, bytes).unwrap();
+        assert_eq!(checkout.head().unwrap().peel_to_commit().unwrap().id(), tip);
+        assert!(
+            existing.validate(&instance).is_err(),
+            "same-OID HEAD replacement must not refresh authority"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn detached_hook_commit_publishes_and_survives_later_capture_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = super::super::test_support::isolate_app_dir();
+        let (parent, tip) = init_repo_with_branch("detached-commit", "release");
+        let main = parent.path().join("detached-commit");
+        let repo = git2::Repository::open(&main).unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let source_path = repo.path().join("refs/remotes/origin/main");
+        let source_identity =
+            super::super::storage::filesystem_identity(&std::fs::metadata(&source_path).unwrap());
+        let marker = parent.path().join("hook-completed");
+        let hook = repo.path().join("hooks/post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_INDEX_FILE\ngit -C \"$PWD\" -c user.name=fixture -c user.email=fixture@example.com commit --allow-empty -m detached-hook >/dev/null || exit 91\nprintf complete > {}\n",
+            super::super::environment::shell_escape(&marker.to_string_lossy()))).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.path().join("checkout");
+        let git = GitWorktree::new(main.clone())
+            .unwrap()
+            .with_init_submodules(false);
+        let mut ownership = Some(super::super::storage::acquire_ownership_read().unwrap());
+        let (_, witness) = super::super::native_hooks::create_worktree(
+            &mut ownership,
+            None,
+            &git,
+            (&main, &path, "origin/main"),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let created = CreatedWorktree {
+            path: path.clone(),
+            main_repo_path: main.clone(),
+            owned_branch: None,
+            witness,
+        };
+        let mut instance = detached_candidate(&main, &path, "origin/main");
+        let publication =
+            CreationWitness::capture(&instance, std::iter::once(&created), None).unwrap();
+        publication.validate(&instance).unwrap();
+        let committed = git2::Repository::open(&path)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        assert_ne!(committed, tip);
+        assert_eq!(std::fs::read(marker).unwrap(), b"complete");
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert_eq!(
+            super::super::storage::filesystem_identity(&std::fs::metadata(source_path).unwrap()),
+            source_identity
+        );
+        instance.worktree_info.as_mut().unwrap().branch = "wrong-publication-ref".into();
+        assert!(CreationWitness::capture(&instance, std::iter::once(&created), None).is_err());
+        drop(ownership.take());
+        cleanup_creation_receipts(std::iter::once(&created), None);
+        assert!(
+            path.exists(),
+            "rollback removed a callback-created detached commit"
+        );
+        assert_eq!(
+            git2::Repository::open(&path)
+                .unwrap()
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id(),
+            committed
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_detached_capture_cleans_only_unclaimed_original_receipts() {
+        for change in ["pristine", "source-ref", "final-head", "foreign", "adopted"] {
+            let _home = super::super::test_support::isolate_app_dir();
+            let (parent, tip) = init_repo_with_branch("detached-cleanup", "release");
+            let main = parent.path().join("detached-cleanup");
+            let repo = git2::Repository::open(&main).unwrap();
+            repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+                .unwrap();
+            let path = parent.path().join("checkout");
+            let git = GitWorktree::new(main.clone())
+                .unwrap()
+                .with_init_submodules(false);
+            let mut ownership = Some(super::super::storage::acquire_ownership_read().unwrap());
+            let (_, witness) = super::super::native_hooks::create_worktree(
+                &mut ownership,
+                None,
+                &git,
+                (&main, &path, "origin/main"),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            let created = CreatedWorktree {
+                path: path.clone(),
+                main_repo_path: main.clone(),
+                owned_branch: None,
+                witness,
+            };
+            let mut instance = detached_candidate(&main, &path, "origin/main");
+            drop(ownership.take());
+            let mut replacement = None;
+            match change {
+                "source-ref" | "final-head" => {
+                    let reference = if change == "source-ref" {
+                        repo.path().join("refs/remotes/origin/main")
+                    } else {
+                        git2::Repository::open(&path).unwrap().path().join("HEAD")
+                    };
+                    let bytes = std::fs::read(&reference).unwrap();
+                    std::fs::rename(&reference, reference.with_extension("retired")).unwrap();
+                    std::fs::write(&reference, bytes).unwrap();
+                    let identity = super::super::storage::filesystem_identity(
+                        &std::fs::metadata(&reference).unwrap(),
+                    );
+                    replacement = Some((reference, identity));
+                }
+                "foreign" => {
+                    std::fs::rename(&path, path.with_extension("original")).unwrap();
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::write(path.join("sentinel"), b"foreign").unwrap();
+                }
+                "adopted" => {
+                    let peer = super::super::Storage::new_unwatched("adopter").unwrap();
+                    peer.update(|rows, _| {
+                        rows.push(Instance::new("adopter", &path.to_string_lossy()));
+                        Ok(())
+                    })
+                    .unwrap();
+                    instance.worktree_info.as_mut().unwrap().branch =
+                        "wrong-publication-ref".into();
+                }
+                "pristine" => {
+                    instance.worktree_info.as_mut().unwrap().branch = "wrong-publication-ref".into()
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                CreationWitness::capture(&instance, std::iter::once(&created), None).is_err(),
+                "{change}"
+            );
+            cleanup_creation_receipts(std::iter::once(&created), None);
+            assert_eq!(path.exists(), change != "pristine", "{change}");
+            assert_eq!(
+                repo.find_reference("refs/remotes/origin/main")
+                    .unwrap()
+                    .target(),
+                Some(tip)
+            );
+            if change == "foreign" {
+                assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"foreign");
+            }
+            if let Some((reference, identity)) = replacement {
+                assert_eq!(
+                    super::super::storage::filesystem_identity(
+                        &std::fs::metadata(reference).unwrap()
+                    ),
+                    identity,
+                    "{change}"
+                );
+            }
+            if matches!(change, "source-ref" | "final-head") {
+                assert_eq!(
+                    git2::Repository::open(&path)
+                        .unwrap()
+                        .head()
+                        .unwrap()
+                        .peel_to_commit()
+                        .unwrap()
+                        .id(),
+                    tip
+                );
+            }
+        }
     }
 }

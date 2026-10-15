@@ -255,6 +255,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
     let mut native_created = Vec::new();
+    let mut workspace_witness = None;
 
     let storage = Storage::new_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
@@ -385,6 +386,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             path = ws_result.workspace_path;
             workspace_info_opt = Some(ws_result.workspace_info);
             native_created = ws_result.created_worktrees;
+            workspace_witness = Some(ws_result.workspace_witness);
 
             for w in &ws_result.warnings {
                 eprintln!("⚠ {}", w);
@@ -467,7 +469,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 native_created.push(builder::CreatedWorktree {
                     path: worktree_path.clone(),
                     main_repo_path: main_repo_path.clone(),
-                    owned_branch: args.create_branch.then(|| branch.to_string()),
+                    owned_branch: (args.create_branch && !checkout.is_detached())
+                        .then(|| branch.to_string()),
                     witness: checkout,
                 });
 
@@ -506,10 +509,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let mut partial = Instance::new(&final_title, &path.to_string_lossy());
         partial.worktree_info = worktree_info_opt.clone();
         partial.workspace_info = workspace_info_opt.clone();
-        let mut witness = builder::CreationWitness::capture(&partial)?;
-        for created in &native_created {
-            witness.retain_created(created)?;
-        }
+        let witness = match builder::CreationWitness::capture(
+            &partial,
+            native_created.iter(),
+            workspace_witness.as_ref(),
+        ) {
+            Ok(witness) => witness,
+            Err(error) => {
+                drop(ownership.take());
+                builder::cleanup_creation_receipts(
+                    native_created.iter(),
+                    workspace_witness.as_ref(),
+                );
+                tracing::warn!(target: "cli.add", "Duplicate creation witness capture failed: {error:#}");
+                return Err(duplicate_session_error(&final_title));
+            }
+        };
         drop(ownership.take());
         cleanup_partial_session(
             &path,
@@ -774,10 +789,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    let mut witness = builder::CreationWitness::capture(&instance)?;
-    for created in &native_created {
-        witness.retain_created(created)?;
-    }
+    let witness = match builder::CreationWitness::capture(
+        &instance,
+        native_created.iter(),
+        workspace_witness.as_ref(),
+    ) {
+        Ok(witness) => witness,
+        Err(error) => {
+            drop(ownership.take());
+            builder::cleanup_creation_receipts(native_created.iter(), workspace_witness.as_ref());
+            return Err(error.context("Creation witness capture failed"));
+        }
+    };
     drop(ownership.take());
     let hook_result: Result<()> = (|| {
         let resolved_hooks: Option<repo_config::ResolvedHooks> = if args.scratch {

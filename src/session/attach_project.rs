@@ -1190,7 +1190,7 @@ pub fn attach_planned(
         !needs_restart(&plan, current.is_sandboxed()) || plan.reservation.is_some(),
         "attach conversion must reserve quiescence before filesystem effects"
     );
-    let witness = builder::CreationWitness::capture(&current)?;
+    let witness = builder::CreationWitness::capture(&current, std::iter::empty(), None)?;
     let reserved = plan.reservation.is_some();
     let mut owner = AttachOwner {
         storage,
@@ -1979,7 +1979,7 @@ exit 0
             ownership.as_ref().unwrap(),
             &instance.id,
         )?);
-        let witness = builder::CreationWitness::capture(instance)?;
+        let witness = builder::CreationWitness::capture(instance, std::iter::empty(), None)?;
         let reserved = plan.reservation.is_some();
         let mut quiesced = Quiesced::default();
         let mut owner = AttachOwner {

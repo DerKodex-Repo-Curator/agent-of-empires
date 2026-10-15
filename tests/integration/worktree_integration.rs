@@ -623,3 +623,193 @@ fn ordinary_cli_ignores_stale_native_context_under_renamed_and_symlink_names() {
         assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
     }
 }
+
+#[cfg(unix)]
+#[test]
+#[serial_test::parallel]
+fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::process::Command;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    for path in [&home, &xdg, &bin] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let repo_path = temp.path().join("repo");
+    let repo = git2::Repository::init(&repo_path).unwrap();
+    let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
+    let tree = repo.index().unwrap().write_tree().unwrap();
+    let tip = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+        .unwrap();
+    let source_path = repo.path().join("refs/remotes/origin/main");
+    let source = std::fs::metadata(&source_path).unwrap();
+    let hook = repo.path().join("hooks/post-checkout");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nprintf complete > \"$AOE_TEST_NATIVE_DETACHED_HOOK\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agent = bin.join("claude");
+    std::fs::write(
+        &agent,
+        "#!/bin/sh\nprintf denied > \"$AOE_TEST_NATIVE_AGENT_LOG\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let app = xdg.join(if cfg!(debug_assertions) {
+        "agent-of-empires-dev"
+    } else {
+        "agent-of-empires"
+    });
+    std::fs::create_dir_all(app.join("profiles/owner")).unwrap();
+    crate::common::disable_systemd_scopes(&app);
+    let marker = temp.path().join("hook-completed");
+    let agent_log = temp.path().join("agent-invocations");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let cli = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aoe"));
+        command
+            .args(["-p", "owner"])
+            .current_dir(temp.path())
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_TMUX_SOCKET", temp.path().join("tmux.sock"))
+            .env("AOE_TEST_NATIVE_DETACHED_HOOK", &marker)
+            .env("AOE_TEST_NATIVE_AGENT_LOG", &agent_log)
+            .env("PATH", &path)
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_PREFIX")
+            .env_remove("AOE_NATIVE_GIT_CONTEXT");
+        command
+    };
+    let mut command = cli();
+    command.arg("add").arg(&repo_path).args([
+        "--title",
+        "detached-publication",
+        "--worktree",
+        "origin/main",
+        "--cmd",
+        "claude",
+        "--trust-hooks",
+        "--no-submodules",
+    ]);
+    let output = agent_of_empires::process::run_with_timeout_process_group(
+        &mut command,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .expect("detached CLI creation exceeded its deadline");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"complete");
+    assert!(!agent_log.exists());
+    let rows: Vec<Instance> =
+        serde_json::from_slice(&std::fs::read(app.join("profiles/owner/sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    let info = rows[0].worktree_info.as_ref().unwrap();
+    assert_eq!(info.branch, "origin/main");
+    assert!(info.managed_by_aoe);
+    let checkout = git2::Repository::open(&rows[0].project_path).unwrap();
+    assert!(checkout.head_detached().unwrap());
+    assert_eq!(checkout.head().unwrap().peel_to_commit().unwrap().id(), tip);
+    assert!(checkout.path().join("locked").is_file());
+    assert!(GitWorktree::new(repo_path)
+        .unwrap()
+        .list_worktrees()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.is_detached
+            && entry.path.canonicalize().ok()
+                == std::path::Path::new(&rows[0].project_path)
+                    .canonicalize()
+                    .ok()));
+    assert!(repo.find_reference("refs/heads/origin/main").is_err());
+    assert_eq!(
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    let after = std::fs::metadata(&source_path).unwrap();
+    assert_eq!((after.dev(), after.ino()), (source.dev(), source.ino()));
+    repo.reference(
+        "refs/heads/origin/main",
+        tip,
+        true,
+        "later independent local branch",
+    )
+    .unwrap();
+    let local_path = repo.path().join("refs/heads/origin/main");
+    let local = std::fs::metadata(&local_path).unwrap();
+    let mut remove = cli();
+    remove.args([
+        "remove",
+        rows[0].id.as_str(),
+        "--delete-worktree",
+        "--delete-branch",
+        "--purge",
+    ]);
+    let removed = agent_of_empires::process::run_with_timeout_process_group(
+        &mut remove,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+    .expect("detached CLI deletion exceeded its deadline");
+    assert!(
+        removed.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&removed.stdout),
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!std::path::Path::new(&rows[0].project_path).exists());
+    let remaining: Vec<Instance> =
+        serde_json::from_slice(&std::fs::read(app.join("profiles/owner/sessions.json")).unwrap())
+            .unwrap();
+    assert!(remaining.is_empty());
+    assert_eq!(
+        repo.find_reference("refs/heads/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    let after_local = std::fs::metadata(local_path).unwrap();
+    assert_eq!(
+        (after_local.dev(), after_local.ino()),
+        (local.dev(), local.ino())
+    );
+    assert_eq!(
+        repo.find_reference("refs/remotes/origin/main")
+            .unwrap()
+            .target(),
+        Some(tip)
+    );
+    let after_source = std::fs::metadata(source_path).unwrap();
+    assert_eq!(
+        (after_source.dev(), after_source.ino()),
+        (source.dev(), source.ino())
+    );
+    assert!(!agent_log.exists());
+}

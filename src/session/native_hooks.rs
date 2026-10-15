@@ -172,7 +172,7 @@ impl ClaimSnapshot {
         root: &OwnershipGuard,
         main_repo: &Path,
         target: &Path,
-        branch: &str,
+        branch: Option<&str>,
         provisional: Option<&ProvisionalCreation>,
     ) -> Result<()> {
         verify_claims(root, &self.claims, main_repo, target, branch, provisional)
@@ -184,14 +184,17 @@ fn verify_claims(
     baseline: &HashSet<Claim>,
     main_repo: &Path,
     target: &Path,
-    branch: &str,
+    branch: Option<&str>,
     provisional: Option<&ProvisionalCreation>,
 ) -> Result<()> {
     let (claims, _pins) = inventory(root, provisional)?;
     let target =
         super::deletion::resolve_claim_path(target).context("unresolved native checkout")?;
-    let main_repo =
-        super::deletion::resolve_claim_path(main_repo).context("unresolved native repository")?;
+    let main_repo = branch
+        .map(|_| {
+            super::deletion::resolve_claim_path(main_repo).context("unresolved native repository")
+        })
+        .transpose()?;
     for claim in claims.difference(baseline) {
         anyhow::ensure!(
             !(claim.path.starts_with(&target)
@@ -199,7 +202,8 @@ fn verify_claims(
                 && !claim
                     .branch
                     .as_ref()
-                    .is_some_and(|(repo, name)| repo == &main_repo && name == branch),
+                    .is_some_and(|(repo, name)| main_repo.as_ref() == Some(repo)
+                        && branch == Some(name.as_str())),
             "Checkout was adopted during a native Git callback; canceling operation"
         );
     }
@@ -214,14 +218,23 @@ enum EntryPin {
     },
 }
 
-struct PathSnapshot {
+pub(crate) struct PathSnapshot {
     path: PathBuf,
     resolved: PathBuf,
     pin: Option<EntryPin>,
 }
 
+impl std::fmt::Debug for PathSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PathSnapshot")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PathSnapshot {
-    fn capture(path: PathBuf) -> Result<Self> {
+    pub(crate) fn capture(path: PathBuf) -> Result<Self> {
         let resolved = super::deletion::resolve_claim_path(&path)
             .context("unresolved native checkout path")?;
         let pin = match std::fs::symlink_metadata(&path) {
@@ -248,7 +261,7 @@ impl PathSnapshot {
         })
     }
 
-    fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         anyhow::ensure!(
             super::deletion::resolve_claim_path(&self.path).as_ref() == Some(&self.resolved),
             "Native checkout path was redirected during a callback"
@@ -377,6 +390,8 @@ impl<'a> BranchHandoff<'a> {
 pub(crate) struct BranchOrigin {
     repo: PathBuf,
     branch: String,
+    reference: String,
+    routes: Vec<PathSnapshot>,
     tip: git2::Oid,
     loose: PathSnapshot,
     packed: PathSnapshot,
@@ -407,19 +422,87 @@ impl BranchOrigin {
     pub(crate) fn capture(repo: &Path, branch: &str) -> Result<Self> {
         let source = git2::Repository::open(repo)?;
         let reference = source.find_reference(&format!("refs/heads/{branch}"))?;
-        let tip = reference
-            .target()
-            .context("branch is not a direct reference")?;
+        Self::from_reference(repo, &source, branch, &reference)
+    }
+
+    fn reference_path(repo: &git2::Repository, name: &str) -> PathBuf {
+        if name.starts_with("refs/") {
+            repo.commondir().join(name)
+        } else {
+            repo.path().join(name)
+        }
+    }
+
+    fn from_reference(
+        path: &Path,
+        repo: &git2::Repository,
+        branch: &str,
+        reference: &git2::Reference<'_>,
+    ) -> Result<Self> {
+        let name = reference
+            .name()
+            .context("source reference name is not UTF-8")?;
         Ok(Self {
-            repo: repo.to_path_buf(),
+            repo: path.to_path_buf(),
             branch: branch.to_owned(),
-            tip,
-            loose: PathSnapshot::capture(source.commondir().join(format!("refs/heads/{branch}")))?,
-            packed: PathSnapshot::capture(source.commondir().join("packed-refs"))?,
-            git: DirectoryWitness::capture(source.path())?,
-            common: DirectoryWitness::capture(source.commondir())?,
-            directory: DirectoryWitness::capture(repo)?,
+            reference: name.to_owned(),
+            routes: Vec::new(),
+            tip: reference
+                .target()
+                .context("source is not a direct reference")?,
+            loose: PathSnapshot::capture(Self::reference_path(repo, name))?,
+            packed: PathSnapshot::capture(repo.commondir().join("packed-refs"))?,
+            git: DirectoryWitness::capture(repo.path())?,
+            common: DirectoryWitness::capture(repo.commondir())?,
+            directory: DirectoryWitness::capture(path)?,
         })
+    }
+
+    fn capture_source(
+        path: &Path,
+        repo: &git2::Repository,
+        requested: &str,
+        resolved: (git2::Object<'_>, Option<git2::Reference<'_>>),
+    ) -> Result<(git2::Oid, Option<std::sync::Arc<Self>>)> {
+        let (object, reference) = resolved;
+        let tip = object.peel_to_commit()?.id();
+        let origin = if let Some(mut reference) = reference {
+            let mut routes = Vec::new();
+            let mut visited = HashSet::new();
+            while let Some(target) = reference.symbolic_target()? {
+                let name = reference
+                    .name()
+                    .context("source reference name is not UTF-8")?;
+                anyhow::ensure!(visited.insert(name.to_owned()), "cyclic source reference");
+                routes.push(PathSnapshot::capture(Self::reference_path(repo, name))?);
+                let next = repo.find_reference(target)?;
+                reference = next;
+            }
+            let mut origin = Self::from_reference(path, repo, requested, &reference)?;
+            origin.routes = routes;
+            origin.verify_source()?;
+            Some(std::sync::Arc::new(origin))
+        } else {
+            None
+        };
+        Ok((tip, origin))
+    }
+
+    pub(crate) fn verify_source(&self) -> Result<()> {
+        let repo = git2::Repository::open(&self.repo)?;
+        self.directory.verify()?;
+        self.git.verify_at(repo.path())?;
+        self.common.verify_at(repo.commondir())?;
+        anyhow::ensure!(
+            repo.find_reference(&self.reference)?.target() == Some(self.tip),
+            "Detached checkout source changed during native Git"
+        );
+        for route in &self.routes {
+            route.verify()?;
+        }
+        self.loose.verify()?;
+        self.packed.verify()?;
+        Ok(())
     }
 
     pub(crate) fn verify(&self, destination: Option<&str>) -> Result<()> {
@@ -600,7 +683,7 @@ impl<'a> BranchLease<'a> {
             &self.claims,
             &self.origin.repo,
             self.path,
-            &self.origin.branch,
+            Some(&self.origin.branch),
             None,
         )?;
         if let Some(destination) = self.destination {
@@ -609,7 +692,7 @@ impl<'a> BranchLease<'a> {
                 &self.claims,
                 &self.origin.repo,
                 self.path,
-                destination,
+                Some(destination),
                 None,
             )?;
         }
@@ -619,7 +702,7 @@ impl<'a> BranchLease<'a> {
                 &self.claims,
                 &self.origin.repo,
                 path,
-                self.destination.unwrap_or(&self.origin.branch),
+                Some(self.destination.unwrap_or(&self.origin.branch)),
                 None,
             )?;
         }
@@ -783,6 +866,7 @@ pub(crate) struct NativeLease<'a> {
     branch: String,
     detached: bool,
     original_tip: Option<git2::Oid>,
+    detached_source: Option<std::sync::Arc<BranchOrigin>>,
     owned_branch_origin: Option<std::sync::Arc<BranchOrigin>>,
     boundary: Option<CheckoutBoundary>,
     child_boundaries: Vec<(String, CheckoutBoundary)>,
@@ -853,6 +937,7 @@ impl<'a> NativeLease<'a> {
             branch: branch.to_owned(),
             detached: false,
             original_tip: None,
+            detached_source: None,
             owned_branch_origin: None,
             boundary: None,
             child_boundaries: Vec::new(),
@@ -870,6 +955,7 @@ impl<'a> NativeLease<'a> {
                 &self.branch,
                 self.detached,
                 self.original_tip,
+                self.detached_source.clone(),
             )?;
             candidate.record_created_branch(self.owned_branch_origin.clone());
             self.verify()?;
@@ -892,6 +978,9 @@ impl<'a> NativeLease<'a> {
         if let Some(profile) = self.profile {
             profile.verify_profile_identity()?;
         }
+        if let Some(source) = &self.detached_source {
+            source.verify_source()?;
+        }
         if let Some(checkout) = &self.checkout {
             checkout.verify()?;
         }
@@ -907,7 +996,7 @@ impl<'a> NativeLease<'a> {
             &self.claims,
             &self.main_repo,
             &self.path,
-            &self.branch,
+            (!self.detached).then_some(self.branch.as_str()),
             self.provisional,
         )
     }
@@ -924,6 +1013,10 @@ impl<'a> NativeLease<'a> {
             git.create_worktree_with_hooks(&branch, &path, create_branch, base, Some(self))?;
         self.pin_checkout()?;
         self.verify()?;
+        self.checkout
+            .as_mut()
+            .context("native checkout witness missing")?
+            .finalize()?;
         Ok((
             warnings,
             self.checkout
@@ -940,7 +1033,7 @@ impl<'a> NativeLease<'a> {
         self.checkout.clone().map(|witness| CreatedWorktree {
             path: self.path.clone(),
             main_repo_path: self.main_repo.clone(),
-            owned_branch: create_branch.then(|| self.branch.clone()),
+            owned_branch: (create_branch && !witness.is_detached()).then(|| self.branch.clone()),
             witness,
         })
     }
@@ -957,27 +1050,33 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
     }
 
     fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()> {
-        let prepare = || -> Result<(bool, Option<git2::Oid>)> {
+        let prepare = || -> Result<(bool, Option<git2::Oid>, Option<std::sync::Arc<BranchOrigin>>)> {
             self.verify()?;
             let repo = git2::Repository::open(&self.main_repo)?;
             let local = repo.find_branch(&self.branch, git2::BranchType::Local).ok();
-            let detached = local.is_none() && repo.revparse_single(&self.branch).is_ok();
-            let tip = if detached {
-                Some(repo.revparse_single(&self.branch)?.peel_to_commit()?.id())
-            } else if owned_branch {
-                Some(
-                    local
-                        .context("native checkout branch is missing")?
-                        .get()
-                        .target()
-                        .context("native checkout branch has no target")?,
-                )
+            if local.is_none() {
+                let resolution = repo.revparse_ext(&self.branch);
+                match resolution {
+                    Ok(resolved) => {
+                        let (tip, source) =
+                            BranchOrigin::capture_source(&self.main_repo, &repo, &self.branch, resolved)?;
+                        Ok((true, Some(tip), source))
+                    }
+                    Err(error) if !owned_branch && error.code() == git2::ErrorCode::NotFound => {
+                        // Existing admission permits remote suffixes that Git DWIMs to a local branch.
+                        Ok((false, None, None))
+                    }
+                    Err(error) => Err(error.into()),
+                }
             } else {
-                None
-            };
-            Ok((detached, tip))
+                let tip = if owned_branch {
+                    Some(local.context("native checkout branch is missing")?.get().target()
+                        .context("native checkout branch has no target")?)
+                } else { None };
+                Ok((false, tip, None))
+            }
         };
-        (self.detached, self.original_tip) =
+        (self.detached, self.original_tip, self.detached_source) =
             prepare().map_err(|error| io::Error::other(format!("{error:#}")))?;
         self.owned_branch_origin = owned_branch
             .then(|| BranchOrigin::capture(&self.main_repo, &self.branch).map(std::sync::Arc::new))
@@ -1671,5 +1770,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn detached_native_claims_ignore_local_label_aliases_but_refuse_path_adoption() {
+        use crate::git::native_hooks::HookLease;
+        use crate::session::{Instance, Storage, WorktreeInfo};
+        let fixture = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&fixture.path().join("home"));
+        let peer = Storage::new_unwatched("peer").unwrap();
+        let main = fixture.path().join("repo");
+        let repo = git2::Repository::init(&main).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
+        let tip = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "fixture",
+                &repo.find_tree(tree_id).unwrap(),
+                &[],
+            )
+            .unwrap();
+        repo.reference("refs/remotes/origin/main", tip, true, "fixture")
+            .unwrap();
+        let target = fixture.path().join("detached-target");
+        let peer_path = fixture.path().join("attached-peer");
+        let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+        let mut lease = super::NativeLease::new(
+            &mut ownership,
+            false,
+            None,
+            None,
+            (&main, &target, "origin/main"),
+            None,
+        )
+        .unwrap();
+        lease.prepare_checkout(false).unwrap();
+        drop(lease.ownership.take());
+        repo.reference(
+            "refs/heads/origin/main",
+            tip,
+            true,
+            "independent local branch",
+        )
+        .unwrap();
+        crate::git::GitWorktree::new(main.clone())
+            .unwrap()
+            .with_init_submodules(false)
+            .create_worktree("origin/main", &peer_path, false, None)
+            .unwrap();
+        let mut adopted = Instance::new("peer", &peer_path.to_string_lossy());
+        adopted.worktree_info = Some(WorktreeInfo {
+            branch: "origin/main".into(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        peer.update(|rows, _| {
+            rows.push(adopted);
+            Ok(())
+        })
+        .unwrap();
+        *lease.ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+        lease.verify().unwrap();
+        drop(lease.ownership.take());
+        peer.update(|rows, _| {
+            rows[0].project_path = target.to_string_lossy().into_owned();
+            Ok(())
+        })
+        .unwrap();
+        *lease.ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+        assert!(
+            lease.verify().is_err(),
+            "detached mode must retain target-path adoption checks"
+        );
+        assert_eq!(
+            repo.find_reference("refs/remotes/origin/main")
+                .unwrap()
+                .target(),
+            Some(tip)
+        );
+        assert!(peer_path.exists());
+        assert!(!target.exists());
     }
 }

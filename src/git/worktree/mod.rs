@@ -260,10 +260,14 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
+            let registered = git2::Repository::open(repo.commondir().join("worktrees").join(name))?;
             entries.push(WorktreeEntry {
-                branch: Self::get_current_branch(&path).ok(),
+                branch: registered
+                    .head()
+                    .and_then(|head| head.shorthand().map(str::to_owned))
+                    .ok(),
                 path,
-                is_detached: false,
+                is_detached: registered.head_detached()?,
             });
         }
         Ok(entries)

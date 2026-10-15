@@ -748,7 +748,12 @@ mod tests {
             let mut instance =
                 crate::session::Instance::new("original", &project.to_string_lossy());
             instance.source_profile = "test".into();
-            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            let witness = crate::session::builder::CreationWitness::capture(
+                &instance,
+                std::iter::empty(),
+                None,
+            )
+            .unwrap();
             let birth = (instance.created_at, instance.lifecycle_generation);
             storage
                 .update(|rows, _| {
@@ -1058,7 +1063,12 @@ mod tests {
             let mut instance =
                 crate::session::Instance::new("original", &project.path().to_string_lossy());
             instance.source_profile = "test".into();
-            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            let witness = crate::session::builder::CreationWitness::capture(
+                &instance,
+                std::iter::empty(),
+                None,
+            )
+            .unwrap();
             storage
                 .update(|rows, _| {
                     rows.push(instance.clone());
@@ -1150,7 +1160,12 @@ mod tests {
                 instance.session_id_poller =
                     Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
             }
-            let witness = crate::session::builder::CreationWitness::capture(&instance).unwrap();
+            let witness = crate::session::builder::CreationWitness::capture(
+                &instance,
+                std::iter::empty(),
+                None,
+            )
+            .unwrap();
             storage
                 .update(|rows, _| {
                     rows.push(instance.clone());

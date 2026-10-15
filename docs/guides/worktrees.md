@@ -1,6 +1,6 @@
 # Worktrees Reference
 
-A worktree session gets its own branch and checkout, created when the session is created and cleaned up when it is deleted.
+A worktree session gets a separate checkout, created when the session is created and cleaned up when it is deleted.
 
 ## Creating one
 
@@ -15,6 +15,8 @@ aoe remove <session> [--delete-worktree]
 ```
 
 `-b` is what switches between creating a branch and attaching to an existing one. `--base-branch` only matters with `-b`, and is resolved against the remotes first, then a local branch, so a teammate's not-yet-fetched branch works without a manual `git fetch`. Remote selection scores every configured remote, not just `origin`: in a fork plus `upstream` layout where `upstream/main` is ahead, aoe fetches and branches from there even when you typed `main`. Ties break toward `origin`. Without `--base-branch`, the branch starts from the repo's default.
+
+Without `-b`, selecting an explicit remote-tracking ref such as `origin/main` can leave the checkout detached instead of creating a local branch. The session keeps the requested ref label; commits in that checkout do not advance the remote-tracking ref. An unqualified remote branch name can instead create and attach a local tracking branch, following Git's branch guessing.
 
 In the TUI, enable the Worktree checkbox in the new-session dialog (`n`); the directory is derived from the session title. `Ctrl+P` on the Worktree field sets an explicit name, attaches to an existing branch, picks a base branch, or configures extra repos, and `Ctrl+P` on the Base field opens a branch picker over local and remote-tracking branches. The web wizard's **Worktree** row opens the same controls, with a base-branch typeahead and an **Attach to existing branch** toggle.
 
@@ -49,7 +51,9 @@ Renaming moves the checkout with `git worktree move`, keeping its parent directo
 
 aoe records a worktree's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch, shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. If exactly one live worktree checks out the branch, the path is rewritten; if two do, aoe leaves it alone rather than guessing. Reconciliation is point-in-time, so a directory moved while a process is already running stays stale until it restarts.
 
-Two caveats: aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first, and a plain `mv` is not recoverable on its own, because git's record still names the old path. Run `git worktree repair <new-path>` and aoe will find it.
+Detached checkouts have no branch identity for this repair. Move them through aoe rather than relying on branch-based reconciliation after an external move.
+
+Two caveats: aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first, and a plain `mv` is not recoverable on its own, because git's record still names the old path. For a checkout on a branch, run `git worktree repair <new-path>` so aoe can find it.
 
 ## Configuration
 
