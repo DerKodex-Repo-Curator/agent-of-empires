@@ -313,7 +313,7 @@ id = "my_pane"
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
-| `page` | global | A full dashboard view rendered from a plugin HTML file, not from pushed state (requires `api_version >= 16`). See [Pages](#pages). |
+| `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
 
 ### Pages
@@ -330,6 +330,10 @@ entry = "dist/board.html"
 A page `id` uses only letters, digits, `-` and `_`, and is unique among the plugin's pages. `entry` follows the [screenshot path rules](#screenshots) with an `.html` extension and must resolve inside the plugin directory. A plugin may declare several pages.
 
 The entry must be one self-contained file: inline every script and style, and embed images as `data:` or `blob:` URLs. The host serves only that file, at `GET /api/plugins/{id}/pages/{page_id}` for an active plugin, uncached. Its policy sandboxes the document (`sandbox allow-scripts`), so it gets an opaque origin even when the URL is opened directly, runs the inline script and style and `data:`/`blob:` images, and blocks every other resource load, connection and form submission. As a second layer, the URL serves only a frame load (`Sec-Fetch-Dest: iframe`) with no query string, and only the dashboard may frame it.
+
+The dashboard opens a page at `/plugins/{id}/{page_id}` in an iframe with `sandbox="allow-scripts"` and nothing else. The page cannot read dashboard storage or cookies, call the API, submit forms, open windows or navigate the dashboard; its only data path is the bridge. A page that reloads itself more than 60 seconds after opening loses its authentication when device binding is on; reopen it from the dashboard instead.
+
+A worker may push state for a page with `ui.state.set` (`slot = "page"`, `id` = the page id, no `session_id`). The payload is any JSON object up to 64 KiB, stored unvalidated; `ui.state.remove` clears it. It appears in `GET /api/plugins/ui-state` as a global entry, `{ "plugin_id", "slot": "page", "id", "payload" }`. The page itself cannot read it yet; frame access arrives with the bridge (#4461).
 
 ### Badge payload
 
