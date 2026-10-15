@@ -868,6 +868,13 @@
       ]
     },
     {
+      "id": "app-shell.topbar-header-start",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/TopBar.test.tsx", "src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/TopBar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
@@ -1839,6 +1846,19 @@
       "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
     },
     {
+      "id": "plugins.pages",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-pages.spec.ts"],
+      "components": [
+        "web/src/components/plugin/PluginPagesMenu.tsx",
+        "web/src/components/plugin/PluginPageView.tsx",
+        "web/src/components/TopBar.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "Pages menu and palette entries appear only with a declared page; the route hides the sidebar, mints a page ticket before framing, and Back pops history. A fixture page served under the daemon's page CSP proves the sandboxed frame cannot read storage, cookies or call the API. Mint ordering and empty states are also unit-tested in PluginPageView.test.tsx; the ticket's server side in src/server/api/plugins.rs."
+    },
+    {
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -2245,10 +2265,12 @@
         "src/lib/acpHistoryWindow.test.ts",
         "src/hooks/__tests__/useHistoryWindow.test.tsx",
         "src/lib/historyScroll.test.ts",
-        "src/hooks/useAcpSession.test.ts"
+        "src/hooks/useAcpSession.test.ts",
+        "src/hooks/acpSession/replay.test.ts"
       ],
       "components": [
         "web/src/lib/acpHistoryWindow.ts",
+        "web/src/hooks/acpSession/replay.ts",
         "web/src/lib/historyScroll.ts",
         "web/src/hooks/useHistoryWindow.ts",
         "web/src/hooks/useAcpSession.ts",
