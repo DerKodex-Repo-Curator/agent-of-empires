@@ -508,37 +508,37 @@ impl SessionService {
             }
             (inst.source_profile.clone(), wake, was_idle_dormant)
         };
-        if let Ok(storage) = crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            let id_clone = id.to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(None);
-                    };
-                    // A peer (e.g. the CLI) may have archived or trashed the row since the
-                    // memory check; waking it here would clear that.
-                    if let Err(blocked) = inst.ensure_startable() {
-                        return Ok(Some(blocked));
-                    }
-                    apply_prompt_persist_to_disk(inst, wake);
-                    Ok(None)
-                })
+        let file_watch = self.file_watch.clone();
+        let id_clone = id.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let storage = crate::session::Storage::new(&profile, file_watch)?;
+            storage.update(|instances, _groups| {
+                let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                    return Ok(None);
+                };
+                // A peer (e.g. the CLI) may have archived or trashed the row since the
+                // memory check; waking it here would clear that.
+                if let Err(blocked) = inst.ensure_startable() {
+                    return Ok(Some(blocked));
+                }
+                apply_prompt_persist_to_disk(inst, wake);
+                Ok(None)
             })
-            .await;
-            match outcome {
-                Ok(Ok(None)) => {}
-                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
-                Ok(Err(e)) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "failed to save after prompt touch and wake: {e}"
-                ),
-                Err(join_err) => tracing::warn!(
-                    target: "server.session_service",
-                    session = %id,
-                    "spawn_blocking join error during prompt touch save: {join_err}"
-                ),
-            }
+        })
+        .await;
+        match outcome {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
+            Ok(Err(e)) => tracing::warn!(
+                target: "server.session_service",
+                session = %id,
+                "failed to save after prompt touch and wake: {e}"
+            ),
+            Err(join_err) => tracing::warn!(
+                target: "server.session_service",
+                session = %id,
+                "spawn_blocking join error during prompt touch save: {join_err}"
+            ),
         }
         PromptTouch::Touched {
             idle_dormant: woke_idle_dormant,

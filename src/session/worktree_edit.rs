@@ -379,36 +379,6 @@ fn rename_branch_effect(
     }
 }
 
-pub(crate) fn rename_worktree_branch_with_ownership(
-    ownership: &super::storage::OwnershipGuard,
-    nested: &[&super::storage::StorageFlock],
-    profile: &str,
-    id: &str,
-    info: &WorktreeInfo,
-    path: &Path,
-    branch: &str,
-) -> anyhow::Result<bool> {
-    rename_worktree_branch_inner(info, path, branch, Some((ownership, nested, profile, id)))
-}
-
-fn rename_worktree_branch_inner(
-    info: &WorktreeInfo,
-    path: &Path,
-    branch: &str,
-    ownership: Option<(
-        &super::storage::OwnershipGuard,
-        &[&super::storage::StorageFlock],
-        &str,
-        &str,
-    )>,
-) -> anyhow::Result<bool> {
-    let Some(git) = prepare_worktree_branch_rename(info, path, branch)? else {
-        return Ok(false);
-    };
-    rename_branch_effect(&git, path, &info.branch, branch, None, ownership)?;
-    Ok(true)
-}
-
 pub(crate) fn prepare_worktree_branch_rename(
     info: &WorktreeInfo,
     path: &Path,
@@ -472,43 +442,12 @@ pub fn rollback_worktree_branch(
     path: &Path,
     renamed_branch: &str,
 ) -> anyhow::Result<()> {
-    rollback_worktree_branch_inner(info, path, renamed_branch, None)
-}
-
-pub(crate) fn rollback_worktree_branch_with_ownership(
-    ownership: &super::storage::OwnershipGuard,
-    nested: &[&super::storage::StorageFlock],
-    profile: &str,
-    id: &str,
-    info: &WorktreeInfo,
-    path: &Path,
-    renamed_branch: &str,
-) -> anyhow::Result<()> {
-    rollback_worktree_branch_inner(
-        info,
-        path,
-        renamed_branch,
-        Some((ownership, nested, profile, id)),
-    )
-}
-
-fn rollback_worktree_branch_inner(
-    info: &WorktreeInfo,
-    path: &Path,
-    renamed_branch: &str,
-    ownership: Option<(
-        &super::storage::OwnershipGuard,
-        &[&super::storage::StorageFlock],
-        &str,
-        &str,
-    )>,
-) -> anyhow::Result<()> {
     anyhow::ensure!(
         GitWorktree::get_current_branch(path)? == renamed_branch,
         "Worktree branch changed concurrently; refusing branch rollback"
     );
     let git = GitWorktree::new(PathBuf::from(&info.main_repo_path))?;
-    rename_branch_effect(&git, path, renamed_branch, &info.branch, None, ownership)?;
+    rename_branch_effect(&git, path, renamed_branch, &info.branch, None, None)?;
     Ok(())
 }
 

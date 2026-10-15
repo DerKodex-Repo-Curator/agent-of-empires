@@ -655,6 +655,29 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
+static ROOT_CONTENTION_OBSERVER: parking_lot::Mutex<
+    Option<(PathBuf, std::sync::mpsc::Sender<PathBuf>)>,
+> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn observe_root_contention_for_test(
+    sender: std::sync::mpsc::Sender<PathBuf>,
+) -> impl Drop {
+    struct Observer;
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            ROOT_CONTENTION_OBSERVER.lock().take();
+        }
+    }
+    let path = get_app_dir().unwrap().join(".workspace-claim.lock");
+    assert!(ROOT_CONTENTION_OBSERVER
+        .lock()
+        .replace((path, sender))
+        .is_none());
+    Observer
+}
+
+#[cfg(test)]
 type UpdateObserver = Box<dyn FnMut(&Storage)>;
 
 #[cfg(test)]
@@ -697,6 +720,14 @@ fn report_lock_contention_for_test(path: &Path) {
             let _ = sender.send(path.to_path_buf());
         }
     });
+    let mut observer = ROOT_CONTENTION_OBSERVER.lock();
+    if observer
+        .as_ref()
+        .is_some_and(|(expected, _)| expected == path)
+    {
+        let (_, sender) = observer.take().unwrap();
+        let _ = sender.send(path.to_path_buf());
+    }
 }
 
 fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
@@ -1017,8 +1048,10 @@ fn record_move_journal(
     source: &Storage,
     target: &Storage,
     ids: &std::collections::HashSet<&str>,
+    source_instances: &[Instance],
+    moved: &[Instance],
     plan: &MoveTransactionPlan<'_>,
-) -> Result<PathBuf> {
+) -> Result<super::move_journal::JournalTransaction> {
     let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
     ids.sort();
     let entry = super::move_journal::MoveJournalEntry {
@@ -1035,8 +1068,26 @@ fn record_move_journal(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default(),
+        authority: super::move_journal::MoveAuthority::Metadata {
+            source: super::move_journal::ProfileAuthority::capture(source)?,
+            target: super::move_journal::ProfileAuthority::capture(target)?,
+            rows: moved
+                .iter()
+                .map(|after| -> Result<_> {
+                    let before = source_instances
+                        .iter()
+                        .find(|row| row.id == after.id)
+                        .context("move journal source incarnation disappeared")?;
+                    Ok(super::move_journal::RowDelta {
+                        before: before.clone(),
+                        after: after.clone(),
+                    })
+                })
+                .collect::<Result<_>>()?,
+        },
+        live_lock_identity: None,
     };
-    super::move_journal::record(&entry, &source.sessions_path)
+    super::move_journal::record_live(&entry)
         .context("recording the durable move journal failed; no move effect or profile row changed")
 }
 
@@ -1193,6 +1244,84 @@ impl Storage {
             #[cfg(test)]
             fail_writes_for_test: false,
         })
+    }
+
+    /// Run explicitly before resolving command or daemon session snapshots.
+    pub fn recover_pending_moves(file_watch: Arc<FileWatchService>) -> Result<Vec<String>> {
+        // An active callback may invoke an annotation command. Do not inventory
+        // unrelated profiles, or wait on its own producer, when nothing can recover.
+        let pending = super::move_journal::scan();
+        let mut needs_recovery = false;
+        let mut notices = Vec::new();
+        for (path, reason) in pending.unreadable_dirs {
+            notices.push(format!(
+                "Move intent directory {} is unreadable: {reason}",
+                path.display()
+            ));
+        }
+        for (path, parsed) in pending.entries {
+            match parsed {
+                Ok(entry) => {
+                    if let super::move_journal::MoveAuthority::LegacyConflict { reason, .. } =
+                        &entry.authority
+                    {
+                        notices.push(format!(
+                            "Move intent conflict at {}: {reason}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                    match super::move_journal::try_recovery_lease(&path, &entry) {
+                        Ok(Some(_lease)) => needs_recovery = true,
+                        Ok(None) => {}
+                        Err(error) => notices.push(format!(
+                            "Move intent conflict at {}: {error:#}",
+                            path.display()
+                        )),
+                    }
+                }
+                Err(reason) => notices.push(format!(
+                    "Move intent conflict at {}: {reason}",
+                    path.display()
+                )),
+            }
+        }
+        if !needs_recovery {
+            return Ok(notices);
+        }
+        let (names, storages, loaded) = {
+            let ownership = acquire_ownership_read()?;
+            let names = super::list_profiles_for_worktree_inventory()?;
+            let storages = names
+                .iter()
+                .map(|profile| {
+                    Self::open_with_ownership(profile, Arc::clone(&file_watch), &ownership)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let loaded = storages
+                .iter()
+                .map(Self::load_strict_for_worktree_ownership)
+                .collect::<Result<Vec<_>>>()?;
+            (names, storages, loaded)
+        };
+        let loads_view: Vec<_> = names
+            .iter()
+            .zip(&loaded)
+            .map(|(name, rows)| (name.as_str(), rows.as_slice()))
+            .collect();
+        let stores_view: Vec<_> = names
+            .iter()
+            .zip(&storages)
+            .map(|(name, store)| (name.as_str(), store))
+            .collect();
+        let outcome = reconcile_profile_duplicates(&loads_view, &stores_view);
+        let mut conflicts: Vec<_> = outcome
+            .reports
+            .iter()
+            .map(DuplicateIdReport::actionable_message)
+            .collect();
+        conflicts.extend(outcome.conflicts);
+        Ok(conflicts)
     }
 
     /// [`Storage::open`] wired to a noop `FileWatchService`.
@@ -1524,13 +1653,13 @@ impl Storage {
         change: (&Instance, &Instance),
         account_swap: bool,
         mut validate_target: F,
-        effect: (bool, B),
+        effect: (bool, B, Option<&super::move_journal::JournalTransaction>),
     ) -> Result<Instance>
     where
         F: FnMut(&[Instance], &Instance) -> Result<()>,
         B: FnOnce(&Instance) -> Result<()>,
     {
-        let (native_handoff, before_commit) = effect;
+        let (native_handoff, before_commit, journal) = effect;
         let (before, after) = change;
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
@@ -1547,6 +1676,7 @@ impl Storage {
                 |instances, candidates| validate_target(instances, &candidates[0]),
                 |candidates| before_commit(&candidates[0]),
                 native_handoff,
+                journal,
             ),
             sync_resolved_parent_directory,
         )?;
@@ -1598,7 +1728,7 @@ impl Storage {
             target,
             changes,
             plan,
-            (validate_target, before_commit, false),
+            (validate_target, before_commit, false, None),
             sync_target_parent,
         )
     }
@@ -1609,7 +1739,7 @@ impl Storage {
         target: &Storage,
         changes: &[(Instance, Instance)],
         plan: MoveTransactionPlan<'_>,
-        callbacks: (F, B, bool),
+        callbacks: (F, B, bool, Option<&super::move_journal::JournalTransaction>),
         mut sync_target_parent: S,
     ) -> Result<Vec<Instance>>
     where
@@ -1618,7 +1748,7 @@ impl Storage {
         S: FnMut(&Path) -> Result<()>,
     {
         ownership.verify()?;
-        let (mut validate_target, before_commit, mut native_handoff) = callbacks;
+        let (mut validate_target, before_commit, mut native_handoff, existing_journal) = callbacks;
         let mut before_commit = Some(before_commit);
         let mut prepared_journal = None;
         if native_handoff {
@@ -1769,7 +1899,16 @@ impl Storage {
             validate_target(&target_instances, &moved)?;
 
             if native_handoff {
-                prepared_journal = Some(record_move_journal(self, target, &ids, &plan)?);
+                if existing_journal.is_none() && prepared_journal.is_none() {
+                    prepared_journal = Some(record_move_journal(
+                        self,
+                        target,
+                        &ids,
+                        &source_instances,
+                        &moved,
+                        &plan,
+                    )?);
+                }
                 #[cfg(test)]
                 test_crash_point("profile-move-journal");
                 // Git may hand the root/session leases off only after all profile
@@ -1782,6 +1921,19 @@ impl Storage {
                 continue;
             }
 
+            if existing_journal.is_none() && prepared_journal.is_none() {
+                prepared_journal = Some(record_move_journal(
+                    self,
+                    target,
+                    &ids,
+                    &source_instances,
+                    &moved,
+                    &plan,
+                )?);
+            }
+            let journal = existing_journal
+                .or(prepared_journal.as_ref())
+                .context("profile move has no durable transaction")?;
             let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
             let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
             let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
@@ -1802,10 +1954,6 @@ impl Storage {
             let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
             let source_groups_changed = source_groups_after != source_groups_before;
             let target_groups_changed = target_groups_after != target_groups_before;
-            let journal_path = match prepared_journal.take() {
-                Some(path) => path,
-                None => record_move_journal(self, target, &ids, &plan)?,
-            };
             #[cfg(test)]
             test_crash_point("profile-move-journal");
             // The durable journal precedes every mutation, including the external
@@ -2028,7 +2176,7 @@ impl Storage {
             ));
             }
             // Every write and directory barrier above has passed.
-            if let Err(error) = super::move_journal::consume(&journal_path) {
+            if let Err(error) = super::move_journal::consume(&journal.path) {
                 tracing::warn!(
                     target: "session.store",
                     error = %error,
@@ -2202,6 +2350,7 @@ pub(crate) struct ReconciliationOutcome {
     pub(crate) repaired: bool,
     /// Duplicates that lack arbitration evidence and remain excluded.
     pub(crate) reports: Vec<DuplicateIdReport>,
+    pub(crate) conflicts: Vec<String>,
 }
 
 /// One ambiguous copy of a duplicated session id.
@@ -2344,13 +2493,13 @@ pub(crate) fn reconcile_profile_duplicates(
     let mut normalized: Vec<(&str, &[Instance])> = loaded.to_vec();
     normalized.sort_by(|left, right| left.0.cmp(right.0));
     let duplicated = !detect_duplicate_ids(normalized.iter().copied()).is_empty();
-    let scan = super::move_journal::scan(
-        storages
-            .iter()
-            .map(|(_, storage)| storage.sessions_path().to_path_buf()),
-    );
+    let scan = super::move_journal::scan();
     let mut opaque_failure = !scan.unreadable_dirs.is_empty();
     for (dir, error) in scan.unreadable_dirs {
+        outcome.conflicts.push(format!(
+            "Move intent directory {} is unreadable: {error}",
+            dir.display()
+        ));
         tracing::warn!(
             target: "session.store",
             path = %dir.display(),
@@ -2363,6 +2512,10 @@ pub(crate) fn reconcile_profile_duplicates(
         match parsed {
             Ok(entry) => valid_entries.push((path, entry)),
             Err(reason) => {
+                outcome.conflicts.push(format!(
+                    "Move intent conflict at {}: {reason}",
+                    path.display()
+                ));
                 opaque_failure = true;
                 let already_reported = UNUSABLE_JOURNAL_ENTRIES
                     .lock()
@@ -2392,7 +2545,7 @@ pub(crate) fn reconcile_profile_duplicates(
     }
     if !opaque_failure {
         let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (path, entry) in valid_entries {
+        for (path, mut entry) in valid_entries {
             if entry.ids.iter().any(|id| blocked_ids.contains(id)) {
                 // Shadowing is transitive across a multi-id batch.
                 blocked_ids.extend(entry.ids.iter().cloned());
@@ -2401,6 +2554,16 @@ pub(crate) fn reconcile_profile_duplicates(
                     path = %path.display(),
                     "older move journal is shadowed by unresolved newer intent"
                 );
+                continue;
+            }
+            if let super::move_journal::MoveAuthority::LegacyConflict { reason, .. } =
+                &entry.authority
+            {
+                outcome.conflicts.push(format!(
+                    "Move intent conflict at {}: {reason}. Concurrent resources were preserved.",
+                    path.display()
+                ));
+                blocked_ids.extend(entry.ids.iter().cloned());
                 continue;
             }
             let already_unusable = UNUSABLE_JOURNAL_ENTRIES
@@ -2412,9 +2575,15 @@ pub(crate) fn reconcile_profile_duplicates(
                 blocked_ids.extend(entry.ids.iter().cloned());
                 continue;
             }
-            if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE {
+            if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE
+                && !matches!(
+                    &entry.authority,
+                    super::move_journal::MoveAuthority::Rename { .. }
+                )
+            {
                 mark_unusable_journal_entry(&path);
                 blocked_ids.extend(entry.ids.iter().cloned());
+                outcome.conflicts.push(format!("Move intent conflict at {}: expired arbitration evidence requires manual resolution.", path.display()));
                 tracing::error!(
                     target: "session.store",
                     path = %path.display(),
@@ -2423,7 +2592,7 @@ pub(crate) fn reconcile_profile_duplicates(
                 );
                 continue;
             }
-            match repair_journal_entry(&entry, storages, &path) {
+            match repair_journal_entry(&mut entry, storages, &path) {
                 Ok(true) => {
                     outcome.repaired = true;
                     tracing::info!(
@@ -2433,6 +2602,18 @@ pub(crate) fn reconcile_profile_duplicates(
                     );
                 }
                 Ok(false) => {
+                    let reason = match &entry.authority {
+                        super::move_journal::MoveAuthority::LegacyConflict { reason, .. } => {
+                            Some(reason.as_str())
+                        }
+                        super::move_journal::MoveAuthority::Rename { intent } => {
+                            intent.conflict.as_deref()
+                        }
+                        _ => None,
+                    };
+                    if let Some(reason) = reason {
+                        outcome.conflicts.push(format!("Move intent conflict at {}: {reason}. Concurrent resources were preserved.", path.display()));
+                    }
                     blocked_ids.extend(entry.ids.iter().cloned());
                     tracing::debug!(
                         target: "session.store",
@@ -2441,6 +2622,10 @@ pub(crate) fn reconcile_profile_duplicates(
                     );
                 }
                 Err(error) => {
+                    outcome.conflicts.push(format!(
+                        "Move intent conflict at {}: {error:#}",
+                        path.display()
+                    ));
                     blocked_ids.extend(entry.ids.iter().cloned());
                     if mark_repair_failure_logged(&path) {
                         tracing::error!(
@@ -2636,11 +2821,16 @@ pub(crate) fn with_storages_locked_with_ownership<R>(
     Ok(f())
 }
 
-fn with_two_storage_locks<F, R>(source: &Storage, target: &Storage, f: F) -> Result<R>
+fn with_two_storage_locks<F, R>(
+    ownership: &OwnershipGuard,
+    source: &Storage,
+    target: &Storage,
+    f: F,
+) -> Result<R>
 where
     F: FnOnce() -> Result<R>,
 {
-    let _ownership = acquire_ownership_read()?;
+    ownership.verify()?;
     source.verify_profile_identity()?;
     target.verify_profile_identity()?;
     let source_dir = source
@@ -2679,7 +2869,7 @@ where
 
 /// Apply the winner policy to one journal entry.
 fn repair_journal_entry(
-    entry: &super::move_journal::MoveJournalEntry,
+    entry: &mut super::move_journal::MoveJournalEntry,
     storages: &[(&str, &Storage)],
     journal_path: &Path,
 ) -> Result<bool> {
@@ -2687,7 +2877,7 @@ fn repair_journal_entry(
 }
 
 fn repair_journal_entry_with_sync<S>(
-    entry: &super::move_journal::MoveJournalEntry,
+    entry: &mut super::move_journal::MoveJournalEntry,
     storages: &[(&str, &Storage)],
     journal_path: &Path,
     mut sync: S,
@@ -2695,16 +2885,58 @@ fn repair_journal_entry_with_sync<S>(
 where
     S: FnMut(&Path) -> Result<()>,
 {
-    let source_storage =
-        match resolve_journal_store(&entry.source_profile, &entry.source_sessions_path, storages) {
-            Some(storage) => storage,
-            None => return Ok(false),
-        };
-    let target_storage =
-        match resolve_journal_store(&entry.target_profile, &entry.target_sessions_path, storages) {
-            Some(storage) => storage,
-            None => return Ok(false),
-        };
+    use super::move_journal::{row_matches_delta, MoveAuthority};
+    if let MoveAuthority::LegacyConflict { reason, .. } = &entry.authority {
+        tracing::error!(target: "session.store", path = %journal_path.display(), %reason, "legacy move intent requires manual conflict resolution; no row changed");
+        return Ok(false);
+    }
+    let Some(live_lease) = super::move_journal::try_recovery_lease(journal_path, entry)? else {
+        return Ok(false);
+    };
+    if matches!(&entry.authority, MoveAuthority::Rename { .. }) {
+        return super::rename::recover_journal_entry(entry, journal_path, &live_lease);
+    }
+    let MoveAuthority::Metadata {
+        source,
+        target,
+        rows,
+    } = &entry.authority
+    else {
+        unreachable!();
+    };
+    if !(source.profile == entry.source_profile
+        && target.profile == entry.target_profile
+        && source.sessions_path == entry.source_sessions_path
+        && target.sessions_path == entry.target_sessions_path
+        && rows.len() == entry.ids.len()
+        && entry.ids.iter().all(|id| {
+            super::validate_instance_id(id).is_ok()
+                && entry.ids.iter().filter(|other| *other == id).count() == 1
+                && rows
+                    .iter()
+                    .filter(|row| &row.before.id == id && row.after.id == row.before.id)
+                    .count()
+                    == 1
+        }))
+    {
+        mark_unusable_journal_entry(journal_path);
+        tracing::error!(target: "session.store", path = %journal_path.display(), "move journal authority does not match its declared batch");
+        return Ok(false);
+    }
+    let ownership = acquire_ownership_lock()?;
+    let mut source_storage = None;
+    let mut target_storage = None;
+    for (_, storage) in storages {
+        if source.matches(storage)? {
+            source_storage = Some(*storage);
+        }
+        if target.matches(storage)? {
+            target_storage = Some(*storage);
+        }
+    }
+    let (Some(source_storage), Some(target_storage)) = (source_storage, target_storage) else {
+        return Ok(false);
+    };
 
     if let Some(reason) = validate_recovery_journal(entry, source_storage, target_storage)? {
         mark_unusable_journal_entry(journal_path);
@@ -2731,15 +2963,13 @@ where
         }
     }
 
-    // App-global identity lock first, then sorted title/lifecycle locks, then the
-    // per-profile storage flocks taken inside `Storage::update`.
-    let _identity_lock = acquire_session_identity_lock()?;
+    let _identity_lock = acquire_session_identity_lock_with_ownership(&ownership)?;
     let mut ids_sorted = entry.ids.clone();
     ids_sorted.sort();
     ids_sorted.dedup();
     let mut guards = Vec::with_capacity(ids_sorted.len() * 2);
     for id in &ids_sorted {
-        guards.push(acquire_session_title_lock(id)?);
+        guards.push(acquire_session_title_lock_with_ownership(&ownership, id)?);
     }
     let source_scope = source_storage
         .sessions_path()
@@ -2752,38 +2982,62 @@ where
         .unwrap()
         .canonicalize()?;
     for id in &ids_sorted {
-        guards.push(source_storage.acquire_instance_lifecycle_lock(id)?);
+        guards.push(source_storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, id)?);
         if source_scope != target_scope {
-            guards.push(target_storage.acquire_instance_lifecycle_lock(id)?);
+            guards.push(
+                target_storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, id)?,
+            );
         }
     }
 
-    with_two_storage_locks(source_storage, target_storage, || {
-        let (source_instances, _source_groups) = source_storage.load_with_groups()?;
-        let (target_instances, _) = target_storage.load_with_groups()?;
+    with_two_storage_locks(&ownership, source_storage, target_storage, || {
+        let source_instances = source_storage.load_strict_for_worktree_ownership()?;
+        let target_instances = target_storage.load_strict_for_worktree_ownership()?;
         let plan = crate::session::GroupMovePlan {
             source_path: entry.group_move_source_path.clone(),
             target_path: entry.group_move_target_path.clone(),
             move_subtree: entry.group_move_subtree,
         };
-        // Automatic arbitration requires one valid row on each side.
-        if entry.ids.iter().any(|id| {
-            source_instances.iter().filter(|row| &row.id == id).count() > 1
-                || target_instances.iter().filter(|row| &row.id == id).count() > 1
-        }) {
-            return Ok(false);
+        let mut source_losers = Vec::new();
+        for delta in rows {
+            let mut source_rows = source_instances
+                .iter()
+                .filter(|row| row.id == delta.before.id);
+            let mut target_rows = target_instances
+                .iter()
+                .filter(|row| row.id == delta.after.id);
+            let pair = (source_rows.next(), target_rows.next());
+            if source_rows.next().is_some() || target_rows.next().is_some() {
+                return Ok(false);
+            }
+            let valid = match pair {
+                (Some(before), Some(after)) => {
+                    if row_matches_delta(before, delta, false)
+                        && row_matches_delta(after, delta, true)
+                        && super::move_journal::source_changes_preserved(
+                            &delta.before,
+                            before,
+                            after,
+                        )?
+                    {
+                        source_losers.push(delta.before.id.clone());
+                        true
+                    } else {
+                        false
+                    }
+                }
+                (Some(before), None) => row_matches_delta(before, delta, false),
+                (None, Some(after)) => row_matches_delta(after, delta, true),
+                (None, None) => true,
+            };
+            if !valid {
+                tracing::error!(target: "session.store", path = %journal_path.display(), session = %delta.before.id, "move intent authority was superseded; retaining all copies");
+                return Ok(false);
+            }
         }
-        let source_losers: Vec<String> = entry
-            .ids
-            .iter()
-            .filter(|id| {
-                target_instances.iter().any(|row| &row.id == *id)
-                    && source_instances.iter().any(|row| &row.id == *id)
-            })
-            .cloned()
-            .collect();
         if source_losers.is_empty() {
             sync_repaired_profile_durably(source_storage, &mut sync)?;
+            sync_repaired_profile_durably(target_storage, &mut sync)?;
             super::move_journal::consume(journal_path)?;
             return Ok(true);
         }
@@ -2806,6 +3060,7 @@ where
             Ok(())
         })?;
         sync_repaired_profile_durably(source_storage, &mut sync)?;
+        sync_repaired_profile_durably(target_storage, &mut sync)?;
         #[cfg(test)]
         test_crash_point("profile-repair-source-written");
         super::move_journal::consume(journal_path)?;
@@ -2845,31 +3100,6 @@ fn target_still_holds(target_sessions_path: &Path, losers: &[String]) -> Result<
     Ok(losers
         .iter()
         .all(|loser| held.iter().any(|row_id| row_id == loser)))
-}
-
-/// Resolve one journal-recorded profile only when the loaded store still
-/// names the same sessions file (including symlink aliases).
-fn resolve_journal_store<'a>(
-    profile: &str,
-    recorded_path: &Path,
-    storages: &'a [(&str, &'a Storage)],
-) -> Option<&'a Storage> {
-    let storage = storages
-        .iter()
-        .find(|(name, _)| *name == profile)
-        .map(|(_, storage)| *storage)?;
-    if storage.sessions_path() == recorded_path {
-        return Some(storage);
-    }
-    // Tolerate symlinked or differently-spelled paths when they still resolve
-    // to the same physical file.
-    match (
-        recorded_path.canonicalize(),
-        storage.sessions_path().canonicalize(),
-    ) {
-        (Ok(recorded), Ok(live)) if recorded == live => Some(storage),
-        _ => None,
-    }
 }
 
 /// Ring budget per marker, counting the copy the call just made.
@@ -3051,7 +3281,7 @@ pub(crate) fn migration_backups(path: &Path) -> Result<Vec<(u128, PathBuf)>> {
 
 /// Keep the repaired profile's groups sidecar consistent with what an uninterrupted
 /// `apply_group_move` would have left on disk.
-fn reconcile_groups_after_repair(
+pub(crate) fn reconcile_groups_after_repair(
     instances: &[Instance],
     groups: &mut Vec<Group>,
     winners: &[Instance],
@@ -4059,10 +4289,14 @@ mod tests {
                 }
                 Ok(())
             },
-            (false, |_| {
-                effect_ran.set(true);
-                Ok(())
-            }),
+            (
+                false,
+                |_| {
+                    effect_ran.set(true);
+                    Ok(())
+                },
+                None,
+            ),
         );
 
         assert!(result.is_err());
@@ -4108,58 +4342,60 @@ mod tests {
                     );
                     Ok(())
                 },
-                (true, |_| {
-                    let journal =
-                        super::super::move_journal::scan([source.sessions_path().to_path_buf()]);
-                    assert_eq!(
-                        journal.entries.len(),
-                        1,
-                        "the existing journal must precede the effect"
-                    );
-                    assert!(journal.entries[0].1.as_ref().unwrap().is_current());
-                    assert!(
-                        source.save_lock.try_lock().is_ok(),
-                        "source save mutex crossed native callback"
-                    );
-                    assert!(
-                        target.save_lock.try_lock().is_ok(),
-                        "target save mutex crossed native callback"
-                    );
-                    for storage in [&source, &target] {
-                        let lock = try_acquire_storage_flock(
-                            storage.sessions_path().parent().unwrap(),
-                            STORAGE_LOCK_FILENAME,
-                        )?
-                        .expect("storage flock crossed native callback");
-                        drop(lock);
-                    }
-                    root.pause_native()?;
-                    let callback = (|| -> Result<()> {
-                        source.update(|rows, _| {
-                            rows[0].favorite();
-                            rows[0].group_path = "callback-group".into();
+                (
+                    true,
+                    |_| {
+                        let journal = super::super::move_journal::scan();
+                        assert_eq!(
+                            journal.entries.len(),
+                            1,
+                            "the existing journal must precede the effect"
+                        );
+                        assert!(journal.entries[0].1.as_ref().unwrap().is_current());
+                        assert!(
+                            source.save_lock.try_lock().is_ok(),
+                            "source save mutex crossed native callback"
+                        );
+                        assert!(
+                            target.save_lock.try_lock().is_ok(),
+                            "target save mutex crossed native callback"
+                        );
+                        for storage in [&source, &target] {
+                            let lock = try_acquire_storage_flock(
+                                storage.sessions_path().parent().unwrap(),
+                                STORAGE_LOCK_FILENAME,
+                            )?
+                            .expect("storage flock crossed native callback");
+                            drop(lock);
+                        }
+                        root.pause_native()?;
+                        let callback = (|| -> Result<()> {
+                            source.update(|rows, _| {
+                                rows[0].favorite();
+                                rows[0].group_path = "callback-group".into();
+                                Ok(())
+                            })?;
+                            target.update(|rows, _| {
+                                rows.push(Instance::new(
+                                    if collision { "requested-title" } else { "peer" },
+                                    if collision { "/repo/checkout" } else { "/peer" },
+                                ));
+                                Ok(())
+                            })?;
                             Ok(())
-                        })?;
-                        target.update(|rows, _| {
-                            rows.push(Instance::new(
-                                if collision { "requested-title" } else { "peer" },
-                                if collision { "/repo/checkout" } else { "/peer" },
-                            ));
-                            Ok(())
-                        })?;
-                        Ok(())
-                    })();
-                    root.resume_native()?;
-                    callback
-                }),
+                        })();
+                        root.resume_native()?;
+                        callback
+                    },
+                    None,
+                ),
             );
             assert_eq!(
                 validations.get(),
                 2,
                 "authoritative target validation must be repeated"
             );
-            let remaining =
-                super::super::move_journal::scan([source.sessions_path().to_path_buf()]);
+            let remaining = super::super::move_journal::scan();
             if collision {
                 assert!(result.is_err());
                 assert_eq!(source.load()?[0].title, "before");
@@ -4446,7 +4682,7 @@ mod tests {
                     (&before, &before),
                     false,
                     |_, _| Ok(()),
-                    (false, effect),
+                    (false, effect, None),
                 )
                 .expect_err("shared inode must be rejected before locking or effects")
         };
@@ -4581,6 +4817,36 @@ mod tests {
     }
 
     #[test]
+    fn recovery_keeps_forked_source_annotations_when_target_has_other_value() -> Result<()> {
+        for clears_color in [false, true] {
+            let (_temp, _guard, source, target, _, _) =
+                setup_recovery_env("source-annotation-fork")?;
+            source.update(|rows, _| {
+                rows[0].color = Some("blue".into());
+                Ok(())
+            })?;
+            run_crashing_move(&source, &target, "profile-move-target");
+            source.update(|rows, _| {
+                rows[0].color = (!clears_color).then(|| "green".into());
+                Ok(())
+            })?;
+            target.update(|rows, _| {
+                rows[0].color = Some("red".into());
+                Ok(())
+            })?;
+            let source_bytes = fs::read(source.sessions_path())?;
+            let target_bytes = fs::read(target.sessions_path())?;
+            let outcome = reconcile_loaded(&[&source, &target]);
+            assert!(!outcome.repaired);
+            assert_eq!(outcome.reports.len(), 1);
+            assert_eq!(fs::read(source.sessions_path())?, source_bytes);
+            assert_eq!(fs::read(target.sessions_path())?, target_bytes);
+            assert_eq!(journal_entry_count(&source), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn profile_move_crash_recovery_target_wins_from_each_crash_point() -> Result<()> {
         for point in [
@@ -4697,8 +4963,8 @@ mod tests {
     #[test]
     fn unprovable_journal_evidence_keeps_duplicates_surfaced() -> Result<()> {
         type Arrange = fn(&Storage, &Storage, &Instance) -> Result<()>;
-        fn record(entry: &move_journal::MoveJournalEntry, at: &Storage) -> Result<()> {
-            move_journal::record(entry, at.sessions_path()).map(drop)
+        fn record(entry: &move_journal::MoveJournalEntry) -> Result<()> {
+            move_journal::record(entry).map(drop)
         }
         fn copy_and_record(
             edit: fn(&mut move_journal::MoveJournalEntry),
@@ -4707,7 +4973,7 @@ mod tests {
                 push_copy(b, before)?;
                 let mut entry = fresh_journal_entry(a, b, &before.id);
                 edit(&mut entry);
-                record(&entry, a)
+                record(&entry)
             }
         }
         let legacy: Arrange = |_, b, before| push_copy(b, before);
@@ -4737,36 +5003,36 @@ mod tests {
         let duplicate_ids: Arrange = |a, b, before| {
             let mut entry = fresh_journal_entry(a, b, &before.id);
             entry.ids.push(before.id.clone());
-            record(&entry, a)
+            record(&entry)
         };
         let aliased: Arrange = |a, b, before| {
             let mut entry = fresh_journal_entry(a, b, &before.id);
             entry.target_profile = a.profile().to_string();
             entry.target_sessions_path = a.sessions_path().to_path_buf();
-            record(&entry, a)
+            record(&entry)
         };
         let target_duplicate: Arrange = |a, b, before| {
             push_copy(b, before)?;
             push_copy(b, before)?;
-            record(&fresh_journal_entry(a, b, &before.id), a)
+            record(&fresh_journal_entry(a, b, &before.id))
         };
         let same_profile: Arrange = |a, _, before| push_copy(a, before);
         let newer_unresolved: Arrange = |a, b, before| {
             push_copy(b, before)?;
             let mut older = fresh_journal_entry(a, b, &before.id);
             older.created_at_epoch_ms = now_ms() - 60_000;
-            record(&older, a)?;
+            record(&older)?;
             let mut newer = fresh_journal_entry(b, a, &before.id);
             newer.target_profile = "missing-profile".to_string();
             newer.target_sessions_path = a.sessions_path().with_file_name("missing.json");
-            record(&newer, b)
+            record(&newer)
         };
         let newer_opaque: Arrange = |a, b, before| {
             push_copy(b, before)?;
             let mut older = fresh_journal_entry(a, b, &before.id);
             older.created_at_epoch_ms = now_ms() - 60_000;
-            record(&older, a)?;
-            let journal_dir = b.sessions_path().parent().unwrap().join(".move-journal");
+            record(&older)?;
+            let journal_dir = move_journal::journal_dir()?;
             fs::create_dir_all(&journal_dir)?;
             fs::write(
                 journal_dir.join("move-99999999999999999999-1.json"),
@@ -4796,9 +5062,9 @@ mod tests {
             j3.target_profile = "missing".to_string();
             j3.target_sessions_path = a.sessions_path().with_file_name("missing.json");
             j3.created_at_epoch_ms = now;
-            record(&j1, a)?;
-            record(&j2, b)?;
-            record(&j3, a)
+            record(&j1)?;
+            record(&j2)?;
+            record(&j3)
         };
         // (tag, arrange, reconcile source only, reports, rows (a, b), journals left in a,
         // entry permanently blacklisted)
@@ -4877,10 +5143,7 @@ mod tests {
     fn resolve_miss_is_transient_not_permanent() -> Result<()> {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("resolvemiss")?;
         push_copy(&target, &before)?;
-        move_journal::record(
-            &fresh_journal_entry(&source, &target, &before.id),
-            source.sessions_path(),
-        )?;
+        move_journal::record(&fresh_journal_entry(&source, &target, &before.id))?;
 
         let outcome = reconcile_loaded(&[&source]);
         assert!(!outcome.repaired, "nothing to arbitrate without the target");
@@ -4903,12 +5166,21 @@ mod tests {
     #[test]
     fn multi_id_batch_arbitrates_surviving_ids_and_skips_vanished_ones() -> Result<()> {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("multi")?;
-        let vanished_id = Instance::new("vanished", "/repo/vanished").id;
+        let vanished = Instance::new("vanished", "/repo/vanished");
+        let vanished_id = vanished.id.clone();
+        push_copy(&source, &vanished)?;
         push_copy(&target, &before)?;
         let mut entry = fresh_journal_entry(&source, &target, &before.id);
         entry.ids.push(vanished_id.clone());
         entry.ids.sort();
-        move_journal::record(&entry, source.sessions_path())?;
+        if let move_journal::MoveAuthority::Metadata { rows, .. } = &mut entry.authority {
+            rows.push(journal_delta(&source, &target, &vanished_id));
+        }
+        move_journal::record(&entry)?;
+        source.update(|rows, _| {
+            rows.retain(|row| row.id != vanished_id);
+            Ok(())
+        })?;
 
         let outcome = reconcile_loaded(&[&source, &target]);
 
@@ -4935,23 +5207,25 @@ mod tests {
         let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let mut writer = None;
+        let ownership = acquire_ownership_read()?;
 
-        let (contended, entered_early) = with_two_storage_locks(&source, &target, || {
-            writer = Some(std::thread::spawn(move || {
-                let target = Storage::new_for_test_path("dual-lock-target", target_path);
-                let _observer = observe_lock_contention_for_test(contended_tx);
-                target
-                    .update(|instances, _| {
-                        instances.clear();
-                        Ok(())
-                    })
-                    .unwrap();
-                done_tx.send(()).unwrap();
-            }));
-            let contended = contended_rx.recv_timeout(Duration::from_secs(2));
-            let entered_early = done_rx.try_recv().is_ok();
-            Ok((contended, entered_early))
-        })?;
+        let (contended, entered_early) =
+            with_two_storage_locks(&ownership, &source, &target, || {
+                writer = Some(std::thread::spawn(move || {
+                    let target = Storage::new_for_test_path("dual-lock-target", target_path);
+                    let _observer = observe_lock_contention_for_test(contended_tx);
+                    target
+                        .update(|instances, _| {
+                            instances.clear();
+                            Ok(())
+                        })
+                        .unwrap();
+                    done_tx.send(()).unwrap();
+                }));
+                let contended = contended_rx.recv_timeout(Duration::from_secs(2));
+                let entered_early = done_rx.try_recv().is_ok();
+                Ok((contended, entered_early))
+            })?;
 
         done_rx
             .recv_timeout(std::time::Duration::from_secs(2))
@@ -4973,7 +5247,7 @@ mod tests {
         let (temp, _guard, source, target, before, _after) = setup_recovery_env("reload-fallback")?;
         push_copy(&target, &before)?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
+        move_journal::record(&entry)?;
         let bad_dir = temp.path().join("bad");
         fs::create_dir_all(&bad_dir)?;
         let bad = Storage::new_for_test_path("bad", bad_dir.join("sessions.json"));
@@ -5019,17 +5293,31 @@ mod tests {
         Ok(())
     }
 
-    fn journal_entry_count(source: &Storage) -> usize {
-        move_journal::scan([source.sessions_path().to_path_buf()])
+    fn journal_entry_paths(source: &Storage) -> impl Iterator<Item = PathBuf> + '_ {
+        move_journal::scan()
             .entries
-            .len()
+            .into_iter()
+            .filter_map(move |(path, _)| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).ok()?;
+                (value
+                    .get("source_sessions_path")
+                    .and_then(serde_json::Value::as_str)
+                    == source.sessions_path().to_str())
+                .then_some(path)
+            })
+    }
+
+    fn journal_entry_count(source: &Storage) -> usize {
+        journal_entry_paths(source).count()
     }
 
     fn journal_entry_scan_ids(source: &Storage) -> Vec<String> {
-        move_journal::scan([source.sessions_path().to_path_buf()])
+        move_journal::scan()
             .entries
             .into_iter()
             .filter_map(|(_, parsed)| parsed.ok())
+            .filter(|entry| entry.source_sessions_path == source.sessions_path())
             .flat_map(|entry| entry.ids)
             .collect()
     }
@@ -5053,7 +5341,7 @@ mod tests {
                 group_move_subtree: move_subtree,
                 ..fresh_journal_entry(&source, &target, &before.id)
             };
-            move_journal::record(&entry, source.sessions_path())?;
+            move_journal::record(&entry)?;
 
             let outcome = reconcile_loaded(&[&source, &target]);
 
@@ -5089,8 +5377,8 @@ mod tests {
         j2.group_move_source_path = "moved".to_string();
         j2.group_move_target_path = "work".to_string();
         j2.created_at_epoch_ms = now;
-        move_journal::record(&j1, a.sessions_path())?;
-        move_journal::record(&j2, b.sessions_path())?;
+        move_journal::record(&j1)?;
+        move_journal::record(&j2)?;
 
         let outcome = reconcile_loaded(&[&a, &b]);
 
@@ -5124,7 +5412,7 @@ mod tests {
         })?;
         push_copy(&target, &before)?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
+        move_journal::record(&entry)?;
 
         let outcome = reconcile_loaded(&[&source, &target]);
 
@@ -5182,9 +5470,10 @@ mod tests {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("sync-fail")?;
         push_copy(&target, &before)?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
-        let journal_path = move_journal::record(&entry, source.sessions_path())?;
+        let journal_path = move_journal::record(&entry)?;
+        let mut entry = serde_json::from_slice(&fs::read(&journal_path)?)?;
         let stores = stores(&[&source, &target]);
-        let error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
+        let error = repair_journal_entry_with_sync(&mut entry, &stores, &journal_path, |_path| {
             Err(anyhow!("forced repaired-profile sync failure"))
         })
         .expect_err("failed durability barrier must fail recovery completion");
@@ -5192,10 +5481,11 @@ mod tests {
         assert!(source.load()?.is_empty(), "repair row write reached disk");
         assert_eq!(journal_entry_count(&source), 1, "evidence must remain");
 
-        let retry_error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
-            Err(anyhow!("forced retry sync failure"))
-        })
-        .expect_err("no-loser retry must repeat the durability barrier");
+        let retry_error =
+            repair_journal_entry_with_sync(&mut entry, &stores, &journal_path, |_path| {
+                Err(anyhow!("forced retry sync failure"))
+            })
+            .expect_err("no-loser retry must repeat the durability barrier");
         assert!(retry_error.to_string().contains("not made durable"));
         assert_eq!(journal_entry_count(&source), 1, "retry keeps evidence too");
 
@@ -5453,7 +5743,30 @@ mod tests {
             group_move_target_path: "moved".to_string(),
             group_move_subtree: false,
             created_at_epoch_ms: now_ms(),
+            authority: move_journal::MoveAuthority::Metadata {
+                source: move_journal::ProfileAuthority::capture(source).unwrap(),
+                target: move_journal::ProfileAuthority::capture(target).unwrap(),
+                rows: vec![journal_delta(source, target, id)],
+            },
+            live_lock_identity: None,
         }
+    }
+
+    fn journal_delta(source: &Storage, target: &Storage, id: &str) -> move_journal::RowDelta {
+        let before = source
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("original source row");
+        let mut after = target
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap_or_else(|| before.clone());
+        after.source_profile = target.profile().to_owned();
+        move_journal::RowDelta { before, after }
     }
 
     #[test]
@@ -5517,11 +5830,8 @@ mod tests {
     }
 
     fn first_journal_path(storage: &Storage) -> PathBuf {
-        move_journal::scan([storage.sessions_path().to_path_buf()])
-            .entries
-            .into_iter()
+        journal_entry_paths(storage)
             .next()
-            .map(|(path, _)| path)
             .expect("journal entry on disk")
     }
 }

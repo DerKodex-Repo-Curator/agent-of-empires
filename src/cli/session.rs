@@ -5,9 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{
-    GroupTree, Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
-};
+use crate::session::{GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -507,90 +505,27 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .filter(|i| i.is_trashed())
         .cloned()
         .collect();
-    let mut inst = super::resolve_session(&args.identifier, &trashed)
+    let inst = super::resolve_session(&args.identifier, &trashed)
         .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
         .clone();
-    let restore_id = inst.id.clone();
-
-    let ownership = crate::session::storage::acquire_ownership_lock()?;
-    let _identity_lock =
-        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-    let _lifecycle_lock = storage
-        .acquire_instance_lifecycle_lock_with_ownership(&ownership, &restore_id)
-        .context("failed to acquire instance restore lock")?;
-    storage.load_strict_for_worktree_ownership()?;
-    let decision = storage.update_with_ownership(&ownership, |instances, _groups| {
-        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
-            .map_err(anyhow::Error::new)
-    })?;
-    let restore_generation = match decision {
-        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+    match crate::session::trash::restore_transition(&storage, &inst, None) {
+        Ok(restored) => println!("Restored: {}", restored.title),
+        Err(crate::session::trash::RestoreError::NotFound) => {
+            bail!("No trashed session matching '{}'", args.identifier)
         }
-        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
-            "Session {} is {}, so it was not restored",
-            inst.title,
-            holder.busy_reason()
-        ),
-        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
-    };
-
-    inst = storage
-        .load_strict_for_worktree_ownership()?
-        .into_iter()
-        .find(|instance| {
-            instance.id == restore_id
-                && instance
-                    .lifecycle_reservation_is_owned(LifecycleOperation::Restore, restore_generation)
-        })
-        .ok_or_else(|| anyhow::anyhow!("restore reservation was superseded"))?;
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst, &ownership)
-    {
-        release_restore_reservation(&storage, &ownership, &restore_id, restore_generation);
-        anyhow::bail!("Cannot restore worktree: {reason}");
-    }
-    let restored_path = inst.project_path.clone();
-    let restored_pre = inst.pre_trash_project_path.clone();
-
-    let commit = storage.update_with_ownership(&ownership, |instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            &restore_id,
-            restore_generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    })?;
-    match commit {
-        crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
-            "Session {} lost its lifecycle reservation during restore",
-            inst.title
-        ),
-        crate::session::claim::RestoreCommit::AlreadyGone => {
-            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        Err(crate::session::trash::RestoreError::Busy(reason)) => {
+            bail!(
+                "Session {} is {}, so it was not restored",
+                inst.title,
+                reason
+            )
         }
+        Err(crate::session::trash::RestoreError::Worktree(reason)) => {
+            bail!("Cannot restore worktree: {reason}")
+        }
+        Err(crate::session::trash::RestoreError::Persist(error)) => return Err(error),
     }
-    println!("Restored: {}", inst.title);
     Ok(())
-}
-
-fn release_restore_reservation(
-    storage: &Storage,
-    ownership: &crate::session::storage::OwnershipGuard,
-    restore_id: &str,
-    generation: u64,
-) {
-    let _ = storage.update_with_ownership(ownership, |instances, _groups| {
-        if let Some(stored) = instances
-            .iter_mut()
-            .find(|instance| instance.id == restore_id)
-        {
-            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
-        }
-        Ok(())
-    });
 }
 
 async fn list_trash(profile: &str) -> Result<()> {

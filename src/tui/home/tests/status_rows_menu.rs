@@ -1012,6 +1012,7 @@ fn trash_then_restore_round_trip() {
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
+    env.view.finish_restore_for_test();
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),
         "session must be restored out of trash"
@@ -1170,6 +1171,7 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
 
     env.view.selected_session = Some(id.clone());
     env.view.restore_selected_from_trash();
+    env.view.finish_restore_for_test();
     let restored = row(&env.view);
     assert!(
         !restored.is_trashed(),
@@ -1596,6 +1598,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         );
 
         env.view.restore_all_from_trash();
+        env.view.finish_restore_for_test();
         assert_eq!(
             env.view
                 .instances

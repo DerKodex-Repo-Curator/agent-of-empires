@@ -698,6 +698,7 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         );
 
         env.view.toggle_archive_at_cursor().unwrap();
+        env.view.finish_restore_for_test();
 
         let inst = env.view.get_instance(&id).unwrap();
         assert!(

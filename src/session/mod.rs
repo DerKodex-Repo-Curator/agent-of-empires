@@ -22,7 +22,7 @@ pub mod idle_reap;
 pub mod import;
 mod instance;
 pub mod mcp;
-mod move_journal;
+pub(crate) mod move_journal;
 pub(crate) mod native_hooks;
 pub mod poller;
 pub mod projects;

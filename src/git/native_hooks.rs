@@ -1,12 +1,12 @@
 //! Preserve native hook dispatch while handing caller leases off during callbacks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,7 @@ const REAL_EXEC: &str = "AOE_NATIVE_GIT_REAL_EXEC";
 const PROXY_EXEC: &str = "AOE_NATIVE_GIT_PROXY_EXEC";
 const PROGRAM_PREFIX: &str = "AOE_NATIVE_GIT_PROGRAM_PREFIX";
 const PARAMETERS_PRESENT: &str = "AOE_NATIVE_GIT_PARAMETERS_PRESENT";
+const OWNER_FD: &str = "AOE_NATIVE_GIT_OWNER_FD";
 
 const LIVE_HOOKS: [&str; 4] = [
     "post-index-change",
@@ -66,6 +67,12 @@ fn hooked_command(name: Option<&OsStr>) -> bool {
         )
     })
 }
+#[derive(Clone, Copy)]
+pub(crate) struct CallbackContext<'a> {
+    pub(crate) parent: Option<&'a str>,
+    pub(crate) reference_transaction: Option<&'a str>,
+}
+
 pub(crate) trait HookLease {
     fn runtime_dir(&self) -> &Path;
     fn prepare_checkout(&mut self, owned_branch: bool) -> io::Result<()>;
@@ -75,16 +82,19 @@ pub(crate) trait HookLease {
         cwd: &Path,
         checkout_ready: bool,
         git_dir: Option<&Path>,
+        context: CallbackContext<'_>,
     ) -> io::Result<()>;
     fn resume(&mut self, completed: Option<&str>) -> io::Result<()>;
     fn checkpoint(&mut self) -> io::Result<()>;
-    // Release restored locks without refreshing the original callback-group boundary.
+    // Release restored locks without replacing active callback boundaries.
     fn pause_retained(&mut self) -> io::Result<()>;
 }
 
 #[derive(Serialize, Deserialize)]
 struct Scope {
     root: PathBuf,
+    root_device: u64,
+    root_inode: u64,
     real_git: PathBuf,
     real_exec: PathBuf,
     proxy_exec: PathBuf,
@@ -92,6 +102,8 @@ struct Scope {
     socket: PathBuf,
     socket_device: u64,
     socket_inode: u64,
+    owner_device: u64,
+    owner_inode: u64,
     capability: String,
 }
 
@@ -100,6 +112,7 @@ struct HookCommand {
     name: Vec<u8>,
     command: Vec<u8>,
     post_checkout: bool,
+    reference_transaction: bool,
     program: String,
 }
 
@@ -118,6 +131,7 @@ enum Frame {
     Enter {
         capability: String,
         parent: Option<String>,
+        reference_transaction: Option<String>,
         cwd: Vec<u8>,
         checkout_ready: bool,
         git_dir: Option<Vec<u8>>,
@@ -136,6 +150,7 @@ enum Event {
         authenticated: bool,
         error: io::Error,
     },
+    ListenerError(io::Error),
     Exit(io::Result<Output>),
 }
 
@@ -172,6 +187,79 @@ fn inheritable(fd: RawFd, inherit: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn liveness_file(file: fs::File) -> io::Result<fs::File> {
+    if file.as_raw_fd() >= 3 {
+        return Ok(file);
+    }
+    // SAFETY: duplicate our own live descriptor, without using a stdio slot.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new owned descriptor.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+fn inherited_owner_fd() -> Option<RawFd> {
+    let value = std::env::var(OWNER_FD).ok()?;
+    let mut parts = value.split(':');
+    let fd: RawFd = parts.next()?.parse().ok()?;
+    let device: u64 = parts.next()?.parse().ok()?;
+    let inode: u64 = parts.next()?.parse().ok()?;
+    if fd < 3 || parts.next().is_some() {
+        return None;
+    }
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat checks the untrusted number before any ownership or flag change.
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: a successful fstat initialized the structure.
+    let metadata = unsafe { metadata.assume_init() };
+    let actual_device: u64 = metadata.st_dev as _;
+    let actual_inode: u64 = metadata.st_ino as _;
+    (actual_device == device
+        && actual_inode == inode
+        && metadata.st_uid == unsafe { libc::geteuid() }
+        && metadata.st_mode & libc::S_IFMT == libc::S_IFREG
+        && metadata.st_mode & 0o777 == 0o600)
+        .then_some(fd)
+}
+
+fn close_inherited_owner() -> io::Result<()> {
+    if let Some(fd) = inherited_owner_fd() {
+        // SAFETY: the inherited tuple matched fstat; close, never LOCK_UN.
+        if unsafe { libc::close(fd) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn helper_owner(scope: &Scope) -> io::Result<fs::File> {
+    let root = DirectoryPin::open(scope.root.clone())?;
+    let metadata = root.file.metadata()?;
+    if metadata.dev() != scope.root_device || metadata.ino() != scope.root_inode {
+        return Err(invalid("native runtime root changed"));
+    }
+    let owner = liveness_file(private_file(&scope.root.join("owner"), false)?)?;
+    let metadata = owner.metadata()?;
+    if metadata.dev() != scope.owner_device || metadata.ino() != scope.owner_inode {
+        return Err(invalid("native runtime liveness owner changed"));
+    }
+    FileExt::try_lock_shared(&owner)?;
+    // Acquire an independent shared lease before retiring the inherited OFD.
+    close_inherited_owner()?;
+    Ok(owner)
+}
+
+fn owner_hint(command: &mut Command, owner: &fs::File, identity: (u64, u64)) {
+    command.env(
+        OWNER_FD,
+        format!("{}:{}:{}", owner.as_raw_fd(), identity.0, identity.1),
+    );
 }
 
 fn env_delta(command: &mut Command, descriptor: &Descriptor) -> io::Result<Option<OsString>> {
@@ -577,7 +665,7 @@ fn descriptor_for(
     } else {
         probe(&descriptor, prefix, &["config", "--null", "--list"])?
     };
-    let mut commands: BTreeMap<Vec<u8>, (Option<Vec<u8>>, bool)> = BTreeMap::new();
+    let mut commands: BTreeMap<Vec<u8>, (Option<Vec<u8>>, bool, bool)> = BTreeMap::new();
     for item in config
         .split(|byte| *byte == 0)
         .filter(|item| !item.is_empty())
@@ -591,6 +679,8 @@ fn descriptor_for(
         } else if let Some(name) = key.strip_suffix(b".event") {
             if value == b"post-checkout" {
                 commands.entry(name.to_vec()).or_default().1 = true;
+            } else if value == b"reference-transaction" {
+                commands.entry(name.to_vec()).or_default().2 = true;
             }
         }
     }
@@ -617,19 +707,28 @@ fn descriptor_for(
     };
     descriptor.commands.clear();
     let helper = descriptor.scope.proxy_exec.join("git");
-    for (index, (name, (command, post_checkout))) in commands.into_iter().enumerate() {
+    for (index, (name, (command, post_checkout, reference_transaction))) in
+        commands.into_iter().enumerate()
+    {
         let Some(command) = command else {
             continue;
         };
         let program = format!("{}-{index}", descriptor.scope.program_prefix);
         let path = descriptor.scope.proxy_exec.join(&program);
-        if !path.exists() {
-            symlink(&helper, &path)?;
+        match symlink(&helper, &path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::read_link(&path)? != helper {
+                    return Err(invalid("native configured hook program was replaced"));
+                }
+            }
+            Err(error) => return Err(error),
         }
         descriptor.commands.push(HookCommand {
             name,
             command,
             post_checkout,
+            reference_transaction,
             program,
         });
     }
@@ -744,129 +843,401 @@ fn routing_git(descriptor: &Descriptor, args: &[OsString], path: &Path) -> io::R
     Ok(command)
 }
 
-// Retain the app marker until its short socket route has been removed.
-struct Runtime {
-    _socket_root: tempfile::TempDir,
-    _root: tempfile::TempDir,
-    owner: fs::File,
-    group: fs::File,
+// Allocation and sweep share the same private namespaces and lock order.
+const RUNTIME_NAMESPACE: &str = "native-git-runtimes-v2";
+const RUNTIME_MARKER: &str = "aoe-native-git-runtime-v2";
+
+struct DirectoryPin {
+    path: PathBuf,
+    file: fs::File,
 }
 
-const RUNTIME_MARKER: &str = "aoe-native-git-runtime-v1";
+impl DirectoryPin {
+    fn open(path: PathBuf) -> io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&path)?;
+        let pin = Self { path, file };
+        pin.verify()?;
+        Ok(pin)
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let retained = self.file.metadata()?;
+        let current = fs::symlink_metadata(&self.path)?;
+        if !current.is_dir()
+            || current.uid() != unsafe { libc::geteuid() }
+            || current.mode() & 0o777 != 0o700
+            || current.dev() != retained.dev()
+            || current.ino() != retained.ino()
+        {
+            return Err(invalid("native runtime directory ownership changed"));
+        }
+        Ok(())
+    }
+}
+
+struct RuntimeNamespace {
+    pin: DirectoryPin,
+    lock: fs::File,
+}
+
+impl RuntimeNamespace {
+    fn open(path: PathBuf, create: bool) -> io::Result<Self> {
+        if create {
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let pin = DirectoryPin::open(path)?;
+        let lock = private_file(&pin.path.join("namespace.lock"), create)?;
+        lock.lock_exclusive()?;
+        let namespace = Self { pin, lock };
+        namespace.verify()?;
+        Ok(namespace)
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        self.pin.verify()?;
+        let retained = self.lock.metadata()?;
+        let current = fs::symlink_metadata(self.pin.path.join("namespace.lock"))?;
+        if !current.is_file() || retained.dev() != current.dev() || retained.ino() != current.ino()
+        {
+            return Err(invalid("native runtime allocation lock changed"));
+        }
+        Ok(())
+    }
+}
+
+struct RuntimeDirectory {
+    pin: DirectoryPin,
+    remove_on_drop: bool,
+}
+
+impl RuntimeDirectory {
+    fn create(namespace: &RuntimeNamespace, name: &str) -> io::Result<Self> {
+        namespace.verify()?;
+        let path = namespace.pin.path.join(name);
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let pin = DirectoryPin::open(path)?;
+        namespace.pin.file.sync_all()?;
+        Ok(Self {
+            pin,
+            remove_on_drop: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.pin.path
+    }
+}
+
+impl Drop for RuntimeDirectory {
+    fn drop(&mut self) {
+        if self.remove_on_drop && self.pin.verify().is_ok() {
+            if let Err(error) = fs::remove_dir_all(self.path()) {
+                tracing::debug!(target: "git.native_hooks", phase = "cleanup", %error, "native runtime cleanup deferred");
+            }
+        }
+    }
+}
+
+struct Runtime {
+    _socket_root: RuntimeDirectory,
+    _root: RuntimeDirectory,
+    owner: Option<fs::File>,
+    group: fs::File,
+    namespace_pins: [DirectoryPin; 2],
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self._socket_root.remove_on_drop = false;
+        self._root.remove_on_drop = false;
+        // Closing our reference must not unlock a detached Git's shared OFD.
+        drop(self.owner.take());
+        if self.namespace_pins[0].verify().is_ok() && self._root.pin.verify().is_ok() {
+            if let Some(app_dir) = self.namespace_pins[0].path.parent() {
+                if let Err(error) = sweep_runtime(app_dir) {
+                    tracing::debug!(target: "git.native_hooks", phase = "cleanup", %error, "native runtime sweep deferred");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RuntimePhase {
+    Allocating,
+    Ready,
+}
 
 #[derive(Serialize, Deserialize)]
 struct RuntimeMarker {
     kind: String,
+    phase: RuntimePhase,
+    owner_device: u64,
+    owner_inode: u64,
+    group_device: u64,
+    group_inode: u64,
     socket_root: PathBuf,
-    socket_device: u64,
-    socket_inode: u64,
+    socket_namespace: PathBuf,
+    socket_namespace_device: u64,
+    socket_namespace_inode: u64,
+    socket_device: Option<u64>,
+    socket_inode: Option<u64>,
     token: String,
 }
 
+fn private_file(path: &Path, create: bool) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(create)
+        .create(create)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(invalid("native runtime file ownership changed"));
+    }
+    Ok(file)
+}
+
+fn publish_runtime_state(root: &DirectoryPin, marker: &RuntimeMarker) -> io::Result<()> {
+    root.verify()?;
+    let pending = root.path.join("state.next");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&pending)?;
+    serde_json::to_writer(&mut file, marker).map_err(invalid)?;
+    file.sync_all()?;
+    fs::rename(pending, root.path.join("state.json"))?;
+    root.file.sync_all()
+}
+
+fn read_runtime_state(root: &Path) -> io::Result<RuntimeMarker> {
+    serde_json::from_reader(private_file(&root.join("state.json"), false)?)
+        .map_err(|_| invalid("invalid native runtime allocation state"))
+}
+
+fn socket_namespace_name() -> String {
+    format!("aoe-native-git-v2-{}", unsafe { libc::geteuid() })
+}
+
+fn socket_namespace_path(name: &str) -> io::Result<(PathBuf, usize)> {
+    // SAFETY: an all-zero sockaddr_un is valid; only its array length is used.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let limit = address.sun_path.len();
+    let namespace = socket_namespace_name();
+    let platform = std::env::temp_dir();
+    let fits = |base: &Path| {
+        base.join(&namespace)
+            .join(name)
+            .join("control")
+            .as_os_str()
+            .len()
+            < limit
+    };
+    let base = if fits(&platform) {
+        platform
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let length = base
+        .join(&namespace)
+        .join(name)
+        .join("control")
+        .as_os_str()
+        .len();
+    if length >= limit {
+        return Err(invalid(format!(
+            "native socket base {} requires {length} bytes, limit {limit}",
+            base.display()
+        )));
+    }
+    Ok((base.join(namespace), length))
+}
+
 fn sweep_runtime(app_dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(app_dir)? {
+    let namespace = match RuntimeNamespace::open(app_dir.join(RUNTIME_NAMESPACE), false) {
+        Ok(namespace) => namespace,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    sweep_namespace(&namespace)
+}
+
+fn sweep_namespace(namespace: &RuntimeNamespace) -> io::Result<()> {
+    namespace.verify()?;
+    let socket_namespace_name = socket_namespace_name();
+    for entry in fs::read_dir(&namespace.pin.path)? {
         let entry = entry?;
-        if !entry.file_name().as_bytes().starts_with(b"native-git-") {
-            continue;
-        }
-        let path = entry.path();
-        let directory = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(&path)
-        {
-            Ok(directory) => directory,
-            Err(_) => continue,
-        };
-        let before = directory.metadata()?;
-        if !before.is_dir()
-            || before.uid() != unsafe { libc::geteuid() }
-            || before.mode() & 0o777 != 0o700
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| uuid::Uuid::parse_str(name).is_err())
         {
             continue;
         }
-        let mut owner = match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path.join("owner"))
-        {
-            Ok(owner) => owner,
-            Err(_) => continue,
+        let root = match DirectoryPin::open(entry.path()) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "foreign-directory", %error, "native runtime retained");
+                continue;
+            }
         };
-        let metadata = owner.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != before.uid()
-            || metadata.mode() & 0o777 != 0o600
-            || owner.try_lock_exclusive().is_err()
-        {
-            continue;
-        }
-        let mut marker = Vec::new();
-        owner.read_to_end(&mut marker)?;
-        let Ok(marker) = serde_json::from_slice::<RuntimeMarker>(&marker) else {
-            continue;
-        };
-        if marker.kind != RUNTIME_MARKER {
-            continue;
-        }
-        let Ok(group) = runtime_group(&path) else {
-            continue;
-        };
-        // A close-fds wrapper can discard the inherited liveness lock.
-        // Never reclaim while an original Git group member can still execute.
-        if group != 0 {
-            if unsafe { libc::kill(-group, 0) } == 0 {
-                // Unreaped zombies cannot use the route; reuse the owned-runner census.
-                if !matches!(
-                    crate::process::runner_group_executing(group as u32),
-                    Ok(false)
-                ) {
+        let owner = match private_file(&root.path.join("owner"), false) {
+            Ok(owner) => {
+                if owner.try_lock_exclusive().is_err() {
+                    tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "live-owner", "native runtime retained");
                     continue;
                 }
-            } else if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                Some(owner)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => continue,
+        };
+        let state = match read_runtime_state(&root.path) {
+            Ok(state) if state.kind == RUNTIME_MARKER => Some(state),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            _ => {
+                tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "unknown-state", "native runtime retained");
+                continue;
+            }
+        };
+        if let Some(marker) = &state {
+            let Some(owner) = &owner else { continue };
+            let metadata = owner.metadata()?;
+            if metadata.dev() != marker.owner_device || metadata.ino() != marker.owner_inode {
+                tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "replaced-owner", "native runtime retained");
                 continue;
             }
         }
-        let after = fs::symlink_metadata(&path)?;
-        if before.dev() == after.dev() && before.ino() == after.ino() {
-            match fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-                .open(&marker.socket_root)
+        let group = match runtime_group(&root.path, state.as_ref()) {
+            Ok(group) => group,
+            Err(error)
+                if state.is_none()
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
+                    ) =>
             {
-                Ok(socket_directory) => {
-                    if verify_socket_runtime(&marker, &socket_directory.metadata()?).is_err() {
+                0
+            }
+            Err(_) => continue,
+        };
+        // A close-fds wrapper can discard the inherited liveness reference.
+        if group != 0 && unsafe { libc::kill(-group, 0) } == 0 {
+            if !matches!(
+                crate::process::runner_group_executing(group as u32),
+                Ok(false)
+            ) {
+                tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "live-group", "native runtime retained");
+                continue;
+            }
+        } else if group != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            continue;
+        }
+        if let Some(marker) = state {
+            if marker.socket_namespace.file_name() != Some(OsStr::new(&socket_namespace_name))
+                || marker.socket_root.parent() != Some(marker.socket_namespace.as_path())
+                || marker.socket_root.file_name() != root.path.file_name()
+            {
+                continue;
+            }
+            let socket_namespace = match RuntimeNamespace::open(
+                marker.socket_namespace.clone(),
+                false,
+            ) {
+                Ok(namespace) => Some(namespace),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if !matches!(fs::symlink_metadata(&marker.socket_namespace), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                    {
+                        tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "missing-namespace-lock", "native runtime retained");
                         continue;
                     }
-                    fs::remove_dir_all(&marker.socket_root)?;
+                    None
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(_) => continue,
+            };
+            if let Some(socket_namespace) = socket_namespace {
+                let metadata = socket_namespace.pin.file.metadata()?;
+                if metadata.dev() != marker.socket_namespace_device
+                    || metadata.ino() != marker.socket_namespace_inode
+                {
+                    continue;
+                }
+                match DirectoryPin::open(marker.socket_root.clone()) {
+                    Ok(socket) => {
+                        if marker.phase == RuntimePhase::Ready {
+                            if verify_socket_runtime(&marker, &socket.file.metadata()?).is_err() {
+                                continue;
+                            }
+                        } else {
+                            match private_file(&marker.socket_root.join("owner"), false) {
+                                Ok(mut token) => {
+                                    let mut bytes = Vec::new();
+                                    token.read_to_end(&mut bytes)?;
+                                    if bytes != marker.token.as_bytes() {
+                                        continue;
+                                    }
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                Err(_) => continue,
+                            }
+                        }
+                        socket.verify()?;
+                        fs::remove_dir_all(&socket.path)?;
+                        socket_namespace.pin.file.sync_all()?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => continue,
+                }
             }
-            fs::remove_dir_all(path)?;
         }
+        namespace.verify()?;
+        root.verify()?;
+        fs::remove_dir_all(&root.path)?;
+        namespace.pin.file.sync_all()?;
+        tracing::debug!(target: "git.native_hooks", phase = "sweep", reason = "inactive-owned-allocation", "native runtime recovered");
     }
     Ok(())
 }
 
 fn verify_socket_runtime(marker: &RuntimeMarker, metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.uid() != unsafe { libc::geteuid() }
+    let mut token = Vec::new();
+    private_file(&marker.socket_root.join("owner"), false)?.read_to_end(&mut token)?;
+    if marker.phase != RuntimePhase::Ready
+        || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o777 != 0o700
-        || metadata.dev() != marker.socket_device
-        || metadata.ino() != marker.socket_inode
-        || fs::read(marker.socket_root.join("owner"))? != marker.token.as_bytes()
+        || Some(metadata.dev()) != marker.socket_device
+        || Some(metadata.ino()) != marker.socket_inode
+        || token != marker.token.as_bytes()
     {
         return Err(invalid("native runtime socket ownership changed"));
     }
     Ok(())
 }
 
-fn runtime_group(root: &Path) -> io::Result<i32> {
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(root.join("group"))?;
+fn runtime_group(root: &Path, expected: Option<&RuntimeMarker>) -> io::Result<i32> {
+    let mut file = private_file(&root.join("group"), false)?;
+    if let Some(expected) = expected {
+        let metadata = file.metadata()?;
+        if metadata.dev() != expected.group_device || metadata.ino() != expected.group_inode {
+            return Err(invalid("native runtime process group marker changed"));
+        }
+    }
     let mut bytes = [0; 4];
     file.read_exact(&mut bytes)?;
     let group = i32::from_ne_bytes(bytes);
@@ -886,52 +1257,88 @@ fn publish_group(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn allocation_barrier(phase: &str, root: &Path, socket: &Path) -> io::Result<()> {
+    if std::env::var_os("AOE_TEST_NATIVE_ALLOCATE_PHASE").as_deref() == Some(OsStr::new(phase)) {
+        let app = root
+            .parent()
+            .and_then(Path::parent)
+            .expect("private runtime namespace");
+        let ready = app.join(format!("ready-{}", std::process::id()));
+        let pending = ready.with_extension("pending");
+        fs::write(
+            &pending,
+            format!("{}\n{}", root.display(), socket.display()),
+        )?;
+        fs::rename(pending, ready)?;
+        loop {
+            std::thread::park();
+        }
+    }
+    Ok(())
+}
+
 fn initialize(
     cwd: &Path,
     app_dir: &Path,
 ) -> io::Result<(Runtime, Descriptor, PathBuf, UnixListener)> {
-    sweep_runtime(app_dir)?;
-    let root = tempfile::Builder::new()
-        .prefix("native-git-")
-        .tempdir_in(app_dir)?;
-    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
-    let mut owner = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(root.path().join("owner"))?;
-    owner.lock_exclusive()?;
-    let mut group = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(root.path().join("group"))?;
+    let namespace = RuntimeNamespace::open(app_dir.join(RUNTIME_NAMESPACE), true)?;
+    sweep_namespace(&namespace)?;
+    let name = uuid::Uuid::new_v4().to_string();
+    let (socket_base, socket_length) = socket_namespace_path(&name)?;
+    let root = RuntimeDirectory::create(&namespace, &name)?;
+    #[cfg(test)]
+    allocation_barrier("root", root.path(), &socket_base.join(&name))?;
+    let owner = liveness_file(private_file(&root.path().join("owner"), true)?)?;
+    FileExt::lock_shared(&owner)?;
+    let owner_metadata = owner.metadata()?;
+    let mut group = private_file(&root.path().join("group"), true)?;
     group.write_all(&0i32.to_ne_bytes())?;
-    // sun_path is only 104 bytes on macOS, independently of the app path.
-    let socket_root = tempfile::Builder::new()
-        .prefix("aoe-git-")
-        .tempdir_in("/tmp")?;
-    fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700))?;
-    let socket_directory = fs::metadata(socket_root.path())?;
-    let token = uuid::Uuid::new_v4().to_string();
-    let mut socket_owner = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(socket_root.path().join("owner"))?;
-    socket_owner.write_all(token.as_bytes())?;
-    let marker = RuntimeMarker {
+    group.sync_all()?;
+    let group_metadata = group.metadata()?;
+    let socket_namespace = RuntimeNamespace::open(socket_base.clone(), true).map_err(|error| {
+        invalid(format!(
+            "native socket base {} (route {socket_length} bytes) cannot allocate: {error}",
+            socket_base.display()
+        ))
+    })?;
+    let socket_namespace_metadata = socket_namespace.pin.file.metadata()?;
+    let mut marker = RuntimeMarker {
         kind: RUNTIME_MARKER.into(),
-        socket_root: socket_root.path().to_path_buf(),
-        socket_device: socket_directory.dev(),
-        socket_inode: socket_directory.ino(),
-        token,
+        phase: RuntimePhase::Allocating,
+        owner_device: owner_metadata.dev(),
+        owner_inode: owner_metadata.ino(),
+        group_device: group_metadata.dev(),
+        group_inode: group_metadata.ino(),
+        socket_root: socket_namespace.pin.path.join(&name),
+        socket_namespace: socket_namespace.pin.path.clone(),
+        socket_namespace_device: socket_namespace_metadata.dev(),
+        socket_namespace_inode: socket_namespace_metadata.ino(),
+        socket_device: None,
+        socket_inode: None,
+        token: uuid::Uuid::new_v4().to_string(),
     };
-    owner.write_all(&serde_json::to_vec(&marker).map_err(invalid)?)?;
+    publish_runtime_state(&root.pin, &marker)?;
+    let socket_root = RuntimeDirectory::create(&socket_namespace, &name)?;
+    #[cfg(test)]
+    allocation_barrier("socket", root.path(), socket_root.path())?;
+    let socket_directory = socket_root.pin.file.metadata()?;
+    let mut socket_owner = private_file(&socket_root.path().join("owner"), true)?;
+    socket_owner.write_all(marker.token.as_bytes())?;
+    socket_owner.sync_all()?;
+    #[cfg(test)]
+    allocation_barrier("socket-owned", root.path(), socket_root.path())?;
+    marker.phase = RuntimePhase::Ready;
+    marker.socket_device = Some(socket_directory.dev());
+    marker.socket_inode = Some(socket_directory.ino());
+    publish_runtime_state(&root.pin, &marker)?;
     let socket = socket_root.path().join("control");
-    let listener = UnixListener::bind(&socket)?;
+    let listener = UnixListener::bind(&socket).map_err(|error| {
+        invalid(format!(
+            "native socket {} ({socket_length} bytes) cannot bind: {error}",
+            socket.display()
+        ))
+    })?;
     let socket_metadata = fs::symlink_metadata(&socket)?;
     let real_git = which::which("git").map_err(invalid)?;
     let mut command = Command::new(&real_git);
@@ -947,9 +1354,12 @@ fn initialize(
     }
     let program = helper_program(root.path())?;
     symlink(program, proxy_exec.join("git"))?;
+    let root_metadata = root.pin.file.metadata()?;
     let descriptor = Descriptor {
         scope: Scope {
             root: root.path().to_path_buf(),
+            root_device: root_metadata.dev(),
+            root_inode: root_metadata.ino(),
             real_git,
             real_exec,
             proxy_exec,
@@ -957,6 +1367,8 @@ fn initialize(
             socket,
             socket_device: socket_metadata.dev(),
             socket_inode: socket_metadata.ino(),
+            owner_device: owner_metadata.dev(),
+            owner_inode: owner_metadata.ino(),
             capability: uuid::Uuid::new_v4().to_string(),
         },
         hooks: PathBuf::new(),
@@ -967,12 +1379,14 @@ fn initialize(
     };
     let path = root.path().join("scope.json");
     fs::write(&path, serde_json::to_vec(&descriptor).map_err(invalid)?)?;
+    tracing::debug!(target: "git.native_hooks", phase = "allocate", socket_bytes = socket_length, "native runtime ready");
     Ok((
         Runtime {
             _root: root,
-            owner,
+            owner: Some(owner),
             _socket_root: socket_root,
             group,
+            namespace_pins: [namespace.pin, socket_namespace.pin],
         },
         descriptor,
         path,
@@ -987,6 +1401,66 @@ pub(crate) fn run(cwd: &Path, args: &[OsString], lease: &mut dyn HookLease) -> i
 #[cfg(test)]
 thread_local! {
     pub(crate) static MUTATION_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+    static EXHAUST_ACCEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct AcceptExhaustion {
+    _files: Vec<fs::File>,
+    limit: libc::rlimit,
+}
+
+#[cfg(test)]
+impl Drop for AcceptExhaustion {
+    fn drop(&mut self) {
+        // SAFETY: restore this isolated test subprocess's previous descriptor limit.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.limit) };
+    }
+}
+
+#[cfg(test)]
+fn exhaust_accept_for_test(listener: &UnixListener) -> io::Result<Option<AcceptExhaustion>> {
+    if !EXHAUST_ACCEPT.get() {
+        return Ok(None);
+    }
+    let mut pending = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the live listener and one initialized pollfd remain valid.
+    if unsafe { libc::poll(&mut pending, 1, 10_000) } != 1 || pending.revents & libc::POLLIN == 0 {
+        return Err(invalid(
+            "real native callback did not connect before descriptor exhaustion",
+        ));
+    }
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit initializes the supplied structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: getrlimit succeeded.
+    let limit = unsafe { limit.assume_init() };
+    let reduced = libc::rlimit {
+        rlim_cur: limit.rlim_cur.min(128),
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: only this test supervisor, after Git was spawned, changes its soft limit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &reduced) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut exhaustion = AcceptExhaustion {
+        _files: Vec::new(),
+        limit,
+    };
+    loop {
+        match fs::File::open("/dev/null") {
+            Ok(file) => exhaustion._files.push(file),
+            Err(error) if error.raw_os_error() == Some(libc::EMFILE) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(exhaustion))
 }
 
 #[cfg(test)]
@@ -1027,6 +1501,7 @@ fn run_inner(
 ) -> io::Result<Option<Output>> {
     let (runtime, descriptor, routing_path, listener) = initialize(cwd, lease.runtime_dir())?;
     let capability = Arc::<str>::from(descriptor.scope.capability.as_str());
+    let owner_identity = (descriptor.scope.owner_device, descriptor.scope.owner_inode);
     let socket_path = descriptor.scope.socket.clone();
     let prefix_len = global_prefix(args)?;
     let eligible = hooked_command(args.get(prefix_len).map(OsString::as_os_str));
@@ -1038,19 +1513,25 @@ fn run_inner(
     };
     command
         .current_dir(cwd)
+        .env_remove("AOE_NATIVE_GIT_PARENT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let capture = if timeout.is_some() {
-        let stdout = tempfile::NamedTempFile::new()?;
-        let stderr = tempfile::NamedTempFile::new()?;
-        command.stdout(Stdio::from(stdout.reopen()?));
-        command.stderr(Stdio::from(stderr.reopen()?));
+        let stdout = tempfile::tempfile()?;
+        let stderr = tempfile::tempfile()?;
+        command.stdout(Stdio::from(stdout.try_clone()?));
+        command.stderr(Stdio::from(stderr.try_clone()?));
         Some((stdout, stderr))
     } else {
         None
     };
-    let fd = runtime.owner.as_raw_fd();
+    let owner = runtime
+        .owner
+        .as_ref()
+        .expect("runtime owns its liveness lease");
+    owner_hint(&mut command, owner, owner_identity);
+    let fd = owner.as_raw_fd();
     let group_fd = runtime.group.as_raw_fd();
     command.process_group(0);
     // The liveness lock, never a protocol descriptor, survives supervisor death.
@@ -1066,6 +1547,8 @@ fn run_inner(
         pid: child.id(),
         complete: false,
     };
+    #[cfg(test)]
+    let _accept_exhaustion = exhaust_accept_for_test(&listener)?;
     let (sender, receiver) = mpsc::channel();
     let stopping = Arc::new(AtomicBool::new(false));
     let stop_reader = Arc::clone(&stopping);
@@ -1081,9 +1564,27 @@ fn run_inner(
             if stop_reader.load(Ordering::Acquire) {
                 break;
             }
-            let Ok(control) = connection else { break };
-            let Ok(connection) = control.try_clone() else {
-                continue;
+            let control = match connection {
+                Ok(control) => control,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue
+                }
+                Err(error) => {
+                    let _ = reader_sender.send(Event::ListenerError(error));
+                    break;
+                }
+            };
+            let connection = match control.try_clone() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = reader_sender.send(Event::ListenerError(error));
+                    break;
+                }
             };
             let id = uuid::Uuid::new_v4().to_string();
             {
@@ -1097,7 +1598,7 @@ fn run_inner(
             let capability = Arc::clone(&reader_capability);
             let connections = Arc::clone(&reader_connections);
             readers.retain(|reader| !reader.is_finished());
-            readers.push(std::thread::spawn(move || {
+            let reader = std::thread::Builder::new().spawn(move || {
                 let mut authenticated = false;
                 let result = (|| -> io::Result<()> {
                     control.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -1130,7 +1631,14 @@ fn run_inner(
                 if let Err(error) = result {
                     let _ = sender.send(Event::ReadError { id, authenticated, error });
                 }
-            }));
+            });
+            match reader {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    let _ = reader_sender.send(Event::ListenerError(error));
+                    break;
+                }
+            }
         }
         for reader in readers {
             let _ = reader.join();
@@ -1142,8 +1650,10 @@ fn run_inner(
                 let status = child.wait()?;
                 let mut stdout = Vec::new();
                 let mut stderr = Vec::new();
-                stdout_file.as_file_mut().read_to_end(&mut stdout)?;
-                stderr_file.as_file_mut().read_to_end(&mut stderr)?;
+                stdout_file.rewind()?;
+                stderr_file.rewind()?;
+                stdout_file.read_to_end(&mut stdout)?;
+                stderr_file.read_to_end(&mut stderr)?;
                 Ok(Output {
                     status,
                     stdout,
@@ -1155,7 +1665,7 @@ fn run_inner(
         })();
         let _ = sender.send(Event::Exit(output));
     });
-    let mut callbacks: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut callbacks = BTreeSet::new();
     let mut expired = false;
     let mut failure = None;
     let output = loop {
@@ -1166,6 +1676,7 @@ fn run_inner(
                 Ok(event) => event,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     expired = true;
+                    tracing::debug!(target: "git.native_hooks", phase = "timeout", "native Git deadline expired");
                     crate::process::worker::kill_process_group(family.pid);
                     continue;
                 }
@@ -1186,31 +1697,30 @@ fn run_inner(
                         cwd,
                         checkout_ready,
                         git_dir,
+                        reference_transaction,
                         ..
                     },
                 mut control,
             } if failure.is_none() && !expired => {
-                let result = if parent
-                    .as_ref()
-                    .is_some_and(|parent| !callbacks.contains_key(parent))
-                {
-                    Err(invalid("native callback parent is no longer active"))
-                } else {
-                    lease.pause(
-                        &id,
-                        Path::new(OsStr::from_bytes(&cwd)),
-                        checkout_ready,
-                        git_dir
-                            .as_deref()
-                            .map(|path| Path::new(OsStr::from_bytes(path))),
-                    )
-                };
+                let result = lease.pause(
+                    &id,
+                    Path::new(OsStr::from_bytes(&cwd)),
+                    checkout_ready,
+                    git_dir
+                        .as_deref()
+                        .map(|path| Path::new(OsStr::from_bytes(path))),
+                    CallbackContext {
+                        parent: parent.as_deref(),
+                        reference_transaction: reference_transaction.as_deref(),
+                    },
+                );
                 if let Err(error) = result {
                     tracing::warn!(target: "git.native_hooks", phase = "enter", %error, "native callback refused");
                     failure = Some(error);
                     crate::process::worker::kill_process_group(family.pid);
                 } else {
-                    callbacks.insert(id.clone(), parent);
+                    tracing::debug!(target: "git.native_hooks", phase = "enter", callback = %id, parent = ?parent, active = callbacks.len() + 1, "native callback admitted");
+                    callbacks.insert(id.clone());
                     if let Err(error) = writeln!(control, "{id}") {
                         failure = Some(error);
                         crate::process::worker::kill_process_group(family.pid);
@@ -1222,14 +1732,8 @@ fn run_inner(
                 frame: Frame::Done,
                 mut control,
             } if failure.is_none() && !expired => {
-                let result = if !callbacks.contains_key(&id)
-                    || callbacks
-                        .values()
-                        .any(|parent| parent.as_ref() == Some(&id))
-                {
-                    Err(invalid(
-                        "native callback completed outside its callback tree",
-                    ))
+                let result = if !callbacks.contains(&id) {
+                    Err(invalid("native callback completion is not active"))
                 } else {
                     lease.resume(Some(&id))
                 };
@@ -1239,6 +1743,7 @@ fn run_inner(
                     crate::process::worker::kill_process_group(family.pid);
                 } else {
                     callbacks.remove(&id);
+                    tracing::debug!(target: "git.native_hooks", phase = "continue", callback = %id, active = callbacks.len(), "native callback completed");
                     if !callbacks.is_empty() {
                         if let Err(error) = lease.pause_retained() {
                             failure = Some(error);
@@ -1258,11 +1763,16 @@ fn run_inner(
                 error,
             } if failure.is_none() && !expired => {
                 // An unknown connector cannot cancel this owned Git family.
-                if authenticated || callbacks.contains_key(&id) {
+                if authenticated || callbacks.contains(&id) {
                     tracing::warn!(target: "git.native_hooks", phase = "transport", %error, "authenticated native callback connection failed");
                     failure = Some(error);
                     crate::process::worker::kill_process_group(family.pid);
                 }
+            }
+            Event::ListenerError(error) if failure.is_none() && !expired => {
+                tracing::warn!(target: "git.native_hooks", phase = "listener", %error, "native callback listener failed");
+                failure = Some(error);
+                crate::process::worker::kill_process_group(family.pid);
             }
             Event::Exit(output) => break output,
             _ => {}
@@ -1287,8 +1797,9 @@ fn run_inner(
                     id,
                     authenticated,
                     error,
-                } if authenticated || callbacks.contains_key(&id) => Some(error),
+                } if authenticated || callbacks.contains(&id) => Some(error),
                 Event::Frame { .. } => Some(invalid("native Git exited with a pending callback")),
+                Event::ListenerError(error) => Some(error),
                 Event::ReadError { .. } | Event::Exit(_) => None,
             };
             if failure.is_none() {
@@ -1315,7 +1826,10 @@ fn run_inner(
         output?;
         Ok(None)
     } else {
-        output.map(Some)
+        output.map(|output| {
+            tracing::debug!(target: "git.native_hooks", phase = "exit", status = ?output.status.code(), "native Git completed");
+            Some(output)
+        })
     }
 }
 
@@ -1378,10 +1892,12 @@ fn enter_callback(
     control: &mut UnixStream,
     descriptor: &Descriptor,
     checkout_ready: bool,
+    reference_transaction: Option<&str>,
 ) -> io::Result<String> {
     let frame = Frame::Enter {
         capability: descriptor.scope.capability.clone(),
         parent: std::env::var("AOE_NATIVE_GIT_PARENT").ok(),
+        reference_transaction: reference_transaction.map(str::to_owned),
         cwd: std::env::current_dir()?.into_os_string().into_vec(),
         checkout_ready,
         git_dir: std::env::var_os("GIT_DIR").map(OsString::into_vec),
@@ -1392,7 +1908,7 @@ fn enter_callback(
     let mut ack = String::new();
     input.read_line(&mut ack)?;
     if ack.trim_end() != descriptor.scope.capability {
-        return Err(invalid("native callback server authentication failed"));
+        return Err(invalid("native callback capability admission failed"));
     }
     input.get_ref().set_read_timeout(None)?;
     ack.clear();
@@ -1418,6 +1934,7 @@ fn configure_callback(
     .map_err(invalid)?;
     command
         .env(CONTEXT, context)
+        .env_remove(OWNER_FD)
         .env("AOE_NATIVE_GIT_PARENT", callback)
         .env(REAL_EXEC, &descriptor.scope.real_exec)
         .env(PROXY_EXEC, &descriptor.scope.proxy_exec)
@@ -1500,8 +2017,12 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
         .commands
         .iter()
         .find(|hook| OsStr::new(&hook.program) == program);
-    let (original, post_checkout) = match configured {
-        Some(hook) => (OsString::from_vec(hook.command.clone()), hook.post_checkout),
+    let (original, post_checkout, reference_transaction) = match configured {
+        Some(hook) => (
+            OsString::from_vec(hook.command.clone()),
+            hook.post_checkout,
+            hook.reference_transaction,
+        ),
         None => {
             let hooks = match &descriptor.original_hooks {
                 Some(hooks) => hooks.clone(),
@@ -1516,6 +2037,7 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
                     .join(program)
                     .into_os_string(),
                 program == "post-checkout",
+                program == "reference-transaction",
             )
         }
     };
@@ -1527,7 +2049,11 @@ fn run_hook(descriptor: &Descriptor, argv: &[OsString]) -> io::Result<i32> {
     }
     let checkout_ready = post_checkout && is_post_checkout(args);
     let mut control = connect_callback(descriptor)?;
-    let callback = enter_callback(&mut control, descriptor, checkout_ready)?;
+    let phase = reference_transaction
+        .then(|| args.first().and_then(|arg| arg.to_str()))
+        .flatten()
+        .filter(|_| args.len() == 1);
+    let callback = enter_callback(&mut control, descriptor, checkout_ready, phase)?;
     let mut command = hook_command(descriptor, &original, args, configured.is_some())?;
     configure_callback(&mut command, descriptor, &callback)?;
     let status = match command.status() {
@@ -1580,7 +2106,8 @@ fn global_exec_path_action(args: &[OsString], prefix: usize) -> bool {
     false
 }
 
-fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
+fn proxy_git(descriptor: Descriptor, args: &[OsString], owner: &fs::File) -> io::Result<i32> {
+    let owner_identity = (descriptor.scope.owner_device, descriptor.scope.owner_inode);
     let prefix = global_prefix(args)?;
     let name = args.get(prefix).map(OsString::as_os_str);
     if global_exec_path_action(args, prefix) {
@@ -1597,6 +2124,8 @@ fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
             .ok_or_else(|| invalid("native Git routing context is missing"))?;
         routing_git(&descriptor, args, Path::new(&path))?
     };
+    owner_hint(&mut command, owner, owner_identity);
+    inheritable(owner.as_raw_fd(), true)?;
 
     Err(command.exec())
 }
@@ -1604,7 +2133,14 @@ fn proxy_git(descriptor: Descriptor, args: &[OsString]) -> io::Result<i32> {
 /// Handle native Git helpers before initializing a binary's CLI or runtime.
 /// Call before starting threads or the CLI/runtime.
 pub fn try_proxy_entry() -> Option<io::Result<i32>> {
-    let context = std::env::var_os(CONTEXT)?;
+    let Some(context) = std::env::var_os(CONTEXT) else {
+        if let Err(error) = close_inherited_owner() {
+            return Some(Err(error));
+        }
+        // SAFETY: this entrypoint runs before threads or configuration.
+        unsafe { std::env::remove_var(OWNER_FD) };
+        return None;
+    };
     let argv: Vec<OsString> = std::env::args_os().collect();
     let result = proxy_entry(&argv);
     if result.is_none() {
@@ -1624,6 +2160,7 @@ fn context_root(context: &Path) -> Option<&Path> {
 }
 
 fn clear_normal_routing(context: &Path) -> io::Result<()> {
+    close_inherited_owner()?;
     let parameters = match std::env::var_os("GIT_CONFIG_PARAMETERS") {
         Some(value) => match (
             context_root(context),
@@ -1715,7 +2252,10 @@ fn proxy_entry(argv: &[OsString]) -> Option<io::Result<i32>> {
     }
     let descriptor = match load_descriptor() {
         Ok(descriptor) => descriptor,
-        Err(error) => return Some(Err(error)),
+        Err(error) => {
+            let _ = writeln!(io::stderr().lock(), "aoe native Git helper: {error}");
+            return Some(Err(error));
+        }
     };
     let hook = program
         .as_bytes()
@@ -1729,27 +2269,40 @@ fn proxy_entry(argv: &[OsString]) -> Option<io::Result<i32>> {
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o777 != 0o700
+            || metadata.dev() != descriptor.scope.root_device
+            || metadata.ino() != descriptor.scope.root_inode
         {
             return Ok(None);
         }
-        let marker: RuntimeMarker =
-            serde_json::from_slice(&fs::read(descriptor.scope.root.join("owner"))?)
-                .map_err(|_| invalid("invalid native runtime owner"))?;
+        let marker = read_runtime_state(&descriptor.scope.root)?;
+        let owner = private_file(&descriptor.scope.root.join("owner"), false)?.metadata()?;
+        if owner.dev() != descriptor.scope.owner_device
+            || owner.ino() != descriptor.scope.owner_inode
+            || owner.dev() != marker.owner_device
+            || owner.ino() != marker.owner_inode
+        {
+            return Ok(None);
+        }
         let group = unsafe { libc::getpgrp() };
         Ok((marker.kind == RUNTIME_MARKER
+            && marker.phase == RuntimePhase::Ready
             && group > 1
-            && runtime_group(&descriptor.scope.root)? == group)
+            && runtime_group(&descriptor.scope.root, Some(&marker))? == group)
             .then_some(group as u32))
     })()
     .ok()
     .flatten();
-    let result = if program == "git" {
-        proxy_git(descriptor, &argv[1..])
-    } else {
-        run_hook(&descriptor, argv)
-    };
+    let result = (|| {
+        let owner = helper_owner(&descriptor.scope)?;
+        if program == "git" {
+            proxy_git(descriptor, &argv[1..], &owner)
+        } else {
+            run_hook(&descriptor, argv)
+        }
+    })();
     if let Err(error) = &result {
         tracing::warn!(target: "git.native_hooks", phase = "helper", kind = ?error.kind(), "native Git helper failed");
+        let _ = writeln!(io::stderr().lock(), "aoe native Git helper: {error}");
     }
     if result.is_err() {
         if let Some(group) = owned_group {
@@ -1848,9 +2401,50 @@ mod tests {
             let source = std::env::var("AOE_TEST_NATIVE_PROFILE").unwrap();
             let action = std::env::var("AOE_TEST_NATIVE_ACTION").unwrap();
             let cwd = std::env::current_dir().unwrap();
-            if matches!(action.as_str(), "adopt" | "workspace-adopt" | "reuse") {
+            if action == "recover" {
+                let before = crate::session::move_journal::scan();
+                assert_eq!(
+                    before.entries.len(),
+                    1,
+                    "the live rename has one canonical intent"
+                );
+                let path = before.entries[0].0.clone();
+                let bytes = fs::read(&path).unwrap();
+                assert!(crate::session::Storage::recover_pending_moves(
+                    crate::file_watch::FileWatchService::noop()
+                )
+                .unwrap()
+                .is_empty());
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    bytes,
+                    "recovery must not consume or rewrite its live caller"
+                );
+                fs::write(
+                    std::env::var_os("AOE_TEST_NATIVE_MARKER").unwrap(),
+                    "active intent retained",
+                )
+                .unwrap();
+                return;
+            }
+            if action == "replace-result-ref" {
+                let repo = git2::Repository::open(&cwd).unwrap();
+                let reference = repo.commondir().join("refs/heads/new");
+                let bytes = fs::read(&reference).unwrap();
+                let saved = PathBuf::from(std::env::var_os("AOE_TEST_NATIVE_MARKER").unwrap())
+                    .with_extension("original-ref");
+                fs::rename(&reference, saved).unwrap();
+                fs::write(reference, bytes).unwrap();
+                return;
+            }
+            if matches!(
+                action.as_str(),
+                "adopt" | "adopt-rename" | "workspace-adopt" | "reuse"
+            ) {
                 let target = if action == "reuse" {
                     PathBuf::from("/unrelated")
+                } else if action == "adopt-rename" {
+                    PathBuf::from(std::env::var_os("AOE_TEST_NATIVE_TARGET").unwrap())
                 } else if action == "workspace-adopt" {
                     let target = PathBuf::from(std::env::var_os("AOE_TEST_NATIVE_TARGET").unwrap());
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2029,10 +2623,59 @@ mod tests {
             let wrapper = bin.join("git");
             fs::write(&wrapper, "#!/bin/sh\nif [ \"$AOE_TEST_CLOSE_FDS_ONCE\" = 1 ] && [ -n \"$AOE_NATIVE_GIT_CONTEXT\" ]; then\n case \" $* \" in *\" worktree add \"*) export AOE_TEST_NATIVE_CLOSE_FDS=1; exec \"$GIT_EXEC_PATH/git\" \"$@\";; esac\nfi\nexec \"$AOE_TEST_NATIVE_REAL_GIT\" \"$@\"\n").unwrap();
             fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-            for mode in ["long", "nested", "parallel", "argv", "closed-fds"] {
+            for mode in [
+                "long",
+                "nested",
+                "parallel",
+                "argv",
+                "closed-fds",
+                "parallel-configured",
+                "late-enter",
+                "parent-done",
+                "listener-exhausted",
+            ] {
                 let marker = fixture.path().join(format!("{mode}-completed"));
                 let source_entered = fixture.path().join("entered-source");
                 let other_entered = fixture.path().join("entered-other");
+                let ordered = matches!(mode, "late-enter" | "parent-done");
+                let order_root = fixture.path().join(mode);
+                let reference_hook = repo.join(".git/hooks/reference-transaction");
+                let child_effect = order_root.join("child-effect");
+                if ordered {
+                    fs::create_dir(&order_root).unwrap();
+                    assert!(Command::new("mkfifo")
+                        .args(
+                            ["start", "entered", "release", "done"]
+                                .map(|name| order_root.join(name))
+                        )
+                        .status()
+                        .unwrap()
+                        .success());
+                    let start = if mode == "late-enter" {
+                        format!(
+                            "IFS= read -r go < {} || exit 99\n",
+                            shell_escape(&order_root.join("start").to_string_lossy())
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let wait = if mode == "parent-done" {
+                        format!(
+                            "IFS= read -r go < {} || exit 99\n",
+                            shell_escape(&order_root.join("entered").to_string_lossy())
+                        )
+                    } else {
+                        String::new()
+                    };
+                    fs::write(&reference_hook, format!(
+                        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n[ ! -e {started} ] || exit 0\n: > {started}\n(\n{start}unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\nexport AOE_TEST_CALLBACK_DEPTH=1\ngit -C {other} checkout -- tracked\nstatus=$?\nprintf '%s\\n' \"$status\" > {done}\nexit \"$status\"\n) &\n{wait}exit 0\n",
+                        started = shell_escape(&order_root.join("parent-started").to_string_lossy()),
+                        other = shell_escape(&other.to_string_lossy()),
+                        done = shell_escape(&order_root.join("done").to_string_lossy()),
+                    )).unwrap();
+                    fs::set_permissions(&reference_hook, fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
                 let body = match mode {
                     "long" => format!("printf entered > {}\nsleep 0.1 || exit 91\n", shell_escape(&fixture.path().join("long-entered").to_string_lossy())),
                     "nested" => format!("if [ \"$AOE_TEST_CALLBACK_DEPTH\" != 1 ]; then\n export AOE_TEST_CALLBACK_DEPTH=1\n unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\n git -C {} checkout -- tracked || exit 92\nfi\n", shell_escape(&repo.to_string_lossy())),
@@ -2046,6 +2689,28 @@ mod tests {
                     ),
                     "argv" => "test -z \"$(git log --format=%s --grep --exec-path)\" || exit 96\ntest \"$(git --exec-path)\" = \"$GIT_EXEC_PATH\" || exit 97\n".to_string(),
                     "closed-fds" => format!("test -e {} || exit 98\n", shell_escape(&fixture.path().join("fds-closed").to_string_lossy())),
+                    "late-enter" | "parent-done" => {
+                        let child_gate = if mode == "parent-done" {
+                            format!("printf 'entered\\n' > {}\nIFS= read -r go < {} || exit 99\n", shell_escape(&order_root.join("entered").to_string_lossy()), shell_escape(&order_root.join("release").to_string_lossy()))
+                        } else { String::new() };
+                        let signal = order_root.join(if mode == "late-enter" { "start" } else { "release" });
+                        format!(
+                            "if [ \"$AOE_TEST_CALLBACK_DEPTH\" = 1 ]; then\n{child_gate}printf child > {effect}\nexit 0\nelse\nprintf 'go\\n' > {signal}\nIFS= read -r status < {done} || exit 99\n[ \"$status\" = 0 ] || exit 99\nfi\n",
+                            effect = shell_escape(&child_effect.to_string_lossy()),
+                            signal = shell_escape(&signal.to_string_lossy()),
+                            done = shell_escape(&order_root.join("done").to_string_lossy()),
+                        )
+                    }
+                    "parallel-configured" => {
+                        let source_command = format!("hook.race.command=printf source > {}", shell_escape(&source_entered.to_string_lossy()));
+                        let other_command = format!("hook.race.command=printf other > {}", shell_escape(&other_entered.to_string_lossy()));
+                        format!("if [ \"$AOE_TEST_CALLBACK_DEPTH\" = 1 ]; then exit 0; fi\nexport AOE_TEST_CALLBACK_DEPTH=1\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE\ngit -C {source} -c hook.race.event=post-checkout -c {source_command} checkout -- tracked & a=$!\ngit -C {other} -c hook.race.event=post-checkout -c {other_command} checkout -- tracked & b=$!\nwait \"$a\" || exit 94\nwait \"$b\" || exit 95\n",
+                            source = shell_escape(&repo.to_string_lossy()),
+                            other = shell_escape(&other.to_string_lossy()),
+                            source_command = shell_escape(&source_command),
+                            other_command = shell_escape(&other_command))
+                    }
+                    "listener-exhausted" => String::new(),
                     _ => unreachable!(),
                 };
                 let script = format!(
@@ -2079,6 +2744,7 @@ mod tests {
                 };
                 let previous = MUTATION_TIMEOUT
                     .replace((mode == "long").then_some(std::time::Duration::from_millis(40)));
+                EXHAUST_ACCEPT.set(mode == "listener-exhausted");
                 let mut ownership =
                     Some(crate::session::storage::acquire_ownership_read().unwrap());
                 let result = crate::session::native_hooks::create_worktree(
@@ -2091,7 +2757,23 @@ mod tests {
                     None,
                 );
                 MUTATION_TIMEOUT.set(previous);
+                EXHAUST_ACCEPT.set(false);
                 drop(routing);
+                if mode == "listener-exhausted" {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => panic!("descriptor exhaustion must fail the supervisor"),
+                    };
+                    assert_eq!(
+                        error
+                            .chain()
+                            .find_map(|cause| cause.downcast_ref::<io::Error>())
+                            .and_then(io::Error::raw_os_error),
+                        Some(libc::EMFILE)
+                    );
+                    assert!(!marker.exists(), "unadmitted user hook must not execute");
+                    continue;
+                }
                 let (_, witness) = result.unwrap_or_else(|error| panic!("{mode}: {error:#}"));
                 witness.verify().unwrap();
                 assert_eq!(fs::read(&marker).unwrap(), b"complete", "{mode}");
@@ -2108,6 +2790,14 @@ mod tests {
                 }
                 if mode == "parallel" {
                     assert!(source_entered.exists() && other_entered.exists());
+                }
+                if mode == "parallel-configured" {
+                    assert_eq!(fs::read(&source_entered).unwrap(), b"source");
+                    assert_eq!(fs::read(&other_entered).unwrap(), b"other");
+                }
+                if ordered {
+                    assert_eq!(fs::read(&child_effect).unwrap(), b"child");
+                    fs::remove_file(&reference_hook).unwrap();
                 }
             }
             return;
@@ -2607,9 +3297,11 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        fn start(app: &Path) -> (Owner, PathBuf, PathBuf) {
+        fn start(app: &Path, phase: &str, temp: Option<&Path>) -> (Owner, PathBuf, PathBuf) {
             let child = Command::new(crate::process::running_image().unwrap())
                 .args(["--exact", "git::native_hooks::tests::runtime_cleanup_reclaims_only_dead_owned_invocations", "--nocapture"])
+                .env("AOE_TEST_NATIVE_ALLOCATE_PHASE", phase)
+                .envs(temp.map(|path| ("TMPDIR", path)))
                 .env("AOE_TEST_NATIVE_RUNTIME_OWNER", app).process_group(0)
                 .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
             let mut owner = Owner(child);
@@ -2633,8 +3325,8 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let app = fixture.path().join("a".repeat(120));
         fs::create_dir(&app).unwrap();
-        let (mut stale, stale_root, stale_socket) = start(&app);
-        let (active, active_root, active_socket) = start(&app);
+        let (mut stale, stale_root, stale_socket) = start(&app, "", None);
+        let (active, active_root, active_socket) = start(&app, "", None);
         let foreign = app.join("native-git-foreign");
         fs::create_dir(&foreign).unwrap();
         fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2645,6 +3337,33 @@ mod tests {
         assert!(!stale_root.exists() && !stale_socket.exists());
         assert!(active_root.exists() && active_socket.exists());
         assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"keep");
+        for phase in ["root", "socket", "socket-owned"] {
+            let (mut interrupted, root, socket) = start(&app, phase, None);
+            assert!(root.exists(), "{phase}");
+            assert_eq!(socket.exists(), phase != "root", "{phase}");
+            interrupted.0.kill().unwrap();
+            interrupted.0.wait().unwrap();
+            let (_next, _, _, _) = initialize(&app, &app).unwrap();
+            assert!(!root.exists() && !socket.exists(), "{phase}");
+            assert!(active_root.exists() && active_socket.exists(), "{phase}");
+            assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"keep");
+        }
+        let short_temp = tempfile::tempdir_in("/tmp").unwrap();
+        let long_temp = fixture.path().join("t".repeat(120));
+        fs::create_dir(&long_temp).unwrap();
+        for temp in [short_temp.path(), long_temp.as_path()] {
+            let (routed, root, socket) = start(&app, "", Some(temp));
+            assert_eq!(socket.starts_with(temp), temp == short_temp.path());
+            // SAFETY: only the initialized array's length is inspected.
+            let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            assert!(socket.join("control").as_os_str().len() < address.sun_path.len());
+            let _connection = UnixStream::connect(socket.join("control")).unwrap();
+            drop(routed);
+            sweep_runtime(&app).unwrap();
+            assert!(!root.exists() && !socket.exists());
+            assert!(active_root.exists() && active_socket.exists());
+            assert_eq!(fs::read(foreign.join("sentinel")).unwrap(), b"keep");
+        }
         drop(active);
         sweep_runtime(&app).unwrap();
         assert!(!active_root.exists() && !active_socket.exists());
@@ -2743,5 +3462,127 @@ mod tests {
         assert!(try_proxy_entry().unwrap().is_err());
         assert_eq!(std::env::var_os(CONTEXT), Some(context.into_os_string()));
         assert_eq!(std::env::var_os("GIT_CONFIG_PARAMETERS"), Some(malformed));
+    }
+
+    #[test]
+    fn ordinary_entry_releases_only_the_verified_inherited_owner_reference() {
+        use std::os::fd::IntoRawFd;
+        for (replace, has_context) in [(false, true), (true, true), (false, false), (true, false)] {
+            let app = tempfile::tempdir().unwrap();
+            let (runtime, descriptor, context, _listener) =
+                initialize(app.path(), app.path()).unwrap();
+            let root = runtime._root.path().to_path_buf();
+            let owner = runtime.owner.as_ref().unwrap();
+            let fd = owner.try_clone().unwrap().into_raw_fd();
+            let foreign_path = app.path().join("foreign");
+            let mut foreign = private_file(&foreign_path, true).unwrap();
+            foreign.write_all(b"before").unwrap();
+            let reused = if replace {
+                // SAFETY: fd is our raw owned duplicate, atomically replaced by another owned file.
+                assert_eq!(unsafe { libc::dup2(foreign.as_raw_fd(), fd) }, fd);
+                // SAFETY: dup2 left this new descriptor owned by the test.
+                Some(unsafe { fs::File::from_raw_fd(fd) })
+            } else {
+                None
+            };
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                (CONTEXT, context.into_os_string()),
+                (
+                    OWNER_FD,
+                    OsString::from(format!(
+                        "{fd}:{}:{}",
+                        descriptor.scope.owner_device, descriptor.scope.owner_inode
+                    )),
+                ),
+                (
+                    PROGRAM_PREFIX,
+                    OsString::from(&descriptor.scope.program_prefix),
+                ),
+                (PARAMETERS_PRESENT, OsString::from("0")),
+                ("GIT_CONFIG_PARAMETERS", OsString::new()),
+            ]);
+            if !has_context {
+                // SAFETY: EnvGuard serializes this test's environment changes.
+                unsafe { std::env::remove_var(CONTEXT) };
+            }
+            assert!(try_proxy_entry().is_none());
+            if let Some(mut reused) = reused {
+                reused.write_all(b"after").unwrap();
+                assert_eq!(fs::read(&foreign_path).unwrap(), b"beforeafter");
+            }
+            sweep_runtime(app.path()).unwrap();
+            assert!(
+                root.exists(),
+                "retiring one reference must not LOCK_UN the original"
+            );
+            drop(runtime);
+            assert!(
+                !root.exists(),
+                "an ordinary invocation must not retain runtime liveness"
+            );
+            assert_eq!(
+                fs::read(&foreign_path).unwrap(),
+                if replace {
+                    b"beforeafter".as_slice()
+                } else {
+                    b"before".as_slice()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn configured_proxy_refuses_foreign_program_without_replacing_or_running_it() {
+        let app = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("GIT_CONFIG_NOSYSTEM", OsString::from("1")),
+            ("GIT_CONFIG_GLOBAL", OsString::from("/dev/null")),
+        ]);
+        let repo = app.path().join("repository");
+        let repository = git2::Repository::init(&repo).unwrap();
+        fs::write(repo.join("tracked"), b"base").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("tracked")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        fs::write(repo.join("tracked"), b"user-change").unwrap();
+        let (_runtime, descriptor, context, _listener) = initialize(&repo, app.path()).unwrap();
+        let sentinel = app.path().join("foreign-target");
+        fs::write(&sentinel, b"keep").unwrap();
+        let program = descriptor
+            .scope
+            .proxy_exec
+            .join(format!("{}-0", descriptor.scope.program_prefix));
+        symlink(&sentinel, &program).unwrap();
+        let before = fs::symlink_metadata(&program).unwrap();
+        let effect = app.path().join("configured-effect");
+        let output = Command::new(descriptor.scope.proxy_exec.join("git"))
+            .current_dir(&repo)
+            .args(["-c", "hook.race.event=post-checkout", "-c"])
+            .arg(format!(
+                "hook.race.command=printf ran > {}",
+                crate::session::environment::shell_escape(&effect.to_string_lossy())
+            ))
+            .args(["checkout", "--", "tracked"])
+            .env(CONTEXT, context)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!output.stderr.is_empty());
+        assert!(!output
+            .stderr
+            .windows(descriptor.scope.capability.len())
+            .any(|part| part == descriptor.scope.capability.as_bytes()));
+        let after = fs::symlink_metadata(&program).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(fs::read_link(&program).unwrap(), sentinel);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(fs::read(repo.join("tracked")).unwrap(), b"user-change");
+        assert!(!effect.exists());
     }
 }

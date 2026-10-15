@@ -1773,76 +1773,116 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let Some((profile, owned_trash_generation)) =
-            self.instances.get(&id).filter(|i| i.is_trashed()).map(|i| {
-                let generation = i
-                    .lifecycle_reservation
-                    .as_ref()
-                    .filter(|reservation| reservation.op == LifecycleOperation::Trash)
-                    .map(|reservation| reservation.generation);
-                (i.source_profile.clone(), generation)
-            })
+        self.restore_from_trash_by_id(&id);
+    }
+
+    fn restore_from_trash_by_id(&mut self, id: &str) {
+        let Some(baseline) = self
+            .instances
+            .get(id)
+            .filter(|row| row.is_trashed())
+            .cloned()
         else {
             return;
         };
-        // Restore bypasses the generic user-action diff because lifecycle ownership,
-        // worktree movement and the durable untrash must stay under the per-instance
-        // flock.
-        let outcome = {
-            let Some(storage) = self.storages.get(&profile) else {
-                tracing::warn!(
-                    target: "tui.home",
-                    profile = %profile,
-                    id = %id,
-                    "restore: no storage registered for profile"
-                );
-                return;
-            };
-            restore_from_trash_with_storage(storage, &id, owned_trash_generation)
+        if self.restore_worker.is_pending(id) {
+            return;
+        }
+        let Some(storage) = self.storages.get(&baseline.source_profile).cloned() else {
+            return;
         };
-        match outcome {
-            RestoreFromTrash::Restored {
-                project_path,
-                pre_trash_project_path,
-            } => {
-                if let Some(inst) = self.instances.get_mut(&id) {
-                    inst.project_path = project_path;
-                    inst.pre_trash_project_path = pre_trash_project_path;
-                    inst.untrash();
-                    inst.lifecycle_reservation = None;
+        self.restore_worker
+            .request(id.to_string(), RestoreRequest { storage, baseline });
+    }
+
+    pub(in crate::tui) fn apply_restore_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        loop {
+            match self.restore_worker.try_recv() {
+                Ok(result) => {
+                    changed = true;
+                    let Some(current) = self.instances.get_mut(&result.baseline.id) else {
+                        continue;
+                    };
+                    if current.created_at != result.baseline.created_at
+                        || current.source_profile != result.baseline.source_profile
+                        || result.storage.verify_profile_identity().is_err()
+                    {
+                        continue;
+                    }
+                    match result.outcome {
+                        Ok(restored) => {
+                            if current.lifecycle_generation > restored.lifecycle_generation
+                                || current.trashed_at != result.baseline.trashed_at
+                                || current.trash_lifecycle_id != result.baseline.trash_lifecycle_id
+                            {
+                                continue;
+                            }
+                            current.project_path = restored.project_path;
+                            current.pre_trash_project_path = restored.pre_trash_project_path;
+                            current.lifecycle_generation = restored.lifecycle_generation;
+                            current.lifecycle_reservation = restored.lifecycle_reservation;
+                            current.untrash();
+                            let was_selected =
+                                self.selected_session.as_deref() == Some(&result.baseline.id);
+                            self.rebuild_flat_items();
+                            if was_selected {
+                                self.select_session_by_id(&result.baseline.id);
+                            }
+                        }
+                        Err(crate::session::trash::RestoreError::NotFound) => {
+                            self.drop_peer_deleted_rows(std::slice::from_ref(&result.baseline.id));
+                            self.rebuild_flat_items();
+                        }
+                        Err(error) => {
+                            let reason = match error {
+                                crate::session::trash::RestoreError::Busy(reason) => {
+                                    format!("Session is {reason}, so it was not restored.")
+                                }
+                                crate::session::trash::RestoreError::Worktree(reason) => {
+                                    format!("Could not restore the worktree: {reason}")
+                                }
+                                crate::session::trash::RestoreError::Persist(error) => {
+                                    format!("Could not persist the restore: {error}")
+                                }
+                                crate::session::trash::RestoreError::NotFound => unreachable!(),
+                            };
+                            self.info_dialog = Some(InfoDialog::new("Restore Failed", &reason));
+                        }
+                    }
                 }
-                self.rebuild_flat_items();
-                self.select_session_by_id(&id);
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.restore_worker.take_pending().is_empty() {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Restore Failed",
+                            "The restore worker stopped; reload and retry.",
+                        ));
+                        changed = true;
+                    }
+                    break;
+                }
             }
-            RestoreFromTrash::AlreadyGone => {
-                self.drop_peer_deleted_rows(std::slice::from_ref(&id));
-                self.rebuild_flat_items();
-            }
-            RestoreFromTrash::Busy(reason) => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    &format!("Session is {reason}, so it was not restored."),
-                ));
-            }
-            RestoreFromTrash::WorktreeFailed { reason } => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    &format!("Could not restore the worktree: {reason}"),
-                ));
-            }
-            RestoreFromTrash::PersistFailed => {
-                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                    "Restore Failed",
-                    "Could not persist the restore. Try again.",
-                ));
-            }
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_restore_for_test(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let ids: Vec<_> = self.instances.keys().cloned().collect();
+        while ids.iter().any(|id| self.restore_worker.is_pending(id)) {
+            self.apply_restore_results();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore result never drained"
+            );
+            std::thread::yield_now();
         }
     }
 
-    /// Restore every trashed session, driving each row through the same
-    /// `restore_selected_from_trash` as a single restore so the claim/commit races
-    /// (#2541) are handled identically. Each failure surfaces its own info dialog; the
-    /// last one wins, which is acceptable for a rare bulk recovery.
+    /// Enqueue each trashed row by ID; failures use the same dialog as selected restore.
     pub(super) fn restore_all_from_trash(&mut self) {
         let ids: Vec<String> = self
             .instances
@@ -1854,11 +1894,7 @@ impl HomeView {
             return;
         }
         for id in ids {
-            // `restore_selected_from_trash` acts on the selection, so point it at each
-            // row in turn; it re-selects the restored session, which the next iteration
-            // overwrites.
-            self.selected_session = Some(id);
-            self.restore_selected_from_trash();
+            self.restore_from_trash_by_id(&id);
         }
     }
 
@@ -2056,141 +2092,39 @@ impl HomeView {
     }
 }
 
-/// Outcome of a TUI restore-from-trash driven directly against storage. See #2541.
-enum RestoreFromTrash {
-    Restored {
-        project_path: String,
-        pre_trash_project_path: Option<String>,
-    },
-    AlreadyGone,
-    Busy(String),
-    WorktreeFailed {
-        reason: String,
-    },
-    PersistFailed,
+pub(in crate::tui) struct RestoreRequest {
+    storage: Storage,
+    baseline: Instance,
 }
 
-/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
-/// and durable commit therefore form one serialized transition.
-fn restore_from_trash_with_storage(
-    storage: &Storage,
-    id: &str,
-    owned_trash_generation: Option<u64>,
-) -> RestoreFromTrash {
-    let ownership = match crate::session::storage::acquire_ownership_lock() {
-        Ok(lock) => lock,
-        Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore ownership lock failed: {error}");
-            return RestoreFromTrash::PersistFailed;
-        }
-    };
-    let _identity_lock = match crate::session::storage::acquire_session_identity_lock_with_ownership(
-        &ownership,
-    ) {
-        Ok(lock) => lock,
-        Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
-            return RestoreFromTrash::PersistFailed;
-        }
-    };
-    let _lifecycle_lock =
-        match storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, id) {
-            Ok(lock) => lock,
-            Err(error) => {
-                tracing::warn!(target: "tui.home", id = %id, "restore lock failed: {error}");
-                return RestoreFromTrash::PersistFailed;
-            }
-        };
-    if let Err(error) = storage.load_strict_for_worktree_ownership() {
-        tracing::warn!(target: "tui.home", id = %id, "restore ownership inventory failed: {error}");
-        return RestoreFromTrash::PersistFailed;
+pub(in crate::tui) struct RestoreResult {
+    storage: Storage,
+    baseline: Instance,
+    outcome: Result<Instance, crate::session::trash::RestoreError>,
+}
+
+impl crate::tui::worker::SessionScoped for RestoreResult {
+    fn session_id(&self) -> &str {
+        &self.baseline.id
     }
-    let decision = match storage.update_with_ownership(&ownership, |instances, _groups| {
-        let decision = match owned_trash_generation {
-            Some(generation) => crate::session::claim::decide_restore_claim_after_trash(
-                instances,
-                id,
-                generation,
-                chrono::Utc::now(),
-            ),
-            None => crate::session::claim::decide_restore_claim(instances, id, chrono::Utc::now()),
-        };
-        decision.map_err(anyhow::Error::new)
-    }) {
-        Ok(decision) => decision,
-        Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore reservation failed: {error}");
-            return RestoreFromTrash::PersistFailed;
-        }
-    };
-    let generation = match decision {
-        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
-        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-            return RestoreFromTrash::AlreadyGone;
-        }
-        crate::session::claim::RestoreClaimDecision::Busy(holder) => {
-            return RestoreFromTrash::Busy(holder.busy_reason());
-        }
-    };
+}
 
-    let loaded = match storage.load() {
-        Ok(all) => all.into_iter().find(|instance| instance.id == id),
-        Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
-            let _ = storage.update_with_ownership(&ownership, |instances, _groups| {
-                if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Restore,
-                        generation,
-                    );
-                }
-                Ok(())
-            });
-            return RestoreFromTrash::PersistFailed;
-        }
-    };
-    let Some(mut instance) = loaded else {
-        return RestoreFromTrash::AlreadyGone;
-    };
-
-    if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut instance, &ownership)
-    {
-        let _ = storage.update_with_ownership(&ownership, |instances, _groups| {
-            if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
-                stored.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Restore,
-                    generation,
-                );
-            }
-            Ok(())
-        });
-        return RestoreFromTrash::WorktreeFailed { reason };
-    }
-    let restored_path = instance.project_path.clone();
-    let restored_pre = instance.pre_trash_project_path.clone();
-
-    match storage.update_with_ownership(&ownership, |instances, _groups| {
-        Ok(crate::session::claim::finalize_restore_commit(
-            instances,
-            id,
-            generation,
-            &restored_path,
-            &restored_pre,
-        ))
-    }) {
-        Ok(crate::session::claim::RestoreCommit::Committed) => RestoreFromTrash::Restored {
-            project_path: restored_path,
-            pre_trash_project_path: restored_pre,
-        },
-        Ok(crate::session::claim::RestoreCommit::Superseded) => {
-            RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
-        }
-        Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
-        Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
-            RestoreFromTrash::PersistFailed
-        }
+pub(super) fn perform_restore(request: RestoreRequest) -> RestoreResult {
+    let owned_trash_generation = request
+        .baseline
+        .lifecycle_reservation
+        .as_ref()
+        .filter(|reservation| reservation.op == LifecycleOperation::Trash)
+        .map(|reservation| reservation.generation);
+    let outcome = crate::session::trash::restore_transition(
+        &request.storage,
+        &request.baseline,
+        owned_trash_generation,
+    );
+    RestoreResult {
+        storage: request.storage,
+        baseline: request.baseline,
+        outcome,
     }
 }
 

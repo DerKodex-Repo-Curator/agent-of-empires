@@ -261,6 +261,26 @@ impl PathSnapshot {
         })
     }
 
+    pub(crate) fn durable_authority(&self) -> Result<super::move_journal::PathAuthority> {
+        self.verify()?;
+        let (identity, directory, contents) = match &self.pin {
+            None => (None, false, None),
+            Some(EntryPin::Directory(directory)) => return directory.durable_authority(),
+            Some(EntryPin::File { handle, bytes }) => (
+                Some(super::storage::filesystem_identity(&handle.metadata()?)),
+                false,
+                Some(bytes.clone()),
+            ),
+        };
+        Ok(super::move_journal::PathAuthority {
+            path: self.path.clone(),
+            resolved: self.resolved.clone(),
+            identity,
+            directory,
+            contents,
+        })
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         anyhow::ensure!(
             super::deletion::resolve_claim_path(&self.path).as_ref() == Some(&self.resolved),
@@ -366,6 +386,48 @@ impl CheckoutBoundary {
         Ok(())
     }
 }
+
+fn same_callback_path(left: &Path, right: &Path) -> bool {
+    super::deletion::resolve_claim_path(left)
+        .is_some_and(|left| super::deletion::resolve_claim_path(right).as_ref() == Some(&left))
+}
+
+fn own_callback_context(
+    context: crate::git::native_hooks::CallbackContext<'_>,
+    cwd: &Path,
+    git_dir: Option<&Path>,
+    source: &Path,
+    checkout: &Path,
+    source_git: &DirectoryWitness,
+    common: &DirectoryWitness,
+) -> Result<(bool, bool)> {
+    if context.parent.is_some() {
+        return Ok((false, false));
+    }
+    let at_checkout = same_callback_path(cwd, checkout);
+    let at_source = same_callback_path(cwd, source);
+    if !at_checkout && !at_source {
+        return Ok((false, false));
+    }
+    let repo = match git2::Repository::open(cwd) {
+        Ok(repo) => repo,
+        Err(error) if error.code() == git2::ErrorCode::NotFound && git_dir.is_some() => {
+            git2::Repository::open(
+                cwd.join(git_dir.context("native callback Git directory missing")?),
+            )?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    common.verify_at(repo.commondir())?;
+    if at_source {
+        source_git.verify_at(repo.path())?;
+    }
+    let own_checkout = at_checkout
+        && repo
+            .workdir()
+            .is_some_and(|path| same_callback_path(path, checkout));
+    Ok((true, own_checkout))
+}
 /// The caller's concrete lock order. Git effects stay fenced except while a
 /// native callback runs; retained Arc holders share the same open description.
 #[derive(Clone, Copy)]
@@ -417,6 +479,25 @@ impl BranchOrigin {
     }
     pub(crate) fn branch_name(&self) -> &str {
         &self.branch
+    }
+
+    pub(crate) fn durable_authority(&self) -> Result<super::move_journal::BranchAuthority> {
+        self.verify_source()?;
+        Ok(super::move_journal::BranchAuthority {
+            repository: self.directory.durable_authority()?,
+            git: self.git.durable_authority()?,
+            common: self.common.durable_authority()?,
+            branch: self.branch.clone(),
+            reference: self.reference.clone(),
+            tip: self.tip.to_string(),
+            loose: self.loose.durable_authority()?,
+            packed: self.packed.durable_authority()?,
+            routes: self
+                .routes
+                .iter()
+                .map(PathSnapshot::durable_authority)
+                .collect::<Result<_>>()?,
+        })
     }
 
     pub(crate) fn capture(repo: &Path, branch: &str) -> Result<Self> {
@@ -565,10 +646,14 @@ struct BranchLease<'a> {
     app: DirectoryWitness,
     protected_path: Option<CheckoutBoundary>,
     owner: Option<(Storage, Option<super::Instance>)>,
-    boundary: Vec<PathSnapshot>,
+    boundary: Vec<(String, PathSnapshot)>,
+    callback_boundaries: Vec<(String, CheckoutBoundary)>,
     branch_checkouts: Vec<PathBuf>,
     root_paused: bool,
     nested_released: usize,
+    recreating: bool,
+    recreated: Option<PathSnapshot>,
+    recreated_authority: Option<super::move_journal::PathAuthority>,
 }
 
 impl<'a> BranchLease<'a> {
@@ -624,14 +709,42 @@ impl<'a> BranchLease<'a> {
             protected_path,
             owner,
             boundary: Vec::new(),
+            callback_boundaries: Vec::new(),
             root_paused: false,
             nested_released: 0,
+            recreating: false,
+            recreated: None,
+            recreated_authority: None,
         })
     }
 
     fn verify(&self) -> Result<()> {
         self.handoff.root.require_exclusive()?;
-        self.origin.verify(self.destination)?;
+        self.verify_boundaries()?;
+        if self.recreating {
+            let repo = git2::Repository::open(&self.origin.repo)?;
+            self.origin.directory.verify()?;
+            self.origin.git.verify_at(repo.path())?;
+            self.origin.common.verify_at(repo.commondir())?;
+            let tip = local_branch_tip(&repo, &self.origin.branch)?;
+            anyhow::ensure!(
+                tip.is_none() || tip == Some(self.origin.tip),
+                "original reference creation was superseded"
+            );
+            if let Some(recreated) = &self.recreated {
+                anyhow::ensure!(
+                    tip == Some(self.origin.tip),
+                    "restored original reference disappeared"
+                );
+                recreated.verify()?;
+            } else if tip.is_none() {
+                self.origin.loose.verify()?;
+            }
+            // A visible in-flight result is not a recovery receipt.
+            self.origin.packed.verify()?;
+        } else {
+            self.origin.verify(self.destination)?;
+        }
         self.checkout.verify()?;
         self.app.verify()?;
         if let Some(path) = &self.protected_path {
@@ -709,6 +822,33 @@ impl<'a> BranchLease<'a> {
         Ok(())
     }
 
+    fn record_recreation(&mut self) -> Result<()> {
+        if self.recreating && self.recreated.is_none() {
+            let repo = git2::Repository::open(&self.origin.repo)?;
+            self.origin.directory.verify()?;
+            self.origin.git.verify_at(repo.path())?;
+            self.origin.common.verify_at(repo.commondir())?;
+            anyhow::ensure!(
+                local_branch_tip(&repo, &self.origin.branch)? == Some(self.origin.tip),
+                "committed reference creation does not match the retained object"
+            );
+            let snapshot = PathSnapshot::capture(repo.commondir().join(&self.origin.reference))?;
+            self.recreated_authority = Some(snapshot.durable_authority()?);
+            self.recreated = Some(snapshot);
+        }
+        Ok(())
+    }
+
+    fn verify_boundaries(&self) -> Result<()> {
+        for (_, path) in &self.boundary {
+            path.verify()?;
+        }
+        for (_, boundary) in &self.callback_boundaries {
+            boundary.verify()?;
+        }
+        Ok(())
+    }
+
     fn restore_locks(&mut self) -> Result<()> {
         let mut result = Ok(());
         if self.root_paused {
@@ -728,9 +868,6 @@ impl<'a> BranchLease<'a> {
 
     fn finish(&mut self) -> Result<()> {
         self.restore_locks()?;
-        for path in &self.boundary {
-            path.verify()?;
-        }
         self.verify()
     }
 }
@@ -746,41 +883,68 @@ impl crate::git::native_hooks::HookLease for BranchLease<'_> {
         self.verify()
             .map_err(|error| io::Error::other(format!("{error:#}")))
     }
-    fn pause(&mut self, _: &str, _: &Path, _: bool, _: Option<&Path>) -> io::Result<()> {
-        if self.root_paused {
-            self.resume(None)?;
-            return self.pause_retained();
-        }
+    fn pause(
+        &mut self,
+        callback: &str,
+        cwd: &Path,
+        _: bool,
+        git_dir: Option<&Path>,
+        context: crate::git::native_hooks::CallbackContext<'_>,
+    ) -> io::Result<()> {
         let mut pause = || -> Result<()> {
+            self.restore_locks()?;
+            self.verify_boundaries()?;
+            let (own, _) = own_callback_context(
+                context,
+                cwd,
+                git_dir,
+                &self.origin.repo,
+                self.path,
+                &self.origin.git,
+                &self.origin.common,
+            )?;
+            if own && context.reference_transaction == Some("committed") {
+                self.record_recreation()?;
+            }
             self.verify()?;
-            let repo = git2::Repository::open(&self.origin.repo)?;
-            let mut paths = vec![
-                repo.commondir()
-                    .join(format!("refs/heads/{}", self.origin.branch)),
-                repo.commondir().join("packed-refs"),
-                repo.path().join("HEAD"),
-            ];
-            if let Some(destination) = self.destination {
-                paths.push(repo.commondir().join(format!("refs/heads/{destination}")));
+            let admin = git_dir.map(|directory| cwd.join(directory));
+            self.callback_boundaries.push((
+                callback.to_owned(),
+                CheckoutBoundary::capture(cwd, admin.as_deref())?,
+            ));
+            if own {
+                let repo = git2::Repository::open(&self.origin.repo)?;
+                let mut paths = vec![
+                    repo.commondir()
+                        .join(format!("refs/heads/{}", self.origin.branch)),
+                    repo.commondir().join("packed-refs"),
+                    repo.path().join("HEAD"),
+                ];
+                if let Some(destination) = self.destination {
+                    paths.push(repo.commondir().join(format!("refs/heads/{destination}")));
+                }
+                if let Some(head) = &self.checkout_head {
+                    paths.push(head.clone());
+                }
+                for path in paths {
+                    self.boundary
+                        .push((callback.to_owned(), PathSnapshot::capture(path)?));
+                }
             }
-            if let Some(head) = &self.checkout_head {
-                paths.push(head.clone());
-            }
-            self.boundary = paths
-                .into_iter()
-                .map(PathSnapshot::capture)
-                .collect::<Result<_>>()?;
+            self.verify()?;
             self.pause_retained().map_err(anyhow::Error::from)
         };
         pause().map_err(|error| io::Error::other(format!("{error:#}")))
     }
-    fn resume(&mut self, _: Option<&str>) -> io::Result<()> {
+    fn resume(&mut self, completed: Option<&str>) -> io::Result<()> {
         let mut resume = || -> Result<()> {
             self.restore_locks()?;
-            for path in &self.boundary {
-                path.verify()?;
-            }
             self.verify()?;
+            if let Some(completed) = completed {
+                self.boundary.retain(|(callback, _)| callback != completed);
+                self.callback_boundaries
+                    .retain(|(callback, _)| callback != completed);
+            }
             Ok(())
         };
         resume().map_err(|error| io::Error::other(format!("{error:#}")))
@@ -813,19 +977,78 @@ pub(crate) fn rename_branch(
     new: &str,
 ) -> Result<()> {
     let origin = BranchOrigin::capture(repo, old)?;
-    let mut lease = BranchLease::new(handoff, &origin, path, Some(new))?;
-    let git = crate::git::GitWorktree::new(repo.to_path_buf())?;
-    let result = git.rename_branch_with_hooks(old, new, Some(&mut lease));
+    rename_branch_from_origin(handoff, &origin, path, new)
+}
+
+pub(crate) fn rename_branch_from_origin(
+    handoff: BranchHandoff<'_>,
+    origin: &BranchOrigin,
+    path: &Path,
+    new: &str,
+) -> Result<()> {
+    let mut lease = BranchLease::new(handoff, origin, path, Some(new))?;
+    let git = crate::git::GitWorktree::new(origin.repo.clone())?;
+    let result = git.rename_branch_with_hooks(&origin.branch, new, Some(&mut lease));
     lease.finish()?;
     result?;
-    let repo = git2::Repository::open(repo)?;
+    let repo = git2::Repository::open(&origin.repo)?;
     anyhow::ensure!(
-        local_branch_tip(&repo, old)?.is_none()
+        local_branch_tip(&repo, &origin.branch)?.is_none()
             && local_branch_tip(&repo, new)? == Some(origin.tip)
             && crate::git::GitWorktree::get_current_branch(path)? == new,
         "Native branch rename did not complete against its original reference"
     );
     Ok(())
+}
+
+/// Recreate only an absent original name, using its pre-effect object authority.
+pub(crate) fn restore_missing_branch(
+    handoff: BranchHandoff<'_>,
+    authority: &super::move_journal::BranchAuthority,
+    path: &Path,
+    receipt: &mut Option<super::move_journal::PathAuthority>,
+) -> Result<()> {
+    authority.verify_directories()?;
+    anyhow::ensure!(
+        authority.reference == format!("refs/heads/{}", authority.branch),
+        "Original reference is not the recorded local branch"
+    );
+    let repo = git2::Repository::open(&authority.repository.path)?;
+    anyhow::ensure!(
+        local_branch_tip(&repo, &authority.branch)?.is_none(),
+        "Original reference is no longer absent"
+    );
+    let tip = git2::Oid::from_str(&authority.tip)?;
+    repo.find_commit(tip)?;
+    let origin = BranchOrigin {
+        repo: authority.repository.path.clone(),
+        branch: authority.branch.clone(),
+        reference: authority.reference.clone(),
+        tip,
+        routes: Vec::new(),
+        loose: PathSnapshot::capture(repo.commondir().join(&authority.reference))?,
+        packed: PathSnapshot::capture(repo.commondir().join("packed-refs"))?,
+        git: DirectoryWitness::capture(repo.path())?,
+        common: DirectoryWitness::capture(repo.commondir())?,
+        directory: DirectoryWitness::capture(&authority.repository.path)?,
+    };
+    let mut lease = BranchLease::new(handoff, &origin, path, None)?;
+    lease.recreating = true;
+    lease.checkout_head = Some(git2::Repository::open(path)?.path().join("HEAD"));
+    let git = crate::git::GitWorktree::new(authority.repository.path.clone())?;
+    let result = git.create_branch_ref_with_hooks(&authority.branch, &authority.tip, &mut lease);
+    let observed = if result.is_ok() {
+        lease.record_recreation()
+    } else {
+        Ok(())
+    };
+    if let Some(original) = lease.recreated_authority.take() {
+        *receipt = Some(original);
+    }
+    let finished = lease.finish();
+    result?;
+    observed?;
+    finished
 }
 
 pub(crate) fn delete_branch(
@@ -868,7 +1091,7 @@ pub(crate) struct NativeLease<'a> {
     original_tip: Option<git2::Oid>,
     detached_source: Option<std::sync::Arc<BranchOrigin>>,
     owned_branch_origin: Option<std::sync::Arc<BranchOrigin>>,
-    boundary: Option<CheckoutBoundary>,
+    boundary: Vec<(String, CheckoutBoundary)>,
     child_boundaries: Vec<(String, CheckoutBoundary)>,
     partial_directories: Vec<(PathBuf, DirectoryWitness)>,
     checkout: Option<CheckoutWitness>,
@@ -939,7 +1162,7 @@ impl<'a> NativeLease<'a> {
             original_tip: None,
             detached_source: None,
             owned_branch_origin: None,
-            boundary: None,
+            boundary: Vec::new(),
             child_boundaries: Vec::new(),
             partial_directories: Vec::new(),
             checkout: None,
@@ -966,6 +1189,9 @@ impl<'a> NativeLease<'a> {
     }
 
     fn verify(&self) -> Result<()> {
+        for (_, boundary) in self.boundary.iter().chain(self.child_boundaries.iter()) {
+            boundary.verify()?;
+        }
         for directory in &self.directories {
             directory.verify()?;
         }
@@ -1091,6 +1317,7 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
         cwd: &Path,
         checkout_ready: bool,
         git_dir: Option<&Path>,
+        context: crate::git::native_hooks::CallbackContext<'_>,
     ) -> io::Result<()> {
         let overlapping = self.ownership.is_none();
         if overlapping {
@@ -1099,21 +1326,28 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
         let mut prepare = || -> Result<()> {
             self.verify()?;
             let admin = git_dir.map(|directory| cwd.join(directory));
-            if !overlapping {
-                self.boundary = Some(CheckoutBoundary::capture(&self.path, admin.as_deref())?);
-                self.child_boundaries.clear();
+            let (own, at_checkout) = own_callback_context(
+                context,
+                cwd,
+                git_dir,
+                &self.main_repo,
+                &self.path,
+                &self.source_git,
+                &self.source_common,
+            )?;
+            if own {
+                self.boundary.push((
+                    callback.to_owned(),
+                    CheckoutBoundary::capture(&self.path, None)?,
+                ));
             }
-            if cwd != self.path && cwd != self.main_repo {
+            if !own || !at_checkout {
                 self.child_boundaries.push((
                     callback.to_owned(),
                     CheckoutBoundary::capture(cwd, admin.as_deref())?,
                 ));
             }
-            for boundary in self
-                .boundary
-                .iter()
-                .chain(self.child_boundaries.iter().map(|(_, boundary)| boundary))
-            {
+            for (_, boundary) in self.boundary.iter().chain(self.child_boundaries.iter()) {
                 for path in boundary.paths() {
                     if let Some(EntryPin::Directory(directory)) = &path.pin {
                         if !self
@@ -1128,10 +1362,12 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                 }
             }
             if checkout_ready {
-                self.pin_checkout()?;
-                if cwd != self.path
-                    && cwd != self.main_repo
-                    && !self.children.iter().any(|(path, _)| path == cwd)
+                if own && at_checkout {
+                    self.pin_checkout()?;
+                } else if !self
+                    .children
+                    .iter()
+                    .any(|(path, _)| same_callback_path(path, cwd))
                 {
                     self.children
                         .push((cwd.to_path_buf(), CheckoutWitness::capture(cwd)?));
@@ -1156,13 +1392,6 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
             } else {
                 storage::acquire_ownership_read()?
             });
-            for boundary in self
-                .boundary
-                .iter()
-                .chain(self.child_boundaries.iter().map(|(_, boundary)| boundary))
-            {
-                boundary.verify()?;
-            }
             self.verify()?;
             if let Some(owner) = &mut self.owner {
                 owner.restore(
@@ -1172,6 +1401,7 @@ impl crate::git::native_hooks::HookLease for NativeLease<'_> {
                 )?;
             }
             if let Some(completed) = completed {
+                self.boundary.retain(|(callback, _)| callback != completed);
                 self.child_boundaries
                     .retain(|(callback, _)| callback != completed);
             }
@@ -1389,7 +1619,18 @@ mod tests {
             if action == "native-progress" {
                 git.rename_branch("original", "renamed").unwrap();
             }
-            lease.pause("callback", &main, false, None).unwrap();
+            lease
+                .pause(
+                    "callback",
+                    &main,
+                    false,
+                    None,
+                    crate::git::native_hooks::CallbackContext {
+                        parent: None,
+                        reference_transaction: None,
+                    },
+                )
+                .unwrap();
             assert!(
                 root.require_exclusive().is_err(),
                 "suspended root must reject authority: {action}"
@@ -1586,7 +1827,18 @@ mod tests {
         )
         .unwrap();
         fs::write(root.app_dir().join("first.lock"), "").unwrap();
-        assert!(lease.pause("callback", &main, false, None).is_err());
+        assert!(lease
+            .pause(
+                "callback",
+                &main,
+                false,
+                None,
+                crate::git::native_hooks::CallbackContext {
+                    parent: None,
+                    reference_transaction: None
+                }
+            )
+            .is_err());
         assert_eq!(lease.nested_released, 1);
         drop(lease);
         assert!(root.require_exclusive().is_ok());
@@ -1856,5 +2108,186 @@ mod tests {
         );
         assert!(peer_path.exists());
         assert!(!target.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn timed_native_capture_preserves_stdout_and_stderr_bytes() {
+        use super::{BranchHandoff, BranchLease, BranchOrigin};
+        use crate::git::native_hooks::HookLease;
+        let supplied =
+            std::env::var_os("AOE_TEST_NATIVE_CAPTURE_ROOT").map(std::path::PathBuf::from);
+        let fixture = supplied.is_none().then(|| tempfile::tempdir().unwrap());
+        let base = supplied
+            .as_deref()
+            .unwrap_or_else(|| fixture.as_ref().unwrap().path());
+        let _home = crate::session::test_support::isolate_app_dir_at(base);
+        let path = base.join("repository");
+        let repo = git2::Repository::init(&path).unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+        repo.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "initial",
+            &tree,
+            &[],
+        )
+        .unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        let _profile = crate::session::Storage::new_unwatched("owner").unwrap();
+        let root = crate::session::storage::acquire_ownership_lock().unwrap();
+        let origin = BranchOrigin::capture(&path, "main").unwrap();
+        let mut lease = BranchLease::new(
+            BranchHandoff {
+                root: &root,
+                nested: &[],
+                owner: None,
+                protected_path: None,
+            },
+            &origin,
+            &path,
+            None,
+        )
+        .unwrap();
+        let alias = std::env::var("AOE_TEST_NATIVE_CAPTURE_ALIAS").unwrap_or_else(|_| {
+            "alias.capture=!printf 'out\\000\\r\\n'; printf 'err\\000\\n' >&2".into()
+        });
+        let args = ["-c", alias.as_str(), "capture"].map(std::ffi::OsString::from);
+        let output = crate::git::native_hooks::run_timed(
+            &path,
+            &args,
+            &mut lease,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .expect("real Git completed");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\0\r\n");
+        assert_eq!(output.stderr, b"err\0\n");
+        lease.checkpoint().unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn timed_native_capture_crash_leaves_no_capture_names() {
+        use crate::session::environment::shell_escape;
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::path::PathBuf;
+        use std::process::{Command, Stdio};
+        struct Producer {
+            child: std::process::Child,
+            group: Option<u32>,
+        }
+        impl Drop for Producer {
+            fn drop(&mut self) {
+                if let Some(group) = self.group {
+                    crate::process::worker::kill_process_group(group);
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+        let fixture = tempfile::tempdir_in("/tmp").unwrap();
+        let base = fixture.path().join("app");
+        let temp = fixture.path().join("t");
+        fs::create_dir(&base).unwrap();
+        fs::create_dir(&temp).unwrap();
+        let ready = fixture.path().join("ready");
+        let release = fixture.path().join("release");
+        assert!(Command::new("mkfifo")
+            .arg(&release)
+            .status()
+            .unwrap()
+            .success());
+        let alias = format!(
+            "alias.capture=!printf 'out\\000\\r\\n'; printf 'err\\000\\n' >&2; printf '%s' \"$AOE_NATIVE_GIT_CONTEXT\" > {pending}; mv {pending} {ready}; IFS= read -r go < {release}",
+            pending = shell_escape(&ready.with_extension("pending").to_string_lossy()),
+            ready = shell_escape(&ready.to_string_lossy()),
+            release = shell_escape(&release.to_string_lossy())
+        );
+        let child = Command::new(crate::process::running_image().unwrap())
+            .args(["--exact", "session::native_hooks::tests::timed_native_capture_preserves_stdout_and_stderr_bytes", "--nocapture"])
+            .env("AOE_TEST_NATIVE_CAPTURE_ROOT", &base)
+            .env("AOE_TEST_NATIVE_CAPTURE_ALIAS", alias)
+            .env("TMPDIR", &temp)
+            .process_group(0)
+            .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut producer = Producer { child, group: None };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                producer.child.try_wait().unwrap().is_none(),
+                "real Git capture producer exited"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real Git alias did not reach its barrier"
+            );
+            std::thread::yield_now();
+        }
+        let context = fs::read_to_string(&ready).unwrap();
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&fs::read(context).unwrap()).unwrap();
+        let runtime = PathBuf::from(descriptor["scope"]["root"].as_str().unwrap());
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(runtime.join("state.json")).unwrap()).unwrap();
+        let socket = PathBuf::from(state["socket_root"].as_str().unwrap());
+        let namespace = PathBuf::from(state["socket_namespace"].as_str().unwrap());
+        let group =
+            i32::from_ne_bytes(fs::read(runtime.join("group")).unwrap().try_into().unwrap());
+        assert!(group > 1 && group as u32 != producer.child.id());
+        producer.group = Some(group as u32);
+        producer.child.kill().unwrap();
+        producer.child.wait().unwrap();
+        assert!(
+            crate::process::runner_group_executing(group as u32).unwrap(),
+            "Git remains causally held at its FIFO"
+        );
+        let names = fs::read_dir(&temp)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names, std::collections::BTreeSet::from([namespace]));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&release)
+            .unwrap()
+            .write_all(b"go\n")
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::process::runner_group_executing(group as u32).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released Git did not finish"
+            );
+            std::thread::yield_now();
+        }
+        producer.group = None;
+        let _home = crate::session::test_support::isolate_app_dir_at(&base);
+        let profile = crate::session::Storage::new_unwatched("owner").unwrap();
+        let repo = base.join("repository");
+        let git = crate::git::GitWorktree::new(repo.clone())
+            .unwrap()
+            .with_init_submodules(false);
+        let target = base.join("after-crash");
+        let mut ownership = Some(crate::session::storage::acquire_ownership_read().unwrap());
+        super::create_worktree(
+            &mut ownership,
+            Some(&profile),
+            &git,
+            (&repo, &target, "after-crash"),
+            true,
+            Some("main"),
+            None,
+        )
+        .unwrap()
+        .1
+        .verify()
+        .unwrap();
+        assert!(!runtime.exists() && !socket.exists());
     }
 }

@@ -147,6 +147,7 @@ pub struct HomeView {
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
+    pub(super) move_intent_conflicts: Vec<String>,
     pub(super) flat_items: Vec<Item>,
 
     pub(super) cursor: usize,
@@ -304,6 +305,8 @@ pub struct HomeView {
     pub(super) stop_poller: StopPoller,
 
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    restore_worker:
+        crate::tui::worker::TrackedWorker<operations::RestoreRequest, operations::RestoreResult>,
     pub(super) drop_poller:
         crate::tui::worker::TrackedWorker<operations::DropRequest, operations::DropResult>,
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,

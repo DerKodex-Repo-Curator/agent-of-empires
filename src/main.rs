@@ -328,6 +328,32 @@ async fn run(
         );
     }
 
+    if matches!(
+        cli.command.as_ref(),
+        Some(
+            Commands::Add(_)
+                | Commands::List(_)
+                | Commands::Ps(_)
+                | Commands::Remove(_)
+                | Commands::Send(_)
+                | Commands::Status(_)
+                | Commands::Session { .. }
+                | Commands::Group { .. }
+                | Commands::Project { .. }
+                | Commands::Worktree { .. }
+        )
+    ) {
+        let conflicts = tokio::task::spawn_blocking(|| {
+            agent_of_empires::session::Storage::recover_pending_moves(
+                agent_of_empires::file_watch::FileWatchService::noop(),
+            )
+        })
+        .await??;
+        for conflict in conflicts {
+            eprintln!("warning: {conflict}");
+        }
+    }
+
     // Unknown keys are only reported here; parse failures only when no subscriber is up.
     // Hidden machine-spawned subcommands never print into a worker's redirected stderr.
     if cli.command.as_ref().and_then(cli::command_name).is_some() {

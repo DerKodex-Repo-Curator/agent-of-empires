@@ -1012,6 +1012,113 @@ fn rename_submission_keeps_help_responsive_while_root_is_contended() {
 
 #[test]
 #[serial]
+fn selected_and_bulk_restore_keep_input_live_under_real_root_contention() {
+    for bulk in [false, true] {
+        let mut rows = Vec::new();
+        for title in ["restore-one", "restore-two"] {
+            let mut row = Instance::new(title, "/tmp/restore-contention");
+            row.status = crate::session::Status::Stopped;
+            row.view = crate::session::View::Structured;
+            row.trash();
+            rows.push(row);
+        }
+        let mut env = seeded_env(test_home(), &rows, true);
+        let id = rows[0].id.clone();
+        env.view.selected_session = Some(id.clone());
+        let root = crate::session::storage::acquire_ownership_lock().unwrap();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let _observer = crate::session::storage::observe_root_contention_for_test(contended_tx);
+        let (release, gate) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let released = gate.recv_timeout(std::time::Duration::from_secs(5));
+            drop(root);
+            assert!(released.is_ok(), "restore submission blocked input on Root");
+        });
+        if bulk {
+            env.view.restore_all_from_trash();
+        } else {
+            env.view.restore_selected_from_trash();
+        }
+        contended_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+        assert!(env.view.restore_worker.is_pending(&id));
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        assert!(env.view.show_help);
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        env.view.finish_restore_for_test();
+        let stored = Storage::open_unwatched("test").unwrap().load().unwrap();
+        for row in &stored {
+            let expected_restored = bulk || row.id == id;
+            assert_eq!(!row.is_trashed(), expected_restored);
+            let memory = env.view.get_instance(&row.id).unwrap();
+            assert_eq!(memory.is_trashed(), row.is_trashed());
+            assert_eq!(memory.status, crate::session::Status::Stopped);
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn restore_result_does_not_overwrite_a_newer_memory_incarnation_or_generation() {
+    for replace_incarnation in [false, true] {
+        let mut row = Instance::new("restore-result", "/tmp/restore-result");
+        row.status = crate::session::Status::Stopped;
+        row.trash();
+        let id = row.id.clone();
+        let mut env = seeded_env(test_home(), &[row], true);
+        env.view.selected_session = Some(id.clone());
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        env.view.restore_worker =
+            crate::tui::worker::TrackedWorker::spawn("restore-result-gate", move |request| {
+                let result = super::super::operations::perform_restore(request);
+                finished_tx.send(()).unwrap();
+                result
+            });
+        env.view.restore_selected_from_trash();
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let current = env.view.instances.get_mut(&id).unwrap();
+        if replace_incarnation {
+            current.created_at += chrono::Duration::seconds(1);
+        } else {
+            current.lifecycle_generation += 2;
+        }
+        current.title = "peer replacement".into();
+        env.view.finish_restore_for_test();
+        let current = env.view.get_instance(&id).unwrap();
+        assert!(current.is_trashed());
+        assert_eq!(current.title, "peer replacement");
+    }
+}
+
+#[test]
+#[serial]
+fn disconnected_restore_worker_clears_pending_and_reports_failure() {
+    let mut row = Instance::new("restore-disconnected", "/tmp/restore-disconnected");
+    row.trash();
+    let id = row.id.clone();
+    let mut env = seeded_env(test_home(), &[row], true);
+    env.view.selected_session = Some(id.clone());
+    env.view.restore_worker =
+        crate::tui::worker::TrackedWorker::spawn("restore-disconnected", |_| {
+            panic!("injected worker disconnect");
+        });
+    env.view.restore_selected_from_trash();
+    env.view.finish_restore_for_test();
+    assert!(!env.view.restore_worker.is_pending(&id));
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Restore Failed")
+    );
+}
+
+#[test]
+#[serial]
 fn rename_result_preserves_a_newer_authoritative_generation_without_stale_save() {
     let mut row = Instance::new("before rename", "/tmp/generation-rename");
     row.view = crate::session::View::Structured;

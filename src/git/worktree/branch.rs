@@ -445,6 +445,36 @@ impl GitWorktree {
         }
         Ok(())
     }
+
+    pub(crate) fn create_branch_ref_with_hooks(
+        &self,
+        branch: &str,
+        original_tip: &str,
+        lease: &mut dyn crate::git::native_hooks::HookLease,
+    ) -> Result<()> {
+        let args = [
+            "update-ref".to_owned(),
+            format!("refs/heads/{branch}"),
+            original_tip.to_owned(),
+            git2::Oid::ZERO_SHA1.to_string(),
+        ]
+        .map(std::ffi::OsString::from);
+        let output = crate::git::native_hooks::run_timed(
+            &self.repo_path,
+            &args,
+            lease,
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        .ok_or_else(|| {
+            GitError::WorktreeCommandFailed(
+                "Original reference creation timed out; its outcome requires reconciliation".into(),
+            )
+        })?;
+        if !output.status.success() {
+            return Err(super::command_failed(&output));
+        }
+        Ok(())
+    }
 }
 
 fn run_branch_mutation(

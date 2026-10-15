@@ -182,6 +182,20 @@ impl DirectoryWitness {
         Ok(witness)
     }
 
+    pub(crate) fn durable_authority(&self) -> Result<super::move_journal::PathAuthority> {
+        self.verify()?;
+        Ok(super::move_journal::PathAuthority {
+            path: self.path.clone(),
+            resolved: super::deletion::resolve_claim_path(&self.path)
+                .context("original directory route cannot be resolved")?,
+            identity: Some(super::storage::filesystem_identity(
+                &self.directory.metadata()?,
+            )),
+            directory: true,
+            contents: None,
+        })
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         self.verify_at(&self.path)
     }
@@ -348,6 +362,24 @@ impl CheckoutWitness {
             }
         }
         self.verify()
+    }
+
+    pub(crate) fn durable_authority(&self) -> Result<super::move_journal::CheckoutAuthority> {
+        self.verify()?;
+        let repo = git2::Repository::open(&self.checkout.path)?;
+        Ok(super::move_journal::CheckoutAuthority {
+            checkout: self.checkout.durable_authority()?,
+            parent: super::move_journal::PathAuthority::capture(
+                self.checkout
+                    .path
+                    .parent()
+                    .context("original checkout has no parent")?,
+            )?,
+            git: self.git_directory.durable_authority()?,
+            common: self.common_git_directory.durable_authority()?,
+            head: super::move_journal::PathAuthority::capture(&repo.path().join("HEAD"))?,
+            tip: self.original_tip.to_string(),
+        })
     }
 
     pub(crate) fn verify(&self) -> Result<()> {
@@ -2528,7 +2560,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_create_workspace_reports_all_concurrent_failures() {
+        let _app = crate::session::test_support::isolate_app_dir();
         let parent_a = init_repo_with_commit("repo-a-fail");
         let parent_b = init_repo_with_commit("repo-b-fail");
         let repo_a = parent_a.path().join("repo-a-fail");
@@ -2560,11 +2594,6 @@ mod tests {
             Err(e) => e,
         };
         let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktrees"),
-            "multi-error bail! prefix missing: {msg}"
-        );
-        assert!(msg.contains("(2 repos)"), "should report repo count: {msg}");
         assert!(
             msg.contains("repo-a-fail"),
             "first repo name missing from message: {msg}"

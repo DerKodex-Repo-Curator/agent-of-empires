@@ -175,6 +175,7 @@ fn right_click_trashed_row_offers_restore() {
     );
 
     env.view.handle_key(key(KeyCode::Enter), None);
+    env.view.finish_restore_for_test();
     assert!(env.view.context_menu.is_none());
     assert!(
         !env.view.get_instance(&id).unwrap().is_trashed(),

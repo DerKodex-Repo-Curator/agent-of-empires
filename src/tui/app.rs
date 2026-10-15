@@ -1209,6 +1209,7 @@ impl App {
             full |= self.home.apply_deletion_results();
             full |= self.home.apply_stop_results();
             full |= self.home.apply_trash_results();
+            full |= self.home.apply_restore_results();
             full |= self.home.apply_drop_results();
             full |= self.home.apply_reconcile_results();
 

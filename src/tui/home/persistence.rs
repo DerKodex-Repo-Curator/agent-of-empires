@@ -433,7 +433,7 @@ impl HomeView {
                 }
                 Ok(())
             },
-            (native_handoff, before_commit),
+            (native_handoff, before_commit, None),
         )?;
         moved.merge_runtime_for_profile_move(&current);
         moved.source_profile = target.to_string();

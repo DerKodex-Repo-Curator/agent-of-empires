@@ -110,7 +110,7 @@ impl HomeView {
         // Duplicate detection across every loaded profile runs before any loaded state is
         // published (#3459): journal-guided repairs fix durable state under lock here, so
         // the reload below publishes exactly one row per session.
-        let legacy_duplicate_reports = {
+        let (legacy_duplicate_reports, move_intent_conflicts) = {
             let loads_view: Vec<(&str, &[Instance])> = profile_loads
                 .iter()
                 .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
@@ -131,7 +131,7 @@ impl HomeView {
                 }
             }
             log_legacy_duplicates_once(&outcome.reports);
-            outcome.reports
+            (outcome.reports, outcome.conflicts)
         };
         for (profile_name, instances, groups) in &profile_loads {
             let tree = GroupTree::new_with_groups(instances, groups);
@@ -201,6 +201,12 @@ impl HomeView {
             handles: HashMap::new(),
         };
 
+        let recovery_dialog = (!move_intent_conflicts.is_empty()).then(|| {
+            crate::tui::dialogs::InfoDialog::new(
+                "Worktree Recovery Conflict",
+                &move_intent_conflicts.join("\n\n"),
+            )
+        });
         let mut view = Self {
             storages,
             active_profile,
@@ -210,6 +216,7 @@ impl HomeView {
             pending_added: HashMap::new(),
             group_trees,
             legacy_duplicate_reports,
+            move_intent_conflicts,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -273,7 +280,7 @@ impl HomeView {
             pending_intro_theme: None,
             no_agents_dialog: None,
             changelog_dialog: None,
-            info_dialog: None,
+            info_dialog: recovery_dialog,
             snooze_duration_dialog: None,
             pending_snooze_session: None,
             profile_picker_dialog: None,
@@ -375,6 +382,10 @@ impl HomeView {
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            restore_worker: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-restore",
+                super::operations::perform_restore,
+            ),
             drop_poller: crate::tui::worker::TrackedWorker::spawn(
                 "aoe-drop-poller",
                 super::operations::perform_drop,
@@ -712,6 +723,13 @@ impl HomeView {
         }
         log_legacy_duplicates_once(&outcome.reports);
         self.legacy_duplicate_reports = outcome.reports;
+        if !outcome.conflicts.is_empty() && outcome.conflicts != self.move_intent_conflicts {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Worktree Recovery Conflict",
+                &outcome.conflicts.join("\n\n"),
+            ));
+        }
+        self.move_intent_conflicts = outcome.conflicts;
 
         for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed
