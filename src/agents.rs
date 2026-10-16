@@ -1052,11 +1052,13 @@ impl AgentDef {
             "codex" => "--no-daemon",
             _ => return None,
         };
-        if options
-            .iter()
-            .any(|word| CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()))
-        {
-            return None;
+        let mut words = options.iter();
+        while let Some(word) = words.next() {
+            if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
+                words.next();
+            } else if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
+                return None;
+            }
         }
         agent_help_advertises(command, flag).then_some(flag)
     }
@@ -1177,6 +1179,30 @@ const CODEX_NON_TUI_SUBCOMMANDS: &[&str] = &[
     "exec-server",
     "features",
     "help",
+];
+
+/// Codex options that take their value as the next word, which is not a subcommand.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "--remote",
+    "--remote-auth-token-env",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
 ];
 
 /// A flag the older generation's help lists and the current one's does not.
