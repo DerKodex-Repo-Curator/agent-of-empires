@@ -1,5 +1,5 @@
 // #4460: plugin pages open full width from the TopBar or palette, framed with
-// `sandbox="allow-scripts"` so plugin script never runs on the dashboard origin.
+// `sandbox="allow-scripts allow-downloads"` so plugin script never runs on the dashboard origin.
 
 import { test, expect } from "./helpers/mockedTest";
 import { mockStaticApis, mockSessionShellApis } from "./helpers/apiMocks";
@@ -19,7 +19,7 @@ const WRITE_PAGE = { ...PAGE, capabilities: ["session.read", "session.write"] };
 
 // The daemon's page policy (src/server/api/plugins.rs `PLUGIN_PAGE_CSP`).
 const PAGE_CSP =
-  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+  "sandbox allow-scripts allow-downloads; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
   "img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'";
 
 // Reports what the page could reach back to the dashboard.
@@ -174,7 +174,7 @@ test.describe("Plugin pages (#4460)", () => {
     );
     await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toHaveCount(0);
     const frame = page.getByTestId("plugin-page-frame");
-    await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    await expect(frame).toHaveAttribute("sandbox", "allow-scripts allow-downloads");
     await expect(frame).toHaveAttribute("src", new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`));
     await expect(page.frameLocator("[data-testid=plugin-page-frame]").getByText("board fixture")).toBeVisible();
     expect(order.slice(0, 2)).toEqual([`POST ${PAGE.url}/ticket`, `GET ${PAGE.url}`]);
