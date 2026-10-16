@@ -286,6 +286,7 @@ mod tests {
                     op: LifecycleOperation::Launch,
                     generation: 1,
                     at: chrono::Utc::now(),
+                    resource_intent: None,
                 });
             }
             storage

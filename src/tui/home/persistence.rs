@@ -331,82 +331,30 @@ impl HomeView {
         &mut self,
         id: &str,
         target: &str,
-        requested: Instance,
+        mut requested: Instance,
         baseline: Option<&Instance>,
         account_swap: bool,
     ) -> anyhow::Result<()> {
-        self.move_to_profile_with_effect(id, target, requested, baseline, account_swap, |_| Ok(()))
-    }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance` because the source
-    /// row and group metadata must be removed in the same transaction that durably
-    /// publishes the target row and metadata.
-    ///
-    /// Ordinary effects run inside the profile transaction. Hook-bearing Git effects
-    /// use the explicit native handoff path: journal, release profile locks, effect,
-    /// then authoritative reload and validation before durable publication.
-    pub(in crate::tui) fn move_to_profile_with_effect<B>(
-        &mut self,
-        id: &str,
-        target: &str,
-        requested: Instance,
-        baseline: Option<&Instance>,
-        account_swap: bool,
-        before_commit: B,
-    ) -> anyhow::Result<()>
-    where
-        B: FnOnce(&Instance) -> anyhow::Result<()>,
-    {
-        let ownership = crate::session::storage::acquire_ownership_read()?;
-        self.move_to_profile_with_effect_with_ownership(
-            &ownership,
-            id,
-            target,
-            (requested, baseline),
-            account_swap,
-            (false, before_commit),
-        )
-    }
-
-    pub(in crate::tui) fn move_to_profile_with_effect_with_ownership<B>(
-        &mut self,
-        ownership: &crate::session::storage::OwnershipGuard,
-        id: &str,
-        target: &str,
-        change: (Instance, Option<&Instance>),
-        account_swap: bool,
-        effect: (bool, B),
-    ) -> anyhow::Result<()>
-    where
-        B: FnOnce(&Instance) -> anyhow::Result<()>,
-    {
-        let (native_handoff, before_commit) = effect;
-        let (mut requested, baseline) = change;
         let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
-        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
         let before = baseline.cloned().unwrap_or_else(|| current.clone());
         let old_profile = before.source_profile.clone();
         requested.source_profile = old_profile.clone();
         if old_profile == target {
-            requested.source_profile = target.to_string();
             self.instances.insert(id.to_string(), requested);
             return Ok(());
         }
         anyhow::ensure!(
-            current.status != crate::session::Status::Creating,
-            "Cannot move session {id} between profiles while it is being created"
-        );
-        anyhow::ensure!(
-            !lifecycle_reserved,
+            current.status != crate::session::Status::Creating
+                && !current.has_fresh_lifecycle_reservation(chrono::Utc::now()),
             "Cannot move session {id} between profiles while a lifecycle operation is in progress"
         );
-
+        let ownership = crate::session::storage::acquire_ownership_lock()?;
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::open_with_ownership(target, self.file_watch.clone(), ownership)?,
+                Storage::open_with_ownership(target, self.file_watch.clone(), &ownership)?,
             );
         }
         let source = self
@@ -417,8 +365,8 @@ impl HomeView {
             .storages
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
-        let mut moved = source.move_instance_to_with_effect_with_ownership(
-            ownership,
+        let mut moved = source.move_instance_to_with_ownership(
+            &ownership,
             target_storage,
             (&before, &requested),
             account_swap,
@@ -429,11 +377,11 @@ impl HomeView {
                     &candidate.project_path,
                     None,
                 ) {
-                    return Err(crate::session::duplicate_session_error(&candidate.title));
+                    anyhow::bail!(crate::session::duplicate_session_error(&candidate.title));
                 }
                 Ok(())
             },
-            (native_handoff, before_commit, None),
+            None,
         )?;
         moved.merge_runtime_for_profile_move(&current);
         moved.source_profile = target.to_string();

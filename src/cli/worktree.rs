@@ -278,7 +278,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let ownership = crate::session::storage::acquire_ownership_lock()?;
     let _identity =
         crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
-    storage.verify_profile_identity()?;
+    storage.verify_profile_available()?;
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {

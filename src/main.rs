@@ -42,9 +42,6 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
 }
 
 fn main() -> Result<()> {
-    if let Some(result) = agent_of_empires::git::native_hooks::try_proxy_entry() {
-        std::process::exit(result?);
-    }
     let mut args = std::env::args();
     let _ = args.next();
     let helper = args.next();

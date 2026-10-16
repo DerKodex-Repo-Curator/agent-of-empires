@@ -199,7 +199,7 @@ impl Instance {
         } = action;
         let profile = self.effective_profile();
         let expected_checkout = original_checkout.then(|| self.clone());
-        storage.verify_profile_identity()?;
+        storage.verify_profile_available()?;
         crate::session::validate_instance_id(&self.id)?;
 
         let title_lock = crate::session::storage::acquire_session_title_lock(&self.id)

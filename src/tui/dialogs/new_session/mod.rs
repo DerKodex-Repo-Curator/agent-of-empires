@@ -157,6 +157,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             scratch: data.scratch,
             fork_seed: data.fork_seed,
             provisional_creation: None,
+            has_creation_callbacks: false,
         }
     }
 }

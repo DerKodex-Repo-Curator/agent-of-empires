@@ -104,12 +104,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 Ok((generation, stored.clone()))
             })?
         };
-        let request = crate::session::trash::TrashRequest {
-            storage: storage.clone(),
-            session_id: removed_id.clone(),
-            instance: inst,
-            generation: trash_generation,
-        };
+        let request = crate::session::trash::prepare_trash(&storage, &inst, trash_generation)?;
         let outcome = crate::session::trash::trash_transition(&request, |inst| {
             if let Err(error) = inst.kill_locked() {
                 eprintln!("Warning: failed to kill agent tmux session: {error}");

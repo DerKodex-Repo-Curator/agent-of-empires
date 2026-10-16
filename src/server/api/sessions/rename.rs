@@ -324,7 +324,11 @@ fn worktree_edit_error_response(
 ) -> (StatusCode, String) {
     use crate::session::worktree_edit::WorktreeEditError as E;
     match e {
-        E::Ownership(_) => (StatusCode::CONFLICT, "Another session uses this checkout or branch, or its owners could not be checked".to_string()),
+        E::Ownership(_) => (
+            StatusCode::CONFLICT,
+            "Another session uses this checkout or branch, or its owners could not be checked"
+                .to_string(),
+        ),
         E::NotManaged => (
             StatusCode::BAD_REQUEST,
             "This worktree is not managed by aoe; its workdir name cannot be edited".to_string(),
@@ -352,14 +356,6 @@ fn worktree_edit_error_response(
         E::BranchExists(name) => (
             StatusCode::CONFLICT,
             format!("Branch '{name}' already exists"),
-        ),
-        E::RollbackFailed { .. } => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to move the worktree, and rolling back the branch rename also failed; the repository may be left on the new branch".to_string(),
-        ),
-        E::Git(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to move the worktree".to_string(),
         ),
     }
 }

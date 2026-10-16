@@ -4,24 +4,14 @@
 use super::*;
 
 async fn release_unmirrored_trash(
-    storage: Storage,
-    snapshot: Instance,
-    generation: u64,
+    request: crate::session::trash::TrashRequest,
 ) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         if let Some(sender) = BEFORE_TRASH_CLEANUP_LOCK.lock().take() {
             let _ = sender.send(());
         }
-        let mut cleanup = crate::session::claim::ReservationCleanup::new(
-            &storage,
-            &snapshot,
-            LifecycleOperation::Trash,
-            generation,
-        );
-        let result = cleanup.release();
-        cleanup.disarm();
-        result
+        request.cancel()
     })
     .await?
 }
@@ -426,12 +416,16 @@ pub async fn trash_session(
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, generation, snapshot) = match tokio::task::spawn_blocking(
-        move || -> anyhow::Result<_> {
-            let storage = Storage::open(&reserve_profile, file_watch)?;
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+    let request = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let storage = Storage::open(&reserve_profile, file_watch)?;
+        let (generation, snapshot) = {
+            let root = crate::session::storage::acquire_ownership_lock()?;
+            let _identity =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&root, &reserve_id)?;
             storage.load_strict_for_worktree_ownership()?;
-            let (generation, snapshot) = storage.update(|instances, _groups| {
+            storage.update_with_ownership(&root, |instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
                     .find(|instance| instance.id == reserve_id)
@@ -447,11 +441,10 @@ pub async fn trash_session(
                     .map_err(anyhow::Error::new)?;
                 instance.trash();
                 Ok((instance.lifecycle_generation, instance.clone()))
-            })?;
-            drop(lifecycle_lock);
-            Ok((storage, generation, snapshot))
-        },
-    )
+            })?
+        };
+        crate::session::trash::prepare_trash(&storage, &snapshot, generation)
+    })
     .await
     {
         Ok(Ok(reserved)) => reserved,
@@ -464,6 +457,9 @@ pub async fn trash_session(
             return persist_failed_response();
         }
     };
+    let storage = request.storage.clone();
+    let snapshot = request.instance.clone();
+    let generation = request.generation;
 
     let was_structured_view = snapshot.is_structured();
     let mirrored = {
@@ -472,8 +468,10 @@ pub async fn trash_session(
             .iter_mut()
             .find(|instance| instance.id == id && instance.created_at == snapshot.created_at)
         {
-            instance.trash();
+            instance.trashed_at = snapshot.trashed_at;
+            instance.trash_lifecycle_id = snapshot.trash_lifecycle_id.clone();
             instance.lifecycle_generation = generation;
+            instance.lifecycle_reservation = snapshot.lifecycle_reservation.clone();
             true
         } else {
             false
@@ -482,7 +480,7 @@ pub async fn trash_session(
     if !mirrored {
         drop(_guard);
         drop(_submission);
-        if let Err(error) = release_unmirrored_trash(storage, snapshot, generation).await {
+        if let Err(error) = release_unmirrored_trash(request).await {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation cleanup failed: {error:#}");
         }
         return crate::server::api::session_gone_after_persist();
@@ -502,12 +500,6 @@ pub async fn trash_session(
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let request = crate::session::trash::TrashRequest {
-            storage: storage.clone(),
-            session_id: work_id.clone(),
-            instance: snapshot,
-            generation,
-        };
         let outcome = crate::session::trash::trash_transition(&request, |instance| {
             if kill_pane {
                 if was_structured_view {
@@ -1461,11 +1453,12 @@ mod reservation_cleanup_tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
-    async fn unmirrored_trash_cleanup_keeps_tokio_responsive_and_preserves_newer_generation() {
+    async fn unmirrored_trash_cleanup_keeps_tokio_responsive_and_rejects_supersession() {
         let _app = crate::session::test_support::isolate_app_dir();
         let storage = Storage::new_unwatched("default").unwrap();
         for superseded in [false, true] {
             let mut row = Instance::new("trashed", "/unmirrored");
+            row.source_profile = storage.profile().to_owned();
             row.trash();
             let generation = row
                 .try_acquire_lifecycle_reservation(
@@ -1480,8 +1473,9 @@ mod reservation_cleanup_tests {
                     Ok(())
                 })
                 .unwrap();
+            let request = crate::session::trash::prepare_trash(&storage, &row, generation).unwrap();
             if superseded {
-                storage
+                assert!(storage
                     .update(|rows, _| {
                         rows[0].release_lifecycle_reservation_if_owned(
                             LifecycleOperation::Trash,
@@ -1494,12 +1488,12 @@ mod reservation_cleanup_tests {
                         )?;
                         Ok(())
                     })
-                    .unwrap();
+                    .is_err());
             }
             let root = crate::session::storage::acquire_ownership_lock().unwrap();
             let (entered, gate) = tokio::sync::oneshot::channel();
             *BEFORE_TRASH_CLEANUP_LOCK.lock() = Some(entered);
-            let cleanup = tokio::spawn(release_unmirrored_trash(storage.clone(), row, generation));
+            let cleanup = tokio::spawn(release_unmirrored_trash(request));
             tokio::time::timeout(std::time::Duration::from_secs(2), gate)
                 .await
                 .unwrap()
@@ -1513,15 +1507,10 @@ mod reservation_cleanup_tests {
             drop(root);
             cleanup.await.unwrap().unwrap();
             let current = storage.load().unwrap().remove(0);
-            if superseded {
-                assert_eq!(
-                    current.lifecycle_reservation.unwrap().op,
-                    LifecycleOperation::Launch
-                );
-                assert_eq!(current.lifecycle_generation, generation + 1);
-            } else {
-                assert!(current.lifecycle_reservation.is_none());
-            }
+            assert_eq!(current.created_at, row.created_at);
+            assert_eq!(current.lifecycle_generation, generation);
+            assert!(current.is_trashed());
+            assert!(current.lifecycle_reservation.is_none());
         }
     }
 }

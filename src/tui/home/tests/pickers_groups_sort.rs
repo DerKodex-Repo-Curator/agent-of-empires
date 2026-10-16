@@ -485,6 +485,7 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now(),
+        resource_intent: None,
     });
     storage
         .update(|instances, groups| {

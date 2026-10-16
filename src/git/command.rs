@@ -20,7 +20,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, false, None)
+    run(cwd, args, false, false)
 }
 
 /// [`run_git`] at background priority, for git commands that delete many files.
@@ -29,28 +29,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run(cwd, args, false, true, None)
+    run(cwd, args, false, true)
 }
 
-pub(crate) fn run_git_with_hooks<I, S>(
-    cwd: &Path,
-    args: I,
-    lease: &mut dyn super::native_hooks::HookLease,
-) -> std::io::Result<Output>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    run(cwd, args, false, false, Some(lease))
-}
-
-fn run<I, S>(
-    cwd: &Path,
-    args: I,
-    quiet: bool,
-    throttled: bool,
-    lease: Option<&mut dyn super::native_hooks::HookLease>,
-) -> std::io::Result<Output>
+fn run<I, S>(cwd: &Path, args: I, quiet: bool, throttled: bool) -> std::io::Result<Output>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -64,17 +46,13 @@ where
         cwd = %cwd.display(),
         "running git"
     );
-    let output = if let Some(lease) = lease {
-        super::native_hooks::run(cwd, &argv, lease)?
-    } else {
-        let mut command = Command::new("git");
-        // Stable English diagnostics are parsed by the worktree error classifiers.
-        command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
-        if throttled {
-            crate::process::throttle_child(&mut command);
-        }
-        command.output()?
-    };
+    let mut command = Command::new("git");
+    // Worktree classifiers parse Git's English diagnostics.
+    command.args(&argv).current_dir(cwd).env("LC_ALL", "C");
+    if throttled {
+        crate::process::throttle_child(&mut command);
+    }
+    let output = command.output()?;
     let dur = start.elapsed().as_millis() as u64;
     if output.status.success() {
         tracing::debug!(
@@ -155,8 +133,6 @@ where
     S: AsRef<OsStr>,
 {
     let argv: Vec<std::ffi::OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-    #[cfg(test)]
-    let timeout = super::native_hooks::creation_test_timeout(&argv, timeout);
     let redacted: Vec<String> = argv.iter().map(|a| redact(a.as_os_str())).collect();
     let start = Instant::now();
     tracing::debug!(

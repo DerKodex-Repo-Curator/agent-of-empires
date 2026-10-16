@@ -215,62 +215,30 @@ impl HomeView {
         let structured = data.structured;
         let params = InstanceParams::from(data);
 
-        let build_result = builder::build_instance(
+        let mut build_result = builder::build_instance(
             params,
             &existing_titles,
             &existing_branches,
             &target_profile,
         )?;
-        let ownership = build_result.ownership;
-        let mut instance = build_result.instance;
-        instance.source_profile = target_profile.clone();
         if structured {
-            builder::structured::apply_structured_choice(&mut instance);
+            builder::structured::apply_structured_choice(&mut build_result.instance);
         }
+        let completion = build_result
+            .run_on_create(|_| Ok(()))
+            .and_then(|()| build_result.publish());
+        if let Err(error) = completion {
+            return match build_result.rollback() {
+                Ok(()) => Err(error),
+                Err(cleanup) => {
+                    Err(error.context(format!("Creation rollback could not finish: {cleanup:#}")))
+                }
+            };
+        }
+        let instance = build_result.instance;
         let session_id = instance.id.clone();
-
-        // Ensure target profile storage exists
-        if !self.storages.contains_key(&target_profile) {
-            self.storages.insert(
-                target_profile.clone(),
-                Storage::new(&target_profile, self.file_watch.clone())?,
-            );
-        }
-
-        let persist = self
-            .storages
-            .get(&target_profile)
-            .expect("creation storage registered above")
-            .update(|instances, groups| {
-                build_result.profile_storage.verify_profile_identity()?;
-                build_result.witness.validate(&instance)?;
-                if is_duplicate_session(
-                    instances.iter(),
-                    &instance.title,
-                    &instance.project_path,
-                    None,
-                ) {
-                    return Err(duplicate_session_error(&instance.title));
-                }
-                instances.push(instance.clone());
-                if !instance.group_path.is_empty() {
-                    let mut tree = GroupTree::new_with_groups(instances, groups);
-                    tree.create_group(&instance.group_path);
-                    *groups = tree.get_all_groups();
-                }
-                Ok(())
-            });
-        if let Err(error) = persist {
-            drop(ownership);
-            builder::cleanup_unpublished_instance(
-                &instance,
-                build_result.created_worktree.as_ref(),
-                &build_result.created_workspace_worktrees,
-                None,
-                &build_result.witness,
-            );
-            return Err(error);
-        }
+        self.storages
+            .insert(target_profile.clone(), build_result.profile_storage);
         self.publish_persisted_instance(instance.clone());
         self.rebuild_group_trees();
         if !instance.group_path.is_empty() {
@@ -278,7 +246,6 @@ impl HomeView {
                 tree.create_group(&instance.group_path);
             }
         }
-        drop(ownership);
 
         crate::tips::record_session_creations(1);
         self.reload()?;
@@ -1713,8 +1680,12 @@ impl HomeView {
             return;
         };
         let acquisition = (|| -> anyhow::Result<_> {
-            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
-            storage.update(|instances, _groups| {
+            let root = crate::session::storage::acquire_ownership_lock()?;
+            let _identity =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&root)?;
+            let _lifecycle_lock =
+                storage.acquire_instance_lifecycle_lock_with_ownership(&root, id)?;
+            storage.update_with_ownership(&root, |instances, _groups| {
                 let stored = instances
                     .iter_mut()
                     .find(|instance| instance.id == id)
@@ -1748,19 +1719,25 @@ impl HomeView {
         request_instance.trash_lifecycle_id = trash_lifecycle_id.clone();
         request_instance.lifecycle_generation = generation;
         request_instance.lifecycle_reservation = reservation.clone();
+        let request =
+            match crate::session::trash::prepare_trash(storage, &request_instance, generation) {
+                Ok(request) => request,
+                Err(error) => {
+                    let message = format!("Could not prepare trash: {error:#}");
+                    if let Err(reload) = self.reload() {
+                        tracing::warn!(target: "tui.session", "trash reload failed: {reload:#}");
+                    }
+                    self.info_dialog = Some(InfoDialog::new("Trash Failed", &message));
+                    return;
+                }
+            };
         if let Some(instance) = self.instances.get_mut(id) {
             instance.trashed_at = trashed_at;
             instance.trash_lifecycle_id = trash_lifecycle_id;
             instance.lifecycle_generation = generation;
-            instance.lifecycle_reservation = reservation;
+            instance.lifecycle_reservation = request.instance.lifecycle_reservation.clone();
         }
-        self.trash_poller
-            .request_trash(crate::session::trash::TrashRequest {
-                storage: storage.clone(),
-                session_id: id.to_string(),
-                instance: request_instance,
-                generation,
-            });
+        self.trash_poller.request_trash(request);
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();
@@ -1807,7 +1784,7 @@ impl HomeView {
                     };
                     if current.created_at != result.baseline.created_at
                         || current.source_profile != result.baseline.source_profile
-                        || result.storage.verify_profile_identity().is_err()
+                        || result.storage.verify_profile_available().is_err()
                     {
                         continue;
                     }

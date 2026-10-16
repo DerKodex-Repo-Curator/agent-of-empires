@@ -1,13 +1,11 @@
 //! Legacy intents lack incarnation authority and must never choose a winner.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 
-use crate::session::move_journal::{MoveAuthority, MoveJournalEntry, MOVE_JOURNAL_VERSION};
-
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct LegacyEntry {
     version: u32,
     ids: Vec<String>,
@@ -19,6 +17,23 @@ struct LegacyEntry {
     group_move_target_path: String,
     group_move_subtree: bool,
     created_at_epoch_ms: u64,
+}
+
+// Version 41 always writes version 2, independently of the current runtime codec.
+#[derive(Deserialize, Serialize)]
+struct HistoricalEntry {
+    #[serde(flatten)]
+    header: LegacyEntry,
+    authority: HistoricalAuthority,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HistoricalAuthority {
+    LegacyConflict {
+        legacy: serde_json::Value,
+        reason: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -94,22 +109,12 @@ pub fn run() -> Result<()> {
         }
         name.push_str(".json");
         let destination = central.join(name);
-        let migrated = MoveJournalEntry {
-            version: MOVE_JOURNAL_VERSION,
-            ids: legacy.ids,
-            source_profile: legacy.source_profile,
-            target_profile: legacy.target_profile,
-            source_sessions_path: legacy.source_sessions_path,
-            target_sessions_path: legacy.target_sessions_path,
-            group_move_source_path: legacy.group_move_source_path,
-            group_move_target_path: legacy.group_move_target_path,
-            group_move_subtree: legacy.group_move_subtree,
-            created_at_epoch_ms: legacy.created_at_epoch_ms,
-            authority: MoveAuthority::LegacyConflict {
+        let migrated = HistoricalEntry {
+            header: LegacyEntry { version: 2, ..legacy },
+            authority: HistoricalAuthority::LegacyConflict {
                 legacy: serde_json::from_slice(&bytes)?,
                 reason: "legacy v1 intent has no original incarnation, generation or physical-resource authority".into(),
             },
-            live_lock_identity: None,
         };
         let migrated_bytes = serde_json::to_vec_pretty(&migrated)?;
         crate::session::backup_before_migration(&path)?;
@@ -171,13 +176,11 @@ mod tests {
         assert!(!path.exists());
         let scanned = crate::session::move_journal::scan();
         assert_eq!(scanned.entries.len(), 1);
-        let (central, parsed) = &scanned.entries[0];
-        match &parsed.as_ref().unwrap().authority {
-            MoveAuthority::LegacyConflict { legacy, .. } => {
-                assert_eq!(legacy, &old);
-            }
-            _ => panic!("legacy evidence must have no arbitration authority"),
-        }
+        let (central, _) = &scanned.entries[0];
+        let parsed: HistoricalEntry = serde_json::from_slice(&fs::read(central)?)?;
+        assert_eq!(parsed.header.version, 2);
+        let HistoricalAuthority::LegacyConflict { legacy, .. } = parsed.authority;
+        assert_eq!(legacy, old);
         let backups = crate::session::storage::migration_backups(&path)?;
         assert_eq!(backups.len(), 1);
         assert_eq!(fs::read(&backups[0].1)?, bytes);

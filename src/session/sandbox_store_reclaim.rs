@@ -641,7 +641,7 @@ fn directory_bytes(root: &Path) -> u64 {
 /// pass.
 pub(crate) struct StoreRemoval {
     app: PathBuf,
-    roots: Vec<(PathBuf, crate::session::builder::DirectoryWitness)>,
+    roots: Vec<PathBuf>,
 }
 
 impl StoreRemoval {
@@ -678,8 +678,7 @@ impl StoreRemoval {
                     return Err(error).with_context(|| format!("inspecting {}", path.display()))
                 }
             }
-            let witness = crate::session::builder::DirectoryWitness::capture(&path)?;
-            roots.push((path, witness));
+            roots.push(path);
         }
         Ok(Self { app, roots })
     }
@@ -688,8 +687,7 @@ impl StoreRemoval {
         let other_namespaces = also_owned(&self.app);
         let mut removed = Vec::new();
         let mut freed = 0;
-        for (path, witness) in self.roots {
-            witness.verify()?;
+        for path in self.roots {
             let root = AnchoredDir::open(&path)?;
             if !has_content_owner(&self.app, &other_namespaces, id, &root)? {
                 tracing::warn!(target: "session.store", path = %path.display(), "preserving sandbox original with unproven native content ownership");

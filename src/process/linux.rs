@@ -12,12 +12,6 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group,
 };
-pub(super) fn running_image() -> std::io::Result<std::path::PathBuf> {
-    Ok(std::path::PathBuf::from(format!(
-        "/proc/{}/exe",
-        std::process::id()
-    )))
-}
 pub(super) fn launch_executable(
     executable: std::path::PathBuf,
 ) -> std::io::Result<std::path::PathBuf> {

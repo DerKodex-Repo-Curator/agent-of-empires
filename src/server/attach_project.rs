@@ -60,7 +60,7 @@ pub(crate) async fn attach_project(
         return Err(AttachError::NotFound);
     };
     let inst_lock = state.instance_lock(id).await;
-    // Release these gates before native callbacks can reenter this daemon.
+    // Release these gates before Git hooks can reenter this daemon.
     let _guard = inst_lock.lock().await;
 
     let (profile, was_running, original) = {
@@ -127,33 +127,60 @@ pub(crate) async fn attach_project(
             .shutdown_and_wait(id, std::time::Duration::from_secs(5))
             .await
         {
-            return Err(AttachError::Rejected(format!(
-                "could not stop the current worker: {e}"
-            )));
+            let message = format!("could not stop the current worker: {e}");
+            let message = run_blocking(storage.clone(), move |_| {
+                Ok(format!(
+                    "{:#}",
+                    crate::session::attach_project::cancel_attach(&plan, anyhow::anyhow!(message))
+                ))
+            })
+            .await
+            .map_err(AttachError::Rejected)?;
+            return Err(AttachError::Rejected(message));
         }
     }
 
     let (plan, quiesced) = if restarts {
-        // The worker registry entry is already gone, so this takes down the tmux
-        // pane and the sandbox container and reports only what it stopped.
+        // The supervisor's worker is gone; quiescence handles the remaining pane.
         match run_blocking(storage.clone(), {
             move |storage| {
                 let quiesced =
                     crate::session::attach_project::quiesce_for_conversion(storage, &plan)
-                        .map_err(|e| format!("{e:#}"))?;
+                        .map_err(|error| {
+                            format!(
+                                "{:#}",
+                                crate::session::attach_project::cancel_attach(&plan, error)
+                            )
+                        })?;
                 Ok((plan, quiesced))
             }
         })
         .await
         {
-            Ok((plan, q)) => {
-                clear_sandbox_pins(state, id).await;
-                (plan, q)
+            Ok(result) => result,
+            Err(error) => {
+                restore_after_failure(
+                    state,
+                    &instance,
+                    storage.clone(),
+                    crate::session::attach_project::Quiesced {
+                        attach_generation: instance.lifecycle_generation,
+                        ..Default::default()
+                    },
+                    was_running,
+                )
+                .await;
+                return Err(AttachError::Rejected(error));
             }
-            Err(e) => return Err(AttachError::Rejected(e)),
         }
     } else {
-        (plan, crate::session::attach_project::Quiesced::default())
+        (
+            plan,
+            crate::session::attach_project::Quiesced {
+                attach_generation: instance.lifecycle_generation,
+                ..Default::default()
+            },
+        )
     };
 
     drop(_guard);
@@ -161,13 +188,11 @@ pub(crate) async fn attach_project(
     let id_owned = id.to_string();
     let admitted_instance = instance.clone();
     let (result, quiesced) = run_blocking(storage.clone(), move |storage| {
-        let mut quiesced = quiesced;
         let result = crate::session::attach_project::attach_planned(
             storage,
             &id_owned,
             &admitted_instance,
             plan,
-            &mut quiesced,
         )
         .map_err(|error| format!("{error:#}"));
         Ok((result, quiesced))
@@ -293,11 +318,7 @@ async fn mirror_conversion(
         expected.project_path = path.clone();
         expected.worktree_info = None;
     }
-    let generation = if quiesced.attach_generation == 0 {
-        original.lifecycle_generation
-    } else {
-        quiesced.attach_generation
-    };
+    let generation = quiesced.attach_generation;
     let current = run_blocking(storage, move |storage| {
         #[cfg(test)]
         if let Some(sender) = BEFORE_MIRROR_ROOT.lock().take() {
@@ -316,6 +337,7 @@ async fn mirror_conversion(
             .ok_or("session disappeared after attach")?;
         if !crate::session::attach_project::same_checkout(&row, &expected)
             || row.lifecycle_generation != generation
+            || row.lifecycle_reservation.is_some()
         {
             return Err("session changed after attach".to_owned());
         }
@@ -334,6 +356,12 @@ async fn mirror_conversion(
         return Err(AttachError::Rejected(
             "session changed after attach".to_owned(),
         ));
+    }
+    inst.lifecycle_generation = current.lifecycle_generation;
+    inst.lifecycle_reservation = None;
+    if let (Some(live), Some(durable)) = (&mut inst.sandbox_info, current.sandbox_info) {
+        live.container_id = durable.container_id;
+        live.container_workdir = durable.container_workdir;
     }
     inst.workspace_info = current.workspace_info;
     inst.project_path = current.project_path;
@@ -367,7 +395,7 @@ async fn spawn_worker(
                 quiesced.pane_was_live && !original.is_structured(),
             ))
             .ok_or_else(|| "attach restart generation overflow".to_string())?;
-        // The strict reader and original profile witness run under the same fence as Launch admission.
+        // This strict reader shares Launch admission's namespace fence.
         let mut expected = original.clone();
         if let Some(outcome) = &outcome {
             expected.workspace_info = Some(outcome.workspace_info.clone());
@@ -496,17 +524,6 @@ fn complete_worker_restart(
     })?;
     cleanup.disarm();
     Ok(checkout_matches)
-}
-
-/// Drop the create-time container pins from the live instance.
-async fn clear_sandbox_pins(state: &Arc<AppState>, id: &str) {
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        if let Some(sandbox) = inst.sandbox_info.as_mut() {
-            sandbox.container_id = None;
-            sandbox.container_workdir = None;
-        }
-    }
 }
 
 #[cfg(test)]

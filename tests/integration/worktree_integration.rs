@@ -57,9 +57,9 @@ fn test_error_when_worktree_already_exists() {
 
 // --- Edit-workdir-name (#1723) ---
 
-use agent_of_empires::session::worktree_edit::{
-    edit_worktree_workdir, WorktreeEditError, WorktreeEditRequest,
-};
+use agent_of_empires::cli::session::{self, SessionCommands};
+use agent_of_empires::session::worktree_edit::WorktreeEditError;
+use anyhow::Context as _;
 
 fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
     WorktreeInfo {
@@ -71,9 +71,53 @@ fn managed_info(branch: &str, repo: &std::path::Path) -> WorktreeInfo {
     }
 }
 
+fn seed_edit_session(info: &WorktreeInfo, path: &std::path::Path) -> (Storage, String) {
+    agent_of_empires::session::config::update_config(|config| {
+        config.session.tie_workdir_to_name = false;
+    })
+    .unwrap();
+    let storage = Storage::new_unwatched("worktree-edit").unwrap();
+    let mut instance = Instance::new("Edit", &path.to_string_lossy());
+    instance.worktree_info = Some(info.clone());
+    let id = instance.id.clone();
+    storage
+        .update(|rows, _| {
+            rows.push(instance);
+            Ok(())
+        })
+        .unwrap();
+    (storage, id)
+}
+
+fn edit_workdir(
+    storage: &Storage,
+    id: &str,
+    name: &str,
+    rename_branch: bool,
+) -> anyhow::Result<Instance> {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Command {
+        #[command(subcommand)]
+        session: SessionCommands,
+    }
+    let args = Command::try_parse_from(
+        ["session", "set-worktree-name", id, "--name", name]
+            .into_iter()
+            .chain(rename_branch.then_some("--rename-branch")),
+    )?;
+    tokio::runtime::Runtime::new()?.block_on(session::run(storage.profile(), args.session))?;
+    storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .context("edited session disappeared")
+}
+
 #[test]
 #[serial]
 fn edit_workdir_moves_dir_and_optionally_renames_branch() {
+    let _home = crate::common::setup_temp_home();
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
 
@@ -83,32 +127,24 @@ fn edit_workdir_moves_dir_and_optionally_renames_branch() {
         .unwrap();
     assert!(old_path.exists());
     let info = managed_info("old-name", repo_dir.path());
+    let (storage, id) = seed_edit_session(&info, &old_path);
 
     // Path-only edit: directory moves, branch untouched.
-    let outcome = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "fresh-name",
-        rename_branch: false,
-    })
-    .unwrap();
+    let outcome = edit_workdir(&storage, &id, "fresh-name", false).unwrap();
     let fresh_path = repo_dir.path().join("fresh-name");
-    assert_eq!(outcome.new_path, fresh_path);
-    assert_eq!(outcome.new_branch, None);
+    assert_eq!(
+        std::path::Path::new(&outcome.project_path),
+        fresh_path.as_path()
+    );
+    assert_eq!(outcome.worktree_info.as_ref().unwrap().branch, "old-name");
     assert!(!old_path.exists());
     assert!(fresh_path.exists());
     assert!(git_wt.branch_exists("old-name").unwrap());
 
     // Branch rename opted in: directory moves and branch is renamed.
-    let outcome2 = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &fresh_path,
-        new_name: "renamed",
-        rename_branch: true,
-    })
-    .unwrap();
+    let outcome2 = edit_workdir(&storage, &id, "renamed", true).unwrap();
     let renamed_path = repo_dir.path().join("renamed");
-    assert_eq!(outcome2.new_branch.as_deref(), Some("renamed"));
+    assert_eq!(outcome2.worktree_info.as_ref().unwrap().branch, "renamed");
     assert!(!fresh_path.exists());
     assert!(renamed_path.exists());
     assert!(git_wt.branch_exists("renamed").unwrap());
@@ -142,6 +178,7 @@ fn tie_workdir_applies_only_for_managed_worktrees() {
 #[test]
 #[serial]
 fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
+    let _home = crate::common::setup_temp_home();
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
 
@@ -154,28 +191,23 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
         .create_worktree("bbb", &occupied, true, None)
         .unwrap();
     let info = managed_info("aaa", repo_dir.path());
+    let (storage, id) = seed_edit_session(&info, &old_path);
 
     // Target directory already exists: nothing moves.
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "bbb",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::TargetExists(_)));
+    let err = edit_workdir(&storage, &id, "bbb", false).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::TargetExists(_))
+    ));
     assert!(old_path.exists());
 
     // Branch rename onto an existing branch is rejected; the source
     // directory and branch are untouched.
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &old_path,
-        new_name: "test-feature",
-        rename_branch: true,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::BranchExists(_)));
+    let err = edit_workdir(&storage, &id, "test-feature", true).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::BranchExists(_))
+    ));
     assert!(old_path.exists());
     assert!(git_wt.branch_exists("aaa").unwrap());
 
@@ -184,14 +216,20 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
         managed_by_aoe: false,
         ..info.clone()
     };
-    let err = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &unmanaged,
-        current_path: &old_path,
-        new_name: "ccc",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(err, WorktreeEditError::NotManaged));
+    storage
+        .update(|rows, _| {
+            rows.iter_mut()
+                .find(|row| row.id == id)
+                .unwrap()
+                .worktree_info = Some(unmanaged);
+            Ok(())
+        })
+        .unwrap();
+    let err = edit_workdir(&storage, &id, "ccc", false).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<WorktreeEditError>(),
+        Some(WorktreeEditError::NotManaged)
+    ));
     assert!(old_path.exists());
 }
 
@@ -270,18 +308,6 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
     assert!(!created.exists());
     assert!(relocated.exists());
 
-    // The pre-reconcile behavior, pinned: `edit_worktree_workdir` is untouched
-    // by the reconcile work, so calling it with the recorded path is exactly
-    // what every surface did before and it still refuses.
-    let before = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: &created,
-        new_name: "settled-name",
-        rename_branch: false,
-    })
-    .unwrap_err();
-    assert!(matches!(before, WorktreeEditError::SourceMissing(_)));
-
     let mut stale = instance.clone();
     assert_eq!(
         reconcile_and_persist(&storage, &mut stale, &mut Default::default()).unwrap(),
@@ -298,30 +324,27 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
         relocated.canonicalize().unwrap()
     );
 
-    // The rename that returned SourceMissing before the reconcile now lands,
-    // renaming within the directory's real parent.
-    let outcome = edit_worktree_workdir(WorktreeEditRequest {
-        worktree_info: &info,
-        current_path: std::path::Path::new(&stale.project_path),
-        new_name: "settled-name",
-        rename_branch: false,
+    agent_of_empires::session::config::update_config(|config| {
+        config.session.tie_workdir_to_name = false;
     })
     .unwrap();
+    let outcome = edit_workdir(&storage, &instance.id, "settled-name", false).unwrap();
+    let settled_path = relocated
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("settled-name");
     assert_eq!(
-        outcome.new_path,
-        relocated
-            .parent()
-            .unwrap()
-            .canonicalize()
-            .unwrap()
-            .join("settled-name")
+        std::path::Path::new(&outcome.project_path),
+        settled_path.as_path()
     );
-    assert!(outcome.new_path.exists());
+    assert!(settled_path.exists());
 
     // Reconciling again is a no-op: the recorded path is present, so git is
     // never consulted.
     let mut settled = stale.clone();
-    settled.project_path = outcome.new_path.to_string_lossy().into_owned();
+    settled.project_path = outcome.project_path;
     assert_eq!(
         reconcile_and_persist(&storage, &mut settled, &mut Default::default()).unwrap(),
         WorktreePathResolution::Current
@@ -465,170 +488,8 @@ fn reconcile_refuses_a_checkout_another_session_records() {
 #[cfg(unix)]
 #[test]
 #[serial_test::parallel]
-fn native_cli_hooks_survive_nested_git_dispatch_and_image_replacement() {
+fn cli_publishes_and_removes_detached_without_owning_a_local_branch_label() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-    for replace in [false, true]
-        .into_iter()
-        .filter(|replace| !replace || cfg!(target_os = "linux"))
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let home = root.join("home");
-        let xdg = root.join("xdg");
-        let bin = root.join("bin");
-        for directory in [&home, &xdg, &bin] {
-            std::fs::create_dir(directory).unwrap();
-        }
-        let repo_path = root.join("repo");
-        let repo = git2::Repository::init(&repo_path).unwrap();
-        let signature = git2::Signature::now("fixture", "fixture@example.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            "fixture",
-            &repo.find_tree(tree_id).unwrap(),
-            &[],
-        )
-        .unwrap();
-        let hook = repo.path().join("hooks/post-checkout");
-        std::fs::write(
-            &hook,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$AOE_TEST_HOOK\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let executable = root.join("aoe");
-        std::fs::copy(env!("CARGO_BIN_EXE_aoe"), &executable).unwrap();
-        let replacement = root.join("replacement");
-        std::fs::write(&replacement, "#!/bin/sh\nexit 93\n").unwrap();
-        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let real_git = which::which("git").unwrap();
-        let wrapper = bin.join("git");
-        std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$AOE_TEST_REPLACE\" = 1 ] && [ \"$1\" = --exec-path ] && mkdir \"$AOE_TEST_GATE\" 2>/dev/null; then\n mv \"$AOE_TEST_REPLACEMENT\" \"$AOE_TEST_IMAGE\" || exit 94\n readlink \"/proc/$PPID/exe\" > \"$AOE_TEST_IMAGE_AFTER\" || exit 95\nfi\nexec \"$AOE_TEST_REAL_GIT\" \"$@\"\n").unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let claude = bin.join("claude");
-        std::fs::write(&claude, "#!/bin/sh\nexit 96\n").unwrap();
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let app = xdg.join(if cfg!(debug_assertions) {
-            "agent-of-empires-dev"
-        } else {
-            "agent-of-empires"
-        });
-        std::fs::create_dir_all(&app).unwrap();
-        crate::common::disable_systemd_scopes(&app);
-        let marker = root.join("hook-ran");
-        let image_after = root.join("image-after");
-        let mut command = Command::new(&executable);
-        command
-            .args([
-                "-p",
-                "owner",
-                "add",
-                repo_path.to_str().unwrap(),
-                "--title",
-                "native-proof",
-                "--worktree",
-                "native-proof",
-                "--new-branch",
-                "--cmd",
-                "claude",
-                "--trust-hooks",
-                "--no-submodules",
-            ])
-            .current_dir(root)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", &xdg)
-            .env("AOE_TMUX_SOCKET", root.join("tmux.sock"))
-            .env(
-                "PATH",
-                std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
-                    &std::env::var_os("PATH").unwrap_or_default(),
-                )))
-                .unwrap(),
-            )
-            .env("AOE_TEST_REAL_GIT", real_git)
-            .env("AOE_TEST_HOOK", &marker)
-            .env("AOE_TEST_IMAGE", &executable)
-            .env("AOE_TEST_REPLACEMENT", &replacement)
-            .env("AOE_TEST_IMAGE_AFTER", &image_after)
-            .env("AOE_TEST_GATE", root.join("replacement-entered"))
-            .env("AOE_TEST_REPLACE", if replace { "1" } else { "0" })
-            .env_remove("AGENT_OF_EMPIRES_PROFILE")
-            .env_remove("CODEX_HOME")
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .env_remove("CURSOR_CONFIG_DIR")
-            .env_remove("COPILOT_CONFIG_DIR")
-            .env_remove("KIRO_CONFIG_DIR");
-        std::fs::create_dir_all(app.join("profiles/owner")).unwrap();
-
-        let output = agent_of_empires::process::run_with_timeout_process_group(
-            &mut command,
-            std::time::Duration::from_secs(75),
-        )
-        .unwrap()
-        .expect("native CLI creation exceeded its deadline");
-        assert!(
-            output.status.success(),
-            "replace={replace}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            marker.exists(),
-            "replace={replace}: real post-checkout hook was skipped"
-        );
-        if replace {
-            assert!(std::fs::read_to_string(image_after)
-                .unwrap()
-                .ends_with(" (deleted)\n"));
-        }
-        let rows: Vec<Instance> = serde_json::from_slice(
-            &std::fs::read(app.join("profiles/owner/sessions.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(std::path::Path::new(&rows[0].project_path)
-            .join(".git")
-            .exists());
-        assert!(repo
-            .find_branch("native-proof", git2::BranchType::Local)
-            .is_ok());
-    }
-}
-
-#[test]
-fn ordinary_cli_ignores_stale_native_context_under_renamed_and_symlink_names() {
-    let fixture = tempfile::tempdir().unwrap();
-    for name in ["aoe", "renamed-aoe", "git"] {
-        let executable = fixture.path().join(name);
-        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_aoe"), &executable).unwrap();
-        let output = std::process::Command::new(&executable)
-            .arg("--version")
-            .env("HOME", fixture.path())
-            .env("XDG_CONFIG_HOME", fixture.path())
-            .env(
-                "AOE_NATIVE_GIT_CONTEXT",
-                fixture.path().join("gone/scope.json"),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{name}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
-    }
-}
-
-#[cfg(unix)]
-#[test]
-#[serial_test::parallel]
-fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::process::Command;
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -653,19 +514,17 @@ fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label
         .unwrap();
     repo.reference("refs/remotes/origin/main", tip, true, "fixture")
         .unwrap();
-    let source_path = repo.path().join("refs/remotes/origin/main");
-    let source = std::fs::metadata(&source_path).unwrap();
     let hook = repo.path().join("hooks/post-checkout");
     std::fs::write(
         &hook,
-        "#!/bin/sh\nprintf complete > \"$AOE_TEST_NATIVE_DETACHED_HOOK\"\n",
+        "#!/bin/sh\nprintf complete > \"$AOE_TEST_POSTCHECKOUT_MARKER\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
     let agent = bin.join("claude");
     std::fs::write(
         &agent,
-        "#!/bin/sh\nprintf denied > \"$AOE_TEST_NATIVE_AGENT_LOG\"\nexit 97\n",
+        "#!/bin/sh\nprintf denied > \"$AOE_TEST_AGENT_LOG\"\nexit 97\n",
     )
     .unwrap();
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -690,14 +549,13 @@ fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &xdg)
             .env("AOE_TMUX_SOCKET", temp.path().join("tmux.sock"))
-            .env("AOE_TEST_NATIVE_DETACHED_HOOK", &marker)
-            .env("AOE_TEST_NATIVE_AGENT_LOG", &agent_log)
+            .env("AOE_TEST_POSTCHECKOUT_MARKER", &marker)
+            .env("AOE_TEST_AGENT_LOG", &agent_log)
             .env("PATH", &path)
             .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_PREFIX")
-            .env_remove("AOE_NATIVE_GIT_CONTEXT");
+            .env_remove("GIT_PREFIX");
         command
     };
     let mut command = cli();
@@ -753,8 +611,6 @@ fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label
             .target(),
         Some(tip)
     );
-    let after = std::fs::metadata(&source_path).unwrap();
-    assert_eq!((after.dev(), after.ino()), (source.dev(), source.ino()));
     repo.reference(
         "refs/heads/origin/main",
         tip,
@@ -762,8 +618,6 @@ fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label
         "later independent local branch",
     )
     .unwrap();
-    let local_path = repo.path().join("refs/heads/origin/main");
-    let local = std::fs::metadata(&local_path).unwrap();
     let mut remove = cli();
     remove.args([
         "remove",
@@ -795,21 +649,11 @@ fn native_cli_publishes_and_removes_detached_without_owning_a_local_branch_label
             .target(),
         Some(tip)
     );
-    let after_local = std::fs::metadata(local_path).unwrap();
-    assert_eq!(
-        (after_local.dev(), after_local.ino()),
-        (local.dev(), local.ino())
-    );
     assert_eq!(
         repo.find_reference("refs/remotes/origin/main")
             .unwrap()
             .target(),
         Some(tip)
-    );
-    let after_source = std::fs::metadata(source_path).unwrap();
-    assert_eq!(
-        (after_source.dev(), after_source.ino()),
-        (source.dev(), source.ino())
     );
     assert!(!agent_log.exists());
 }

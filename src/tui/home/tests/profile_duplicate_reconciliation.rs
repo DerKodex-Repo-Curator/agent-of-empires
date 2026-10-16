@@ -59,7 +59,6 @@ fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
                         .unwrap(),
                 }],
             },
-            live_lock_identity: None,
         })
         .unwrap();
     }
@@ -159,8 +158,14 @@ fn legacy_intent_conflict_is_visible_at_startup_and_not_reopened_on_unchanged_re
         authority: crate::session::move_journal::MoveAuthority::LegacyConflict {
             legacy: serde_json::json!({"version": 1, "ids": [id]}),
             reason: "legacy v1 intent has no original incarnation authority".into(),
+            scope: crate::session::move_journal::LegacyScope {
+                profiles: vec![
+                    crate::session::move_journal::ProfileAuthority::capture(&alpha).unwrap(),
+                    crate::session::move_journal::ProfileAuthority::capture(&beta).unwrap(),
+                ],
+                resources: Vec::new(),
+            },
         },
-        live_lock_identity: None,
     })
     .unwrap();
     let mut view = HomeView::new_for_test(

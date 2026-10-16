@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::move_journal;
 
 fn fixture() -> (tempfile::TempDir, Storage, Instance) {
     let root = tempfile::tempdir().unwrap();
@@ -397,8 +398,6 @@ fn real_git_effects_recover_after_same_and_cross_profile_publication_failure() {
             );
             let pending = move_journal::scan();
             assert_eq!(pending.entries.len(), 1);
-            assert!(matches!(&pending.entries[0].1.as_ref().unwrap().authority,
-                MoveAuthority::Rename { intent } if intent.phase == EffectPhase::Conflict));
             std::fs::remove_dir(&restore_file).unwrap();
             std::fs::rename(&restore_saved, &restore_file).unwrap();
             assert!(
@@ -435,433 +434,78 @@ fn real_git_effects_recover_after_same_and_cross_profile_publication_failure() {
     }
 }
 
-fn reference_hook(
-    root: &Path,
-    row: &Instance,
-    phase: &str,
-    action: &str,
-    profile: &str,
-) -> std::path::PathBuf {
-    use crate::session::environment::shell_escape;
-    use std::os::unix::fs::PermissionsExt;
-    let entered = root.join("callback-entered");
-    let completed = root.join("callback-completed");
-    let program = crate::process::running_image().unwrap();
-    let hook = Path::new(&row.worktree_info.as_ref().unwrap().main_repo_path)
-        .join(".git/hooks/reference-transaction");
-    let gate = if action == "replace-result-ref" {
-        let repo =
-            git2::Repository::open(&row.worktree_info.as_ref().unwrap().main_repo_path).unwrap();
-        format!(
-            "[ -f {} ] || exit 0\n",
-            shell_escape(&repo.commondir().join("refs/heads/new").to_string_lossy())
-        )
-    } else {
-        String::new()
-    };
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = {phase} ] || exit 0\n{gate}[ ! -e {entered} ] || exit 0\n: > {entered}\nAOE_TEST_NATIVE_MUTATOR=1 AOE_TEST_NATIVE_PROFILE={profile} AOE_TEST_NATIVE_ACTION={action} AOE_TEST_NATIVE_TARGET={target} AOE_TEST_NATIVE_MARKER={completed} {program} --exact git::native_hooks::tests::native_callbacks_reenter_ownership --nocapture >/dev/null || exit $?\nprintf complete > {completed}\n",
-        phase = shell_escape(phase), entered = shell_escape(&entered.to_string_lossy()),
-        profile = shell_escape(profile), action = shell_escape(action),
-        target = shell_escape(&row.project_path), completed = shell_escape(&completed.to_string_lossy()),
-        program = shell_escape(&program.to_string_lossy()),
-    );
-    std::fs::write(&hook, script).unwrap();
-    std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-    completed
-}
-
 #[test]
 #[serial_test::serial]
-fn committed_old_ref_deletion_repairs_from_original_oid_after_profile_rename() {
-    let _app = crate::session::test_support::isolate_app_dir();
-    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
-    let (root, source, before) = fixture();
-    let old_identity = source.physical_profile_identity().unwrap();
-    let repo =
-        git2::Repository::open(&before.worktree_info.as_ref().unwrap().main_repo_path).unwrap();
-    let original_tip = repo
-        .find_reference("refs/heads/topic")
-        .unwrap()
-        .target()
-        .unwrap();
-    let completed = reference_hook(root.path(), &before, "committed", "rename", "owner");
-    let result = perform(edit_request(&before, "both", false), |_, _| Ok(()));
-    assert!(result.is_err());
-    assert!(
-        completed.exists(),
-        "the real committed callback must finish its profile rename"
-    );
-    assert!(Storage::open_unwatched("owner").is_err());
-    let moved = Storage::open_unwatched("owner-renamed").unwrap();
-    assert_eq!(moved.physical_profile_identity().unwrap(), old_identity);
-    let durable = moved.load().unwrap();
-    assert_eq!(durable[0].created_at, before.created_at);
-    assert_eq!(durable[0].project_path, before.project_path);
-    assert_eq!(durable[0].worktree_info, before.worktree_info);
-    assert!(durable[0].lifecycle_reservation.is_none());
-    assert_eq!(
-        repo.find_reference("refs/heads/topic").unwrap().target(),
-        Some(original_tip)
-    );
-    assert!(repo.find_reference("refs/heads/new").is_err());
-    assert_eq!(
-        git2::Repository::open(&before.project_path)
-            .unwrap()
-            .head()
-            .unwrap()
-            .shorthand()
-            .unwrap(),
-        "topic"
-    );
-    assert!(move_journal::scan().entries.is_empty());
-}
-
-#[test]
-#[serial_test::serial]
-fn recovery_in_a_real_native_callback_cannot_consume_the_live_intent() {
-    for cross_profile in [false, true] {
-        let _app = crate::session::test_support::isolate_app_dir();
-        let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
-        let (root, source, before) = fixture();
-        let target = Storage::new_unwatched("target").unwrap();
-        let completed = reference_hook(root.path(), &before, "prepared", "recover", "owner");
-        let committed =
-            perform(edit_request(&before, "both", cross_profile), |_, _| Ok(())).unwrap();
-        assert!(completed.exists());
-        assert_eq!(
-            committed.instance.worktree_info.as_ref().unwrap().branch,
-            "new"
-        );
-        assert!(root.path().join("new/tracked").exists());
-        assert!(move_journal::scan().entries.is_empty());
-        if cross_profile {
-            assert!(source.load().unwrap().is_empty());
-            assert_eq!(target.load().unwrap()[0].created_at, before.created_at);
-        } else {
-            assert_eq!(source.load().unwrap()[0].created_at, before.created_at);
-        }
-    }
-}
-
-#[test]
-#[serial_test::serial]
-fn native_adoption_after_partial_git_effect_keeps_an_explicit_conflict() {
-    let _app = crate::session::test_support::isolate_app_dir();
-    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
-    let (root, source, before) = fixture();
-    let peer = Storage::new_unwatched("peer").unwrap();
-    let completed = reference_hook(root.path(), &before, "committed", "adopt-rename", "peer");
-    assert!(perform(edit_request(&before, "both", false), |_, _| Ok(())).is_err());
-    assert!(completed.exists());
-    let adopter = peer.load().unwrap();
-    assert_eq!(adopter.len(), 1);
-    assert_eq!(adopter[0].project_path, before.project_path);
-    assert!(Path::new(&before.project_path).join("tracked").exists());
-    assert!(!root.path().join("new").exists());
-    let pending = move_journal::scan();
-    assert_eq!(pending.entries.len(), 1);
-    assert!(matches!(&pending.entries[0].1.as_ref().unwrap().authority,
-        MoveAuthority::Rename { intent } if intent.phase == EffectPhase::Conflict));
-    let original = source.load().unwrap();
-    assert_eq!(original[0].created_at, before.created_at);
-    let bytes = std::fs::read(peer.sessions_path()).unwrap();
-    assert!(
-        !Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), bytes);
-    assert_eq!(move_journal::scan().entries.len(), 1);
-}
-
-#[test]
-#[serial_test::serial]
-fn post_effect_supersession_never_rolls_back_or_overwrites_new_owner_data() {
-    for change in [
-        "generation",
-        "incarnation",
-        "profile",
-        "checkout",
-        "destination-owner",
-    ] {
+fn post_effect_resource_reservation_rejects_supersession_and_commits_owner() {
+    for change in ["generation", "incarnation", "checkout", "destination-owner"] {
         let _app = crate::session::test_support::isolate_app_dir();
         let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
         let (root, source, before) = fixture();
         let peer = Storage::new_unwatched("peer").unwrap();
         let edited = source.clone();
         let adopter = peer.clone();
-        let retired_profile = root.path().join("retired-profile");
-        let retired_checkout = root.path().join("retired-checkout");
         let result = with_after_effects(
             move |ownership, original, candidate| {
-                if change == "destination-owner" {
-                    adopter
-                        .update_with_ownership(ownership, |rows, _| {
-                            rows.push(Instance::new("new owner", &candidate.project_path));
-                            Ok(())
-                        })
-                        .unwrap();
-                    return;
-                }
-                if change == "profile" {
-                    let directory = edited.sessions_path().parent().unwrap();
-                    std::fs::rename(directory, &retired_profile).unwrap();
-                    std::fs::create_dir(directory).unwrap();
-                    let replacement =
-                        Storage::open_unwatched_with_ownership("owner", ownership).unwrap();
-                    replacement
-                        .update_with_ownership(ownership, |rows, _| {
-                            let mut row = candidate.clone();
-                            row.created_at += chrono::Duration::seconds(1);
-                            row.title = "replacement owner".into();
-                            rows.push(row);
-                            Ok(())
-                        })
-                        .unwrap();
-                    return;
-                }
-                if change == "checkout" {
-                    std::fs::rename(&candidate.project_path, &retired_checkout).unwrap();
-                    std::fs::create_dir(&candidate.project_path).unwrap();
-                    std::fs::write(
-                        Path::new(&candidate.project_path).join("replacement"),
-                        "keep",
-                    )
-                    .unwrap();
-                }
-                edited
-                    .update_with_ownership(ownership, |rows, _| {
+                let refused = if change == "destination-owner" {
+                    adopter.update_with_ownership(ownership, |rows, _| {
+                        rows.push(Instance::new("new owner", &candidate.project_path));
+                        Ok(())
+                    })
+                } else {
+                    edited.update_with_ownership(ownership, |rows, _| {
                         let row = rows.iter_mut().find(|row| row.id == original.id).unwrap();
-                        row.project_path.clone_from(&candidate.project_path);
-                        row.worktree_info.clone_from(&candidate.worktree_info);
-                        row.title = "replacement owner".into();
-                        if change == "generation" {
-                            row.release_lifecycle_reservation_if_owned(
-                                LifecycleOperation::Rename,
-                                original.lifecycle_generation,
-                            );
-                            row.try_acquire_lifecycle_reservation(
-                                LifecycleOperation::Trash,
-                                Instance::LIFECYCLE_RESERVATION_TTL,
-                                Utc::now(),
-                            )?;
-                        } else {
-                            row.created_at += chrono::Duration::seconds(1);
-                        }
-                        if change == "checkout" {
-                            row.worktree_info = None;
+                        match change {
+                            "generation" => {
+                                row.release_lifecycle_reservation_if_owned(
+                                    LifecycleOperation::Rename,
+                                    original.lifecycle_generation,
+                                );
+                                row.try_acquire_lifecycle_reservation(
+                                    LifecycleOperation::Trash,
+                                    Instance::LIFECYCLE_RESERVATION_TTL,
+                                    Utc::now(),
+                                )?;
+                            }
+                            "incarnation" => {
+                                row.created_at += chrono::Duration::seconds(1);
+                            }
+                            "checkout" => {
+                                row.project_path.clone_from(&candidate.project_path);
+                                row.worktree_info = None;
+                            }
+                            _ => unreachable!(),
                         }
                         Ok(())
                     })
-                    .unwrap();
+                };
+                assert!(
+                    refused.is_err(),
+                    "{change}: resource supersession was accepted"
+                );
             },
             || perform(edit_request(&before, "both", false), |_, _| Ok(())),
         );
-        assert!(result.is_err(), "{change}");
-        let current = Storage::open_unwatched("owner").unwrap();
-        let source_bytes = std::fs::read(current.sessions_path()).unwrap();
-        let peer_bytes = peer
-            .sessions_path()
-            .try_exists()
-            .unwrap()
-            .then(|| std::fs::read(peer.sessions_path()).unwrap());
-        let pending = move_journal::scan();
-        assert_eq!(pending.entries.len(), 1, "{change}");
-        assert!(
-            matches!(&pending.entries[0].1.as_ref().unwrap().authority,
-            MoveAuthority::Rename { intent } if intent.phase == EffectPhase::Conflict),
-            "{change}"
-        );
-        assert!(
-            !Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
-                .unwrap()
-                .is_empty()
+        let committed = result.unwrap_or_else(|error| panic!("{change}: {error:#}"));
+        assert_eq!(committed.instance.created_at, before.created_at);
+        assert_eq!(
+            committed.instance.project_path,
+            root.path().join("new").to_string_lossy()
         );
         assert_eq!(
-            std::fs::read(current.sessions_path()).unwrap(),
-            source_bytes,
-            "{change}"
+            committed.instance.worktree_info.as_ref().unwrap().branch,
+            "new"
         );
-        if let Some(bytes) = peer_bytes {
-            assert_eq!(
-                std::fs::read(peer.sessions_path()).unwrap(),
-                bytes,
-                "{change}"
-            );
-        }
-        assert!(
-            root.path().join("new").exists(),
-            "{change}: adopted output must not be moved"
-        );
-        if change == "checkout" {
-            assert_eq!(
-                std::fs::read(root.path().join("new/replacement")).unwrap(),
-                b"keep"
-            );
-            assert!(root.path().join("retired-checkout/tracked").exists());
-        } else {
-            assert!(root.path().join("new/tracked").exists(), "{change}");
-        }
+        assert!(root.path().join("new/tracked").exists(), "{change}");
+        assert!(!root.path().join("old").exists(), "{change}");
+        assert!(peer.load().unwrap().is_empty(), "{change}");
+        assert!(move_journal::scan().entries.is_empty(), "{change}");
+        let durable = source.load().unwrap().remove(0);
+        assert_eq!(durable.project_path, committed.instance.project_path);
+        assert_eq!(durable.worktree_info, committed.instance.worktree_info);
+        assert!(durable.lifecycle_reservation.is_none());
         let repo =
             git2::Repository::open(&before.worktree_info.as_ref().unwrap().main_repo_path).unwrap();
-        assert!(
-            repo.find_reference("refs/heads/new").is_ok(),
-            "{change}: never delete an adopted resulting ref"
-        );
-    }
-}
-
-#[test]
-#[serial_test::serial]
-fn same_oid_reference_replacement_in_committed_hook_is_not_reauthorized() {
-    let _app = crate::session::test_support::isolate_app_dir();
-    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
-    let (root, _, before) = fixture();
-    let completed = reference_hook(
-        root.path(),
-        &before,
-        "committed",
-        "replace-result-ref",
-        "owner",
-    );
-    assert!(perform(edit_request(&before, "both", false), |_, _| Ok(())).is_err());
-    assert!(
-        completed.exists(),
-        "the real committed hook must replace the resulting reference"
-    );
-    let repo =
-        git2::Repository::open(&before.worktree_info.as_ref().unwrap().main_repo_path).unwrap();
-    let reference = repo.commondir().join("refs/heads/new");
-    let original = completed.with_extension("original-ref");
-    let replacement_identity =
-        storage::filesystem_identity(&std::fs::metadata(&reference).unwrap());
-    assert_ne!(
-        replacement_identity,
-        storage::filesystem_identity(&std::fs::metadata(&original).unwrap())
-    );
-    let bytes = std::fs::read(&reference).unwrap();
-    assert_eq!(bytes, std::fs::read(&original).unwrap());
-    assert!(
-        !Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        storage::filesystem_identity(&std::fs::metadata(&reference).unwrap()),
-        replacement_identity
-    );
-    assert_eq!(std::fs::read(&reference).unwrap(), bytes);
-    let pending = move_journal::scan();
-    assert_eq!(pending.entries.len(), 1);
-    assert!(matches!(&pending.entries[0].1.as_ref().unwrap().authority,
-        MoveAuthority::Rename { intent } if intent.phase == EffectPhase::Conflict));
-}
-
-#[test]
-#[serial_test::serial]
-fn branch_recreation_never_adopts_same_oid_refs_from_prepared_or_replaced_committed_hooks() {
-    use crate::session::environment::shell_escape;
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
-    for phase in ["prepared", "committed"] {
-        let _app = crate::session::test_support::isolate_app_dir();
-        let (fixture, source, before) = fixture();
-        let info = before.worktree_info.as_ref().unwrap();
-        let ownership = storage::acquire_ownership_lock().unwrap();
-        let identity = storage::acquire_session_identity_lock_with_ownership(&ownership).unwrap();
-        let title =
-            storage::acquire_session_title_lock_with_ownership(&ownership, &before.id).unwrap();
-        let lifecycle = source
-            .acquire_instance_lifecycle_lock_with_ownership(&ownership, &before.id)
-            .unwrap();
-        let origin = BranchOrigin::capture(Path::new(&info.main_repo_path), &info.branch).unwrap();
-        let authority = origin.durable_authority().unwrap();
-        let reference = authority.common.path.join(&authority.reference);
-        assert!(Command::new("git")
-            .current_dir(&info.main_repo_path)
-            .args(["update-ref", "-d", &authority.reference, &authority.tip])
-            .status()
-            .unwrap()
-            .success());
-        let entered = fixture.path().join("foreign-ref-written");
-        let retired = fixture.path().join("original-created-ref");
-        let effect = if phase == "prepared" {
-            format!(
-                "printf '%s\\n' {} > {}\n",
-                shell_escape(&authority.tip),
-                shell_escape(&reference.to_string_lossy())
-            )
-        } else {
-            format!(
-                "mv {} {}\ncp {} {}\n",
-                shell_escape(&reference.to_string_lossy()),
-                shell_escape(&retired.to_string_lossy()),
-                shell_escape(&retired.to_string_lossy()),
-                shell_escape(&reference.to_string_lossy())
-            )
-        };
-        let hook = authority.common.path.join("hooks/reference-transaction");
-        std::fs::write(&hook, format!(
-            "#!/bin/sh\n[ \"$1\" = {} ] || exit 0\n[ ! -e {entered} ] || exit 0\n{effect}printf written > {entered}\n",
-            shell_escape(phase), entered = shell_escape(&entered.to_string_lossy())
-        )).unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let row_bytes = std::fs::read(source.sessions_path()).unwrap();
-        let mut receipt = None;
-        let result = super::super::native_hooks::restore_missing_branch(
-            super::super::native_hooks::BranchHandoff {
-                root: &ownership,
-                nested: &[&identity, &title, &lifecycle],
-                owner: Some((source.profile(), &before.id)),
-                protected_path: None,
-            },
-            &authority,
-            Path::new(&before.project_path),
-            &mut receipt,
-        );
-        assert!(
-            result.is_err(),
-            "{phase}: the foreign reference must refuse continuation"
-        );
-        assert!(
-            entered.exists(),
-            "{phase}: the real reference hook must execute"
-        );
-        let current = storage::filesystem_identity(&std::fs::metadata(&reference).unwrap());
-        let repo = git2::Repository::open(&info.main_repo_path).unwrap();
-        assert_eq!(
-            repo.find_reference(&authority.reference)
-                .unwrap()
-                .target()
-                .unwrap()
-                .to_string(),
-            authority.tip
-        );
-        if phase == "prepared" {
-            assert!(
-                receipt.is_none(),
-                "a prepared hook has no committed owner receipt"
-            );
-            assert_ne!(Some(current), authority.loose.identity);
-        } else {
-            let receipt = receipt.expect("the committed owner receipt survives the later error");
-            assert_eq!(
-                receipt.identity,
-                Some(storage::filesystem_identity(
-                    &std::fs::metadata(&retired).unwrap()
-                ))
-            );
-            assert_ne!(receipt.identity, Some(current));
-            assert!(
-                receipt.verify().is_err(),
-                "never replace the original receipt with the same-OID foreign inode"
-            );
-            assert_eq!(
-                std::fs::read(&reference).unwrap(),
-                std::fs::read(&retired).unwrap()
-            );
-        }
-        assert_eq!(std::fs::read(source.sessions_path()).unwrap(), row_bytes);
+        assert!(repo.find_reference("refs/heads/topic").is_err(), "{change}");
+        assert!(repo.find_reference("refs/heads/new").is_ok(), "{change}");
     }
 }

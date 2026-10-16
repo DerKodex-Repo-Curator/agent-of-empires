@@ -23,7 +23,6 @@ pub mod import;
 mod instance;
 pub mod mcp;
 pub(crate) mod move_journal;
-pub(crate) mod native_hooks;
 pub mod poller;
 pub mod projects;
 pub(crate) mod recovery;
@@ -77,9 +76,8 @@ pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
-    duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
-    NEWER_GENERATION_BUSY_REASON,
+    duplicate_session_error, is_duplicate_session, persist_session_to_storage, PassiveStatusPatch,
+    ResumeIntent, SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
@@ -318,23 +316,77 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
 }
 
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
-    let _ownership = storage::acquire_ownership_read()?;
-    let base = get_app_dir()?;
     let resolved;
-    let profile_name = if profile.is_empty() {
+    let profile = if profile.is_empty() {
         resolved = config::resolve_default_profile();
         resolved.as_str()
     } else {
         profile
     };
-    let dir = base.join("profiles").join(profile_name);
-    if !dir.exists() {
-        // Only a name about to be created runs the strict grammar; an existing directory still
-        // opens, so older malformed profiles stay listable and deletable.
-        validate_new_profile_name(profile_name)?;
-        fs::create_dir_all(&dir)?;
+    let ownership = storage::acquire_ownership_read()?;
+    if let Some(directory) = existing_profile_dir(&ownership, profile)? {
+        return Ok(directory);
     }
-    Ok(dir)
+    drop(ownership);
+    let ownership = storage::acquire_ownership_lock()?;
+    get_profile_dir_with_ownership(profile, &ownership)
+}
+
+fn existing_profile_dir(
+    ownership: &storage::OwnershipGuard,
+    profile: &str,
+) -> Result<Option<PathBuf>> {
+    let directory = ownership.app_dir().join("profiles").join(profile);
+    match fs::metadata(&directory) {
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_dir(), "profile path is not a directory");
+            Ok(Some(directory))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn get_profile_dir_with_ownership(
+    profile: &str,
+    ownership: &storage::OwnershipGuard,
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !profile.is_empty(),
+        "scoped profile creation requires an explicit name"
+    );
+    if let Some(directory) = existing_profile_dir(ownership, profile)? {
+        return Ok(directory);
+    }
+    ownership.require_exclusive()?;
+    validate_new_profile_name(profile)?;
+    let directory = ownership.app_dir().join("profiles").join(profile);
+    ensure_profile_namespace_available(ownership, profile, &directory)?;
+    fs::create_dir_all(&directory)?;
+    storage::sync_parent_directory(&directory)?;
+    storage::sync_parent_directory(directory.parent().expect("profile has a parent"))?;
+    Ok(directory)
+}
+
+fn ensure_profile_namespace_available(
+    ownership: &storage::OwnershipGuard,
+    profile: &str,
+    directory: &Path,
+) -> Result<()> {
+    ownership.require_exclusive()?;
+    let profile = move_journal::ProfileAuthority {
+        profile: profile.to_owned(),
+        sessions_path: deletion::resolve_claim_path(&directory.join("sessions.json"))
+            .ok_or_else(|| anyhow::anyhow!("profile namespace route cannot be resolved"))?,
+    };
+    for (path, entry) in move_journal::resource_inventory()? {
+        anyhow::ensure!(
+            !entry.affects_profile(&profile),
+            "profile namespace is busy in unresolved resource intent {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolve the on-disk profile directory path WITHOUT creating it.
@@ -342,7 +394,7 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
     let resolved;
     let profile_name = if profile.is_empty() {
-        resolved = config::resolve_default_profile();
+        resolved = config::default_profile_name();
         resolved.as_str()
     } else {
         profile
@@ -618,7 +670,7 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 }
 
 pub fn create_profile(name: &str) -> Result<()> {
-    let _ownership = storage::acquire_ownership_read()?;
+    let ownership = storage::acquire_ownership_lock()?;
     validate_new_profile_name(name)?;
 
     let profiles = list_profiles()?;
@@ -626,12 +678,12 @@ pub fn create_profile(name: &str) -> Result<()> {
         anyhow::bail!("Profile '{}' already exists", name);
     }
 
-    get_profile_dir(name)?;
+    get_profile_dir_with_ownership(name, &ownership)?;
     Ok(())
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
-    let _ownership = storage::acquire_ownership_lock()?;
+    let ownership = storage::acquire_ownership_lock()?;
     validate_profile_name(name)?;
 
     let base = get_app_dir()?;
@@ -644,6 +696,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
     }
+    ensure_profile_namespace_available(&ownership, name, &profile_dir)?;
 
     // The invariant is "at least one profile must exist", a count, not a name.
     // Any profile is deletable as long as deleting it would not leave zero.
@@ -658,7 +711,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
 /// The source keeps the permissive traversal guard so a stray minted by an older binary stays
 /// renameable; the destination is a new profile and is held to the create grammar.
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    let _ownership = storage::acquire_ownership_lock()?;
+    let ownership = storage::acquire_ownership_lock()?;
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
 
@@ -676,6 +729,8 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     if new_dir.exists() {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
+    ensure_profile_namespace_available(&ownership, old_name, &old_dir)?;
+    ensure_profile_namespace_available(&ownership, new_name, &new_dir)?;
 
     fs::rename(&old_dir, &new_dir)?;
 

@@ -46,31 +46,16 @@ enum FetchOutcome {
 impl GitWorktree {
     /// `git fetch <remote> <branch>` with stdin nulled (no passphrase prompts)
     /// and a 10 second bound.
-    fn fetch_branch(
-        &self,
-        remote: &str,
-        branch: &str,
-        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
-    ) -> Result<FetchOutcome> {
+    fn fetch_branch(&self, remote: &str, branch: &str) -> FetchOutcome {
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
-        let output = match lease {
-            Some(lease) => Ok(crate::git::native_hooks::run_timed(
-                &self.repo_path,
-                &["fetch", remote, branch].map(std::ffi::OsString::from),
-                *lease,
-                timeout,
-            )?),
-            None => {
-                let mut command = std::process::Command::new("git");
-                command
-                    .args(["fetch", remote, branch])
-                    .current_dir(&self.repo_path)
-                    .stdin(std::process::Stdio::null());
-                crate::process::run_with_timeout(&mut command, timeout)
-            }
-        };
-        Ok(match output {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["fetch", remote, branch])
+            .current_dir(&self.repo_path)
+            .stdin(std::process::Stdio::null());
+        let output = crate::process::run_with_timeout(&mut command, timeout);
+        match output {
             Ok(Some(output)) if output.status.success() => {
                 tracing::info!(target: "git.worktree", "git fetch {remote}/{branch} ok in {:?}", start.elapsed());
                 FetchOutcome::Ok
@@ -94,19 +79,13 @@ impl GitWorktree {
                     error = %error, "git fetch spawn failed");
                 FetchOutcome::Skipped(format!("spawn failed: {error}"))
             }
-        })
+        }
     }
 
-    /// Native fetch failures warn; failed ownership handoffs cancel creation.
-    fn fetch_with_warning(
-        &self,
-        warnings: &mut Vec<String>,
-        remote: &str,
-        branch: &str,
-        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
-    ) -> Result<()> {
-        let detail = match self.fetch_branch(remote, branch, lease)? {
-            FetchOutcome::Ok => return Ok(()),
+    /// Fetch failures are warnings, so an available local base remains usable.
+    fn fetch_with_warning(&self, warnings: &mut Vec<String>, remote: &str, branch: &str) {
+        let detail = match self.fetch_branch(remote, branch) {
+            FetchOutcome::Ok => return,
             FetchOutcome::Failed(msg) | FetchOutcome::Skipped(msg) => msg,
             FetchOutcome::TimedOut => "timed out after 10s".to_string(),
         };
@@ -114,7 +93,6 @@ impl GitWorktree {
             "git fetch {remote} {branch} failed for {repo}: {detail}",
             repo = self.repo_path.display()
         ));
-        Ok(())
     }
 
     /// Create a worktree at `path` checking out `branch`.
@@ -129,17 +107,6 @@ impl GitWorktree {
         path: &Path,
         create_branch: bool,
         base_branch: Option<&str>,
-    ) -> Result<Vec<String>> {
-        self.create_worktree_with_hooks(branch, path, create_branch, base_branch, None)
-    }
-
-    pub(crate) fn create_worktree_with_hooks(
-        &self,
-        branch: &str,
-        path: &Path,
-        create_branch: bool,
-        base_branch: Option<&str>,
-        mut lease: Option<&mut dyn crate::git::native_hooks::HookLease>,
     ) -> Result<Vec<String>> {
         let total_start = Instant::now();
         let mut warnings: Vec<String> = Vec::new();
@@ -159,26 +126,20 @@ impl GitWorktree {
 
         let t = Instant::now();
         if create_branch {
-            let base = self.fetch_base(&mut warnings, base_branch, &mut lease)?;
+            let base = self.fetch_base(&mut warnings, base_branch);
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
             self.create_branch_from_base(branch, base)?;
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         } else {
-            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch, &mut lease)?;
+            self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch);
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
             self.ensure_branch_exists(branch)?;
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         }
 
-        if let Some(lease) = &mut lease {
-            lease.prepare_checkout(create_branch)?;
-        }
-        self.add_worktree(branch, path, &mut warnings, &mut lease)?;
-        if let Some(lease) = &mut lease {
-            lease.checkpoint()?;
-        }
+        self.add_worktree(branch, path, &mut warnings)?;
 
         // Relative, so the checkout resolves when mounted elsewhere.
         let t = Instant::now();
@@ -188,7 +149,7 @@ impl GitWorktree {
 
         let t = Instant::now();
         let submodule_status = if self.init_submodules {
-            self.initialize_submodules(path, &mut lease)?
+            self.initialize_submodules(path)?
         } else {
             "disabled-by-config".to_string()
         };
@@ -222,8 +183,7 @@ impl GitWorktree {
         &self,
         warnings: &mut Vec<String>,
         base_branch: Option<&str>,
-        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
-    ) -> Result<(String, Option<String>, bool)> {
+    ) -> (String, Option<String>, bool) {
         let (base, remote, explicit) = match base_branch.map(str::trim) {
             Some(base) if !base.is_empty() => {
                 (base.to_string(), self.pick_remote_for_branch(base), true)
@@ -238,13 +198,8 @@ impl GitWorktree {
                 (info.name, info.remote, false)
             }
         };
-        self.fetch_with_warning(
-            warnings,
-            remote.as_deref().unwrap_or(FETCH_REMOTE),
-            &base,
-            lease,
-        )?;
-        Ok((base, remote, explicit))
+        self.fetch_with_warning(warnings, remote.as_deref().unwrap_or(FETCH_REMOTE), &base);
+        (base, remote, explicit)
     }
 
     /// Branches from `<remote>/<base>`, then `origin/<base>`, then local
@@ -322,19 +277,10 @@ impl GitWorktree {
 
     /// `git worktree add`. A post-checkout hook can fail after the checkout
     /// exists; that worktree is usable, so the failure becomes a warning.
-    fn add_worktree(
-        &self,
-        branch: &str,
-        path: &Path,
-        warnings: &mut Vec<String>,
-        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
-    ) -> Result<()> {
+    fn add_worktree(&self, branch: &str, path: &Path, warnings: &mut Vec<String>) -> Result<()> {
         let t = Instant::now();
         let args = ["worktree", "add", path_str(path)?, branch];
-        let output = match lease {
-            Some(lease) => crate::git::command::run_git_with_hooks(&self.repo_path, args, *lease)?,
-            None => crate::git::command::run_git(&self.repo_path, args)?,
-        };
+        let output = crate::git::command::run_git(&self.repo_path, args)?;
         let add_elapsed = t.elapsed();
 
         if !output.status.success() {
@@ -377,11 +323,7 @@ impl GitWorktree {
         Ok(())
     }
 
-    fn initialize_submodules(
-        &self,
-        worktree_path: &Path,
-        lease: &mut Option<&mut dyn crate::git::native_hooks::HookLease>,
-    ) -> Result<String> {
+    fn initialize_submodules(&self, worktree_path: &Path) -> Result<String> {
         let gitmodules_path = worktree_path.join(".gitmodules");
         if !gitmodules_path.is_file() {
             return Ok("none".to_string());
@@ -403,10 +345,7 @@ impl GitWorktree {
         }
         args.extend(["submodule", "update", "--init", "--recursive"].map(String::from));
 
-        let output = match lease {
-            Some(lease) => crate::git::command::run_git_with_hooks(worktree_path, &args, *lease)?,
-            None => crate::git::command::run_git(worktree_path, &args)?,
-        };
+        let output = crate::git::command::run_git(worktree_path, &args)?;
         if output.status.success() {
             return Ok(format!("initialized count={}", submodule_count));
         }
@@ -603,19 +542,14 @@ pub(super) mod tests {
         let (no_remote, _repo) = init_repo();
         let git_wt = GitWorktree::new(no_remote.path().to_path_buf()).unwrap();
         assert!(matches!(
-            git_wt.fetch_branch("origin", "main", &mut None).unwrap(),
+            git_wt.fetch_branch("origin", "main"),
             FetchOutcome::Failed(_)
         ));
         let (_dirs, local, _, _) = fork_upstream_layout("main");
         let git_wt = GitWorktree::new(local).unwrap();
-        assert_eq!(
-            git_wt.fetch_branch("origin", "main", &mut None).unwrap(),
-            FetchOutcome::Ok
-        );
+        assert_eq!(git_wt.fetch_branch("origin", "main"), FetchOutcome::Ok);
         assert!(matches!(
-            git_wt
-                .fetch_branch("origin", "nonexistent-branch", &mut None)
-                .unwrap(),
+            git_wt.fetch_branch("origin", "nonexistent-branch"),
             FetchOutcome::Failed(_)
         ));
     }

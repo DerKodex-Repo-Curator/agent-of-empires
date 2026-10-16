@@ -734,6 +734,7 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         op: LifecycleOperation::Launch,
         generation: 1,
         at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        resource_intent: None,
     };
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Idle;
@@ -1583,13 +1584,15 @@ esac
         };
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut poller = CreationPoller::new();
-        poller.request_creation(CreationRequest {
-            data,
-            existing_instances: vec![],
-            hooks,
-            cancel: cancel.clone(),
-            provisional_creation: None,
-        });
+        poller
+            .request_creation(CreationRequest {
+                data,
+                existing_instances: vec![],
+                hooks,
+                cancel: cancel.clone(),
+                provisional_creation: None,
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -1642,9 +1645,8 @@ esac
             "{scenario}: unrelated ownership mutations must progress while Docker is blocked"
         );
         match (scenario, outcome.result) {
-            ("success" | "retry", CreationResult::Success(success)) => {
-                success.profile_storage.verify_profile_identity().unwrap();
-                success.witness.validate(&success.instance).unwrap();
+            ("success" | "retry", CreationResult::Success(mut success)) => {
+                success.build_result.publish().unwrap();
             }
             ("profile" | "checkout", CreationResult::Error(_)) => {
                 if let Some(bytes) = replacement_bytes {

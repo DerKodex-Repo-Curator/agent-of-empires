@@ -1945,44 +1945,6 @@ mod rename_tests {
             git(&worktree, &["branch", "--show-current"]),
             "olof/bemlo-123-task"
         );
-
-        let info = storage.load().unwrap()[0].worktree_info.clone().unwrap();
-        git(&worktree, &["branch", "-m", "rollback-source"]);
-        git(&worktree, &["checkout", "-b", "external-checkout"]);
-        let refs = git(&repo, &["show-ref", "--heads"]);
-        let error = crate::session::worktree_edit::rollback_worktree_branch(
-            &info,
-            &worktree,
-            "rollback-source",
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("changed concurrently"));
-        assert_eq!(git(&repo, &["show-ref", "--heads"]), refs);
-        assert_eq!(
-            git(&worktree, &["branch", "--show-current"]),
-            "external-checkout"
-        );
-        assert_eq!(
-            storage.load().unwrap()[0]
-                .worktree_info
-                .as_ref()
-                .unwrap()
-                .branch,
-            info.branch
-        );
-        git(&worktree, &["checkout", "rollback-source"]);
-        crate::session::worktree_edit::rollback_worktree_branch(
-            &info,
-            &worktree,
-            "rollback-source",
-        )
-        .unwrap();
-        assert_eq!(git(&worktree, &["branch", "--show-current"]), info.branch);
-        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("uncommitted.txt")).unwrap(),
-            "keep me"
-        );
     }
 
     #[tokio::test]
@@ -2418,20 +2380,18 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     let mut plan = crate::session::attach_project::plan(inst, profile, &repo_path, on_existing)?;
     let inst = crate::session::attach_project::reserve_attach(&storage, &mut plan)?;
     let restarts = crate::session::attach_project::needs_restart(&plan, inst.is_sandboxed());
-    let mut quiesced = if restarts {
+    let quiesced = if restarts {
         println!("Stopping '{title}' so its working directory can move...");
-        crate::session::attach_project::quiesce_for_conversion(&storage, &plan)?
+        crate::session::attach_project::quiesce_for_conversion(&storage, &plan)
+            .map_err(|error| crate::session::attach_project::cancel_attach(&plan, error))?
     } else {
-        crate::session::attach_project::Quiesced::default()
+        crate::session::attach_project::Quiesced {
+            attach_generation: inst.lifecycle_generation,
+            ..Default::default()
+        }
     };
 
-    let outcome = match crate::session::attach_project::attach_planned(
-        &storage,
-        &id,
-        &inst,
-        plan,
-        &mut quiesced,
-    ) {
+    let outcome = match crate::session::attach_project::attach_planned(&storage, &id, &inst, plan) {
         Ok(outcome) => outcome,
         Err(e) => {
             crate::session::attach_project::resume_after_conversion(

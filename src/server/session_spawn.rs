@@ -92,6 +92,8 @@ pub(crate) async fn spawn_structured_session(
     drop(instances);
 
     let file_watch_for_create = service.file_watch.clone();
+    let active_ticket = Arc::new(std::sync::Mutex::new(None));
+    let active_for_build = Arc::clone(&active_ticket);
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
@@ -164,6 +166,7 @@ pub(crate) async fn spawn_structured_session(
 
         let params = InstanceParams {
             provisional_creation: None,
+            has_creation_callbacks: !hook_plan.on_create().is_empty(),
             title,
             title_typed: false,
             path,
@@ -198,18 +201,21 @@ pub(crate) async fn spawn_structured_session(
             fork_seed,
         };
 
-        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
-        let mut ownership = build_result.ownership;
-        let original_storage = build_result.profile_storage;
-        original_storage.verify_profile_identity()?;
-        let storage = crate::session::Storage::open_with_ownership(
-            original_storage.profile(),
-            file_watch_for_create,
-            ownership.as_ref().expect("builder retains creation ownership"),
-        )?;
-        let witness = build_result.witness;
-        let mut instance = build_result.instance;
-        instance.source_profile = storage.profile().to_string();
+        let mut build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
+        *active_for_build.lock().map_err(|_| anyhow::anyhow!("Creation cleanup slot is poisoned"))? =
+            build_result.transaction.clone();
+        let storage = match crate::session::Storage::open(
+            build_result.profile_storage.profile(), file_watch_for_create)
+        {
+            Ok(storage) => storage,
+            Err(error) => {
+                return match build_result.rollback() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!("Creation rollback could not finish: {cleanup:#}"))),
+                };
+            }
+        };
+        let instance = &mut build_result.instance;
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
         instance.pending_initial_turn =
@@ -221,9 +227,6 @@ pub(crate) async fn spawn_structured_session(
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
-        let build_warnings = build_result.warnings;
-        let created_worktree = build_result.created_worktree;
-        let created_workspace_worktrees = build_result.created_workspace_worktrees;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -326,60 +329,41 @@ pub(crate) async fn spawn_structured_session(
             agent_effort
         };
 
-        drop(ownership.take());
-        // Run on_create hooks now that the worktree exists, before the session is persisted
-        // or started.
-        if let Err(e) = crate::server::api::sessions::run_create_hooks(
-            &mut instance,
-            &hook_plan,
-            std::path::Path::new(&original_path),
-            progress.as_deref(),
-        ) {
-            builder::cleanup_unpublished_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
-                &witness,
-            );
+        if let Err(error) = build_result.run_on_create(|instance|
+            crate::server::api::sessions::run_create_hooks(
+                instance, &hook_plan, std::path::Path::new(&original_path), progress.as_deref()))
+        {
             let hint = hook_plan
                 .hooks
                 .as_ref()
                 .and_then(|h| h.origin_hint("on_create"))
                 .map(|hint| format!("\n{hint}"))
                 .unwrap_or_default();
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
+            let error = anyhow::anyhow!("on_create hook failed: {error:#}{hint}");
+            return match build_result.rollback() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("Creation rollback could not finish: {cleanup:#}"))),
+            };
         }
 
         if let Some(progress) = &progress {
             progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
 
-        let mut persist = || -> anyhow::Result<()> {
-            ownership = Some(crate::session::storage::acquire_ownership_read()?);
-            storage.verify_profile_identity()?;
-            witness.validate(&instance)?;
-            storage.update_with_ownership(
-                ownership.as_ref().expect("creation ownership reacquired"),
-                |all, _groups| {
-                    all.push(instance.clone());
-                    Ok(())
-                },
-            )
-        };
-        if let Err(error) = persist() {
-            drop(ownership.take());
-            builder::cleanup_unpublished_instance(
-                &instance, created_worktree.as_ref(), &created_workspace_worktrees, None, &witness,
-            );
-            return Err(error);
+        if let Err(error) = build_result.publish() {
+            return match build_result.rollback() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("Creation rollback could not finish: {cleanup:#}"))),
+            };
         }
-        drop(ownership.take());
+        *active_for_build.lock().map_err(|_| anyhow::anyhow!("Creation cleanup slot is poisoned"))? = None;
+        let mut instance = build_result.instance;
+        let build_warnings = build_result.warnings;
         let startup_error = if !instance.is_structured() {
             let birth = (instance.created_at, instance.lifecycle_generation);
             if let Err(error) = instance.start() {
                 if let Err(settlement) = record_created_start_failure(
-                    &storage, &witness, &mut instance, birth, &error,
+                    &storage, &mut instance, birth, &error,
                 ) {
                     return Err(error.context(format!("Could not record retained startup failure: {settlement:#}")));
                 }
@@ -399,15 +383,14 @@ pub(crate) async fn spawn_structured_session(
             build_warnings,
             agent_effort,
             storage,
-            witness,
             startup_error,
         ))
     })
     .await;
 
     match result {
-        Ok(Ok((instance, warnings, agent_effort, storage, witness, startup_error))) => {
-            let instance = publish_created_instance(service, instance, storage, witness).await?;
+        Ok(Ok((instance, warnings, agent_effort, storage, startup_error))) => {
+            let instance = publish_created_instance(service, instance, storage).await?;
             if let Some(error) = startup_error {
                 return Err(error);
             }
@@ -573,31 +556,62 @@ pub(crate) async fn spawn_structured_session(
             })
         }
         Ok(Err(e)) => Err(e),
-        Err(e) => Err(anyhow::Error::new(SessionBuildPanicked(e.to_string()))),
+        Err(error) => {
+            let mut message = error.to_string();
+            let transaction = {
+                let mut slot = match active_ticket.lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => {
+                        message.push_str("; creation cleanup slot was poisoned");
+                        poisoned.into_inner()
+                    }
+                };
+                slot.take()
+            };
+            if let Some(transaction) = transaction {
+                let cleanup = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = transaction.rollback() {
+                        let root = crate::session::storage::acquire_ownership_lock()?;
+                        transaction.note_conflict_with_ownership(
+                            &root,
+                            format!("Creation worker panicked: {error:#}"),
+                        )?;
+                        return Err(error);
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+                match cleanup {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => message
+                        .push_str(&format!("; creation rollback could not finish: {error:#}")),
+                    Err(error) => {
+                        message.push_str(&format!("; creation cleanup task failed: {error}"))
+                    }
+                }
+            }
+            Err(anyhow::Error::new(SessionBuildPanicked(message)))
+        }
     }
 }
 
 fn record_created_start_failure(
     storage: &crate::session::Storage,
-    witness: &crate::session::builder::CreationWitness,
     instance: &mut Instance,
     birth: (chrono::DateTime<chrono::Utc>, u64),
     error: &anyhow::Error,
 ) -> anyhow::Result<()> {
-    let original_path = witness.original_project_path();
     anyhow::ensure!(
-        instance.created_at == birth.0
-            && std::path::Path::new(&instance.project_path) == original_path,
-        "Created session changed during startup"
+        instance.created_at == birth.0,
+        "Created session incarnation changed during startup"
     );
     let ownership = crate::session::storage::acquire_ownership_read()?;
-    storage.verify_profile_identity()?;
+    storage.verify_profile_available()?;
     let _lifecycle =
         storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &instance.id)?;
     let matches = |row: &Instance| {
         row.id == instance.id
             && row.created_at == birth.0
-            && std::path::Path::new(&row.project_path) == original_path
             && row.lifecycle_generation == instance.lifecycle_generation
             && row.lifecycle_reservation.is_none()
             && (row.lifecycle_generation == birth.1 || row.status == crate::session::Status::Error)
@@ -606,7 +620,6 @@ fn record_created_start_failure(
     let current = rows.iter().find(|row| matches(row)).ok_or_else(|| {
         anyhow::anyhow!("Created session was removed or superseded during startup")
     })?;
-    witness.validate(current)?;
     let needs_commit = current.status != crate::session::Status::Error;
     drop(rows);
     if needs_commit {
@@ -629,9 +642,8 @@ async fn publish_created_instance(
     service: &Arc<SessionService>,
     instance: Instance,
     storage: crate::session::Storage,
-    witness: crate::session::builder::CreationWitness,
 ) -> anyhow::Result<Instance> {
-    let originals = Arc::new((storage, witness, instance));
+    let originals = Arc::new((storage, instance));
     loop {
         let service_for_publish = service.clone();
         let originals = originals.clone();
@@ -641,8 +653,8 @@ async fn publish_created_instance(
             // transaction may still need the live mirror after its durable commit.
             // Take file locks before trying the live lock, and never wait for
             // that live lock while retaining either ownership or lifecycle.
-            let (storage, witness, expected) = &*originals;
-            storage.verify_profile_identity()?;
+            let (storage, expected) = &*originals;
+            storage.verify_profile_available()?;
             let _lifecycle =
                 storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &expected.id)?;
             let Ok(mut instances) = service_for_publish.instances.try_write() else {
@@ -661,7 +673,6 @@ async fn publish_created_instance(
                     && authoritative.project_path == expected.project_path,
                 "Created session changed before live publication"
             );
-            witness.validate(&authoritative)?;
             // Only startup-only fields may come from the worker snapshot.
             if authoritative.runs(&expected.tool, expected.active_execution.as_ref())
                 && authoritative.view == expected.view
@@ -729,16 +740,13 @@ mod tests {
         for change in [
             "generation",
             "birth",
-            "path",
             "reservation",
             "reconciled-generation",
             "reconciled-reservation",
             "purge",
             "corrupt",
             "profile",
-            "checkout",
             "worker-birth",
-            "worker-path",
         ] {
             let _home = crate::session::test_support::isolate_app_dir();
             let fixture = tempfile::tempdir().unwrap();
@@ -748,12 +756,6 @@ mod tests {
             let mut instance =
                 crate::session::Instance::new("original", &project.to_string_lossy());
             instance.source_profile = "test".into();
-            let witness = crate::session::builder::CreationWitness::capture(
-                &instance,
-                std::iter::empty(),
-                None,
-            )
-            .unwrap();
             let birth = (instance.created_at, instance.lifecycle_generation);
             storage
                 .update(|rows, _| {
@@ -771,12 +773,7 @@ mod tests {
                     std::fs::create_dir_all(profile).unwrap();
                     std::fs::write(storage.sessions_path(), b"[]").unwrap();
                 }
-                "checkout" => {
-                    std::fs::rename(&project, fixture.path().join("retired")).unwrap();
-                    std::fs::create_dir(&project).unwrap();
-                }
                 "worker-birth" => instance.created_at += chrono::Duration::seconds(1),
-                "worker-path" => instance.project_path.push_str("/changed"),
                 _ => storage
                     .update(|rows, _| {
                         match change {
@@ -784,7 +781,6 @@ mod tests {
                                 rows[0].lifecycle_generation += 1
                             }
                             "birth" => rows[0].created_at += chrono::Duration::seconds(1),
-                            "path" => rows[0].project_path.push_str("/changed"),
                             "reservation" | "reconciled-reservation" => {
                                 rows[0]
                                     .try_acquire_lifecycle_reservation(
@@ -807,7 +803,6 @@ mod tests {
             let before = std::fs::read(storage.sessions_path()).unwrap();
             let result = super::record_created_start_failure(
                 &storage,
-                &witness,
                 &mut instance,
                 birth,
                 &anyhow::anyhow!("startup failed"),
@@ -1063,12 +1058,6 @@ mod tests {
             let mut instance =
                 crate::session::Instance::new("original", &project.path().to_string_lossy());
             instance.source_profile = "test".into();
-            let witness = crate::session::builder::CreationWitness::capture(
-                &instance,
-                std::iter::empty(),
-                None,
-            )
-            .unwrap();
             storage
                 .update(|rows, _| {
                     rows.push(instance.clone());
@@ -1077,12 +1066,8 @@ mod tests {
                 .unwrap();
             let state = crate::server::test_support::build_test_app_state(Vec::new());
             let live = state.instances.write().await;
-            let publish = super::publish_created_instance(
-                &state.session_service,
-                instance,
-                storage.clone(),
-                witness,
-            );
+            let publish =
+                super::publish_created_instance(&state.session_service, instance, storage.clone());
             tokio::pin!(publish);
             assert!(futures_util::poll!(&mut publish).is_pending());
             // The live lock causally prevents publication until this peer has
@@ -1160,12 +1145,6 @@ mod tests {
                 instance.session_id_poller =
                     Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
             }
-            let witness = crate::session::builder::CreationWitness::capture(
-                &instance,
-                std::iter::empty(),
-                None,
-            )
-            .unwrap();
             storage
                 .update(|rows, _| {
                     rows.push(instance.clone());
@@ -1174,12 +1153,8 @@ mod tests {
                 .unwrap();
             let state = crate::server::test_support::build_test_app_state(Vec::new());
             let live = state.instances.write().await;
-            let publish = super::publish_created_instance(
-                &state.session_service,
-                instance,
-                storage.clone(),
-                witness,
-            );
+            let publish =
+                super::publish_created_instance(&state.session_service, instance, storage.clone());
             tokio::pin!(publish);
             assert!(futures_util::poll!(&mut publish).is_pending());
             let peer_storage = storage.clone();

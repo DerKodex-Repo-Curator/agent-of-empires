@@ -59,10 +59,6 @@ mod platform {
     }
 }
 
-pub(crate) fn running_image() -> std::io::Result<std::path::PathBuf> {
-    platform::running_image()
-}
-
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]

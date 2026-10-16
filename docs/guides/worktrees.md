@@ -83,29 +83,25 @@ Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-
 
 **Trashing relocates the worktree** into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`, so trashed sessions stop cluttering the active checkouts while staying previewable. Restoring moves it back, and is refused if that path is now occupied. Purging removes it.
 
-TUI restores, including Restore All, run in the background and leave restored sessions stopped. Restore reserves the exact session before checking or discarding its old sandbox container, without holding application or session locks during Docker. It then checks the original profile, session generation, checkout identity and ownership again before moving the checkout back; a competing change can therefore refuse the restore without overwriting that change.
+TUI restores, including Restore All, run in the background and leave restored sessions stopped. Restore reserves the exact session before checking or discarding its old sandbox container, without holding application or session locks during Docker. It revalidates the logical profile, session generation and other sessions' path claims before moving the checkout back.
 
-Background trash pointer repair only corrects stored metadata. It pins the matching directory and session generation and checks other profiles' path claims, but does not require Git metadata or move the checkout.
+Background trash pointer repair only corrects stored metadata. It checks the session generation and other profiles' path claims, but does not require Git metadata or move the checkout.
 
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
 An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.
 
+Branch cleanup requires the session's exclusive registered checkout ownership. If that binding is missing, including a detached checkout whose display name matches a local branch, AoE keeps the branch and reports why.
+
 ## Hooks that call AoE
 
-Native Git hooks may call AoE commands. If a hook changes the session or claims a checkout needed by the operation, the operation can be cancelled without undoing the hook's changes.
+Git hooks may call AoE. Commands that touch a checkout or branch reserved by the outer operation fail with a busy error instead of waiting for that operation. Commands on unreserved resources remain allowed, including adopting an existing checkout after its reservation has been released.
 
-Renames record their original session generation, physical profile and Git resources in the application directory's `.move-journal` before changing a branch or checkout. CLI session commands, daemon startup and TUI loads recover interrupted intents before using session snapshots. A live transaction keeps its own flock through callbacks, so a hook's nested AoE command cannot recover or consume its caller's intent.
+Ownership admission and profile creation, rename and deletion share one application namespace fence. Git, Docker and user callbacks run outside the namespace, identity, lifecycle and storage locks. A durable, generation-bound reservation protects the operation's affected paths and refs until publication or verified rollback. Unreadable profile inventories refuse destructive operations.
 
-Recovery finishes a verified publication or compensates only resources still proven original and unadopted. This includes recreating an absent original branch from its recorded object when Git stopped between deleting the old name and creating the new one. Replaced resources, newer session incarnations or generations, and competing owners are preserved instead; the intent remains an explicit conflict, shown in the TUI or reported by the CLI and daemon. This is not a promise of atomic commits across Git and JSON. Legacy v1 intents are backed up and migrated to non-authoritative conflict records; they never select or delete a session copy automatically.
+The application directory's `.move-journal` records logical profiles, session incarnations and generations, and the planned before/after Git resources. CLI session commands, daemon startup and TUI loads recover completed effects before using session snapshots. A live operation holds its own parent-only journal lease; Git and hooks do not inherit it. If a process disappears before an external effect's completion is recorded, recovery retains an explicit conflict rather than assuming that its child stopped or that its reservation expired.
 
-Worktree creation waits for long-running hooks, LFS filters and recursive submodule initialization to finish.
-
-Overlapping hook callbacks are independent while their owning Git command is still alive; each must pass the original ownership and checkout checks before Git continues. A callback's temporary boundary expires only after that callback has finished and been verified, so unrelated callbacks do not freeze later native progress. Reference recreation retains its committed file receipt before user hooks run; a later error cannot authorize adopting a replacement merely because it points to the same commit. Ordinary AoE commands launched from a hook stop inheriting that command's native routing and liveness reference.
-
-Native runtimes use the reserved `native-git-runtimes-v2` application namespace and a private `aoe-native-git-v2-<uid>` socket namespace. Allocation and recovery share locks, and record the socket route before creating it, so interrupted initialization can be cleaned up without deleting unrelated neighbouring directories. Active routed Git processes, including detached Git children that retain their liveness descriptor, keep their runtime protected until the last reference closes. A short platform temporary directory is used when the socket path fits; otherwise aoe uses a short fallback. Helper failures go to stderr without changing Git's stdout.
-
-While another worktree operation is finishing, TUI favorite, manual unread and snooze changes may show a retry message without changing memory or disk. Navigation and rendering remain available. Automatic read marking retries without blocking input.
+AoE runs plain Git with the repository's configured hooks. It does not inject a hook proxy, `core.hooksPath` or `GIT_EXEC_PATH`. These reservations coordinate AoE commands, not independent Git commands or filesystem edits, and do not make Git and JSON one atomic transaction.
 
 ## Warnings during create
 

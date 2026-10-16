@@ -48,6 +48,7 @@ mod v038_prime_native_runtime;
 mod v039_prime_control_path;
 mod v040_worker_ownership;
 mod v041_move_journal_authority;
+mod v042_logical_resource_intents;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -93,7 +94,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 41;
+const CURRENT_VERSION: u32 = 42;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -236,6 +237,11 @@ const MIGRATIONS: &[Migration] = &[
         41,
         "move_journal_authority",
         v041_move_journal_authority::run,
+    ),
+    (
+        42,
+        "logical_resource_intents",
+        v042_logical_resource_intents::run,
     ),
 ];
 
