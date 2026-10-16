@@ -1041,15 +1041,23 @@ impl AgentDef {
     /// Flag keeping the agent's app server inside the launched process. A shared daemon runs
     /// hooks under the env of the pane that spawned it, so every session's status lands on that
     /// pane's `AOE_INSTANCE_ID`. `command` is the launch's own executable and environment: older
-    /// installs reject the flag.
+    /// installs reject the flag. `options` are the arguments before any `--`; the flag is
+    /// withheld when they name a subcommand that does not define it.
     pub(crate) fn supported_no_daemon_flag(
         &self,
         command: &std::process::Command,
+        options: &[String],
     ) -> Option<&'static str> {
         let flag = match self.name {
             "codex" => "--no-daemon",
             _ => return None,
         };
+        if options
+            .iter()
+            .any(|word| CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()))
+        {
+            return None;
+        }
         agent_help_advertises(command, flag).then_some(flag)
     }
 
@@ -1137,6 +1145,39 @@ fn with_agent_help<R>(
         inspect,
     )
 }
+
+/// Codex subcommands, and their aliases, outside the interactive TUI. `--no-daemon` is defined on
+/// the TUI, `resume` and `fork` only; the others reject it.
+const CODEX_NON_TUI_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+];
 
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";

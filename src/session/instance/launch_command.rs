@@ -181,14 +181,14 @@ fn apply_no_daemon_flag(
     let Some(command) = inst.host_agent_command(agent, execution) else {
         return;
     };
-    let Some(flag) = agent.supported_no_daemon_flag(&command) else {
-        return;
-    };
     let Ok(mut words) = shell_words::split(cmd) else {
         return;
     };
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    let Some(flag) = agent.supported_no_daemon_flag(&command, &words[..options_end]) else {
+        return;
+    };
     if words[..options_end].iter().any(|w| w == flag) {
         return;
     }
@@ -3194,6 +3194,44 @@ mod tests {
             words[..terminator].iter().any(|w| w == "--no-daemon"),
             "{words:?}"
         );
+    }
+
+    /// `--no-daemon` belongs to the TUI, `resume` and `fork`; other subcommands reject it.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_flag_is_withheld_from_subcommands_that_reject_it() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::agents::forget_agent_help_for_test();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp_home.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
+        );
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+
+        for (extra_args, injected) in [
+            ("", true),
+            ("-m o3", true),
+            ("resume --last", true),
+            ("fork --last", true),
+            ("-- 'review'", true),
+            ("exec 'fix the build'", false),
+            ("-m o3 exec 'fix the build'", false),
+            ("agents", false),
+            ("review", false),
+            ("mcp list", false),
+        ] {
+            codex.extra_args = extra_args.into();
+            let command = host_command(&mut codex);
+            assert_eq!(
+                command.contains("--no-daemon"),
+                injected,
+                "extra_args {extra_args:?}: {command}"
+            );
+        }
     }
 
     /// Each case starts from a launch that is named, then changes one thing that must keep the
