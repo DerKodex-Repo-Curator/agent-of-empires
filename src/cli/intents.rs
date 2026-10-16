@@ -237,7 +237,12 @@ mod tests {
     #[serial_test::serial]
     fn pending_resolution_validates_authority_and_preserves_session_fields() -> Result<()> {
         for change in ["none", "incarnation", "generation", "other-intent"] {
-            let _app = crate::session::test_support::isolate_app_dir();
+            let temp = tempfile::tempdir()?;
+            let home = temp.path().join("home");
+            std::fs::create_dir(&home)?;
+            let alias = temp.path().join("home-alias");
+            std::os::unix::fs::symlink(&home, &alias)?;
+            let _app = crate::session::test_support::isolate_app_dir_at(&alias);
             let (storage, before, admitted) = pending_fixture()?;
             let path = admitted.transaction.journal().path.clone();
             assert!(

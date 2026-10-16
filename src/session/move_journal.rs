@@ -2029,7 +2029,7 @@ pub(crate) fn same_namespace(left: &super::Instance, right: &super::Instance) ->
 }
 
 pub(crate) fn journal_dir() -> Result<PathBuf> {
-    Ok(super::get_app_dir()?.join(JOURNAL_DIR_NAME))
+    Ok(fs::canonicalize(super::get_app_dir()?)?.join(JOURNAL_DIR_NAME))
 }
 
 /// The stable flock is separate from the atomically rewritten JSON inode.

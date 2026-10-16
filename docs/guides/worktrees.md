@@ -109,7 +109,7 @@ Cancelling creation hides its pending row while the hook stops and cleanup finis
 
 If an operation is interrupted, AoE may keep its affected session, checkout or branch busy rather than risk another operation using it. A matching checkout snapshot does not prove that a surviving Git or hook child has stopped.
 
-1. Run `aoe intents list` to inspect current and legacy entries, malformed evidence and orphaned session bindings. This command also works when an entry prevents startup migrations.
+1. Run `aoe intents list` to inspect current and legacy entries, malformed evidence and orphaned session bindings. This command also works when an entry prevents startup migrations. Use the listed JSON path; symlinked ancestors are supported, but the journal file itself must not be a symlink.
 2. Stop the AoE processes producing the operation and any surviving Git or hook children. Inspect and reconcile the affected checkout, branch and session state.
 3. Clear only the named entry: `aoe intents clear '<path>' --actors-stopped --reason "what was inspected"`.
 
