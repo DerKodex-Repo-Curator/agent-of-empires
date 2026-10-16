@@ -38,23 +38,16 @@ pub struct LivePane0 {
 #[serde(rename_all = "camelCase")]
 pub struct LivePaneMeta {
     /// Rows of live screen at the end of `content`; the rest is history.
-    #[serde(default)]
     pub rows: u16,
     /// Lines in the pane's scrollback.
-    #[serde(default)]
     pub history: u32,
-    #[serde(default)]
     pub cursor: Option<LiveCursor>,
     /// Full-screen app: no scrollback to widen, the wheel belongs to the app.
-    #[serde(default)]
     pub alt_screen: bool,
     /// The app asked for mouse button reports.
-    #[serde(default)]
     pub mouse: bool,
     /// SGR (1006) mouse encoding rather than legacy X10.
-    #[serde(default)]
     pub mouse_sgr: bool,
-    #[serde(default)]
     pub pane0: Option<LivePane0>,
 }
 
@@ -298,8 +291,7 @@ mod tests {
         }
     }
 
-    /// Every defaulted field stays optional on the way in, so an older peer
-    /// keeps working.
+    /// Defaulted client fields stay optional, so an older dashboard keeps working.
     #[test]
     fn an_older_peer_still_parses() {
         let caps: LiveClientMessage = serde_json::from_str(r#"{"type":"caps"}"#).unwrap();
@@ -319,12 +311,5 @@ mod tests {
                 submit: false
             }
         );
-        let frame: LiveServerMessage =
-            serde_json::from_str(r#"{"type":"frame","seq":1,"content":"x\n","rows":5}"#).unwrap();
-        let LiveServerMessage::Frame { meta, .. } = frame else {
-            panic!("expected a frame");
-        };
-        assert_eq!(meta.rows, 5);
-        assert!(meta.pane0.is_none() && meta.cursor.is_none() && !meta.mouse);
     }
 }
