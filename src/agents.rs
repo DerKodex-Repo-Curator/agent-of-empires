@@ -1038,6 +1038,18 @@ impl AgentDef {
         with_agent_help(command, false, |help| help_advertises_flag(help, flag)).then_some(flag)
     }
 
+    /// Flag keeping the agent's app server inside the launched process. A shared daemon runs
+    /// hooks under the env of the pane that spawned it, so every session's status lands on that
+    /// pane's `AOE_INSTANCE_ID`. Probes the ambient binary: older installs reject the flag.
+    pub(crate) fn supported_no_daemon_flag(&self) -> Option<&'static str> {
+        let flag = match self.name {
+            "codex" => "--no-daemon",
+            _ => return None,
+        };
+        let program = which::which(self.binary).ok()?;
+        agent_help_advertises(&ambient_help_command(&program), flag).then_some(flag)
+    }
+
     pub fn launch_base_command(&self) -> String {
         match self.launch_subcommand {
             Some(sub) => format!("{} {}", self.binary, sub),

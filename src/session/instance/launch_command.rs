@@ -167,6 +167,33 @@ fn apply_first_launch_agent_name(
     }
 }
 
+/// Keep a host agent's app server in its own process so its hooks run under this pane's env.
+fn apply_no_daemon_flag(
+    cmd: &mut String,
+    agent: Option<&crate::agents::AgentDef>,
+    inst: &Instance,
+) {
+    let Some(agent) = agent else {
+        return;
+    };
+    // A wrapper or custom command is not the binary the probe describes.
+    if shell_words::split(inst.get_tool_command())
+        .ok()
+        .and_then(|words| words.into_iter().next())
+        .as_deref()
+        != Some(agent.binary)
+    {
+        return;
+    }
+    let Some(flag) = agent.supported_no_daemon_flag() else {
+        return;
+    };
+    let already = shell_words::split(cmd).is_ok_and(|words| words.iter().any(|w| w == flag));
+    if !already {
+        cmd.push_str(&format!(" {flag}"));
+    }
+}
+
 /// Write the Pi session-id extension into the app dir and return its path.
 pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
@@ -1318,6 +1345,7 @@ impl Instance {
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+                    apply_no_daemon_flag(&mut cmd, agent, self);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!(
                         "{}{}",
@@ -1411,6 +1439,7 @@ impl Instance {
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
+            apply_no_daemon_flag(&mut cmd, agent, self);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!(
                 "{}{}",
@@ -3044,6 +3073,42 @@ mod tests {
             "want: {expected}\ngot:  {command}"
         );
         assert!(probed.exists(), "the setting on probes the agent");
+    }
+
+    /// A shared Codex daemon runs hooks under its spawner's env, so every session's status would
+    /// land on one pane's id.
+    #[test]
+    #[serial_test::serial]
+    fn codex_runs_its_own_app_server_only_where_the_install_has_the_flag() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let install = |help: &str| {
+            crate::agents::forget_agent_help_for_test();
+            crate::session::test_support::install_login_shell_path_command(
+                temp_home.path(),
+                "codex",
+                &format!(
+                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; esac\nexit 0\n",
+                    shell_escape(help),
+                ),
+            )
+        };
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+
+        let _current = install("      --no-daemon  Run without the shared background server");
+        let command = host_command(&mut codex);
+        assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
+
+        codex.extra_args = "--no-daemon".into();
+        let command = host_command(&mut codex);
+        assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
+
+        codex.extra_args = String::new();
+        let _older = install("      --model <MODEL>");
+        let command = host_command(&mut codex);
+        assert!(!command.contains("--no-daemon"), "{command}");
     }
 
     /// Each case starts from a launch that is named, then changes one thing that must keep the
