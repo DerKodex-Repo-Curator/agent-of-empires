@@ -90,8 +90,14 @@ export function persistState(sessionId: string, state: AcpState): void {
 // Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
 function reopenState(state: AcpState): AcpState {
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) {
-    // Cold replay cannot rebuild these: queued prompts are client-held, config options may predate the replayed tail.
-    return { ...emptyAcpState(), queuedPrompts: state.queuedPrompts, configOptions: state.configOptions };
+    // Cold replay cannot rebuild these: queued prompts are client-held; config options and background
+    // agents may predate the replayed tail. Agent events merge idempotently into the kept records.
+    return {
+      ...emptyAcpState(),
+      queuedPrompts: state.queuedPrompts,
+      configOptions: state.configOptions,
+      backgroundAgents: state.backgroundAgents,
+    };
   }
   return state;
 }
@@ -154,10 +160,9 @@ export function cacheGet(sessionId: string): AcpState | undefined {
   const memory = stateCache.get(sessionId);
   const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
-  const fromStorage = memory === undefined;
   lruInsert(sessionId, value);
-  // Wake subscribers that rendered before the cache was primed; deferred so it never fires mid-render.
-  if (fromStorage) queueMicrotask(() => notifyStateListeners(sessionId));
+  // Wake subscribers that rendered before the cache was primed or saw a pre-reset entry; deferred so it never fires mid-render.
+  if (value !== memory) queueMicrotask(() => notifyStateListeners(sessionId));
   return value;
 }
 

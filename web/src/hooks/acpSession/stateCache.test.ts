@@ -54,6 +54,7 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
   const configOptions = [
     { id: "model", name: "Model", category: "model", current_value: "opus", options: [] },
   ] as AcpState["configOptions"];
+  const backgroundAgents = [{ agentId: "a1", toolCallId: "tc1", status: "running" }] as AcpState["backgroundAgents"];
   const entry = (activity: ActivityRow[], oldestSeq: number) => ({
     ...emptyAcpState(),
     lastSeq: 900,
@@ -61,6 +62,7 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
     activity,
     queuedPrompts: queued,
     configOptions,
+    backgroundAgents,
   });
 
   it.each([
@@ -72,6 +74,7 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
     const loaded = loadPersistedState("mid")!;
     expect(loaded.queuedPrompts).toEqual(queued);
     expect(loaded.configOptions).toEqual(configOptions);
+    expect(loaded.backgroundAgents).toEqual(backgroundAgents);
     if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
     else expect(loaded).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [] });
   });
