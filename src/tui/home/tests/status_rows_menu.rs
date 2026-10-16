@@ -1009,6 +1009,16 @@ fn trash_then_restore_round_trip() {
         "Trash section header must be present after trashing"
     );
 
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while env.view.trash_poller.is_pending(&id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trash result never drained"
+        );
+        env.view.apply_trash_results();
+        std::thread::yield_now();
+    }
+
     // Restore via the shelve/unshelve key.
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
