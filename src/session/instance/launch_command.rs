@@ -184,9 +184,19 @@ fn apply_no_daemon_flag(
     let Some(flag) = agent.supported_no_daemon_flag(&command) else {
         return;
     };
-    let already = shell_words::split(cmd).is_ok_and(|words| words.iter().any(|w| w == flag));
-    if !already {
+    let Ok(mut words) = shell_words::split(cmd) else {
+        return;
+    };
+    // Past `--` every word is a positional, so only the options before it count.
+    let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
+    if words[..options_end].iter().any(|w| w == flag) {
+        return;
+    }
+    if options_end == words.len() {
         cmd.push_str(&format!(" {flag}"));
+    } else {
+        words.insert(options_end, flag.to_owned());
+        *cmd = shell_words::join(words);
     }
 }
 
@@ -3142,6 +3152,47 @@ mod tests {
             command.matches("--no-daemon").count(),
             1,
             "the profile selects a newer install: {command}"
+        );
+    }
+
+    /// After `--` the flag would be a second positional, not the option.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_flag_lands_before_an_argument_terminator() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::agents::forget_agent_help_for_test();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp_home.path(),
+            "codex",
+            "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
+        );
+        let launch_words = |command: &str| {
+            let exec = command.lines().find(|l| l.starts_with("exec ")).unwrap();
+            shell_words::split(exec).unwrap()
+        };
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+
+        codex.extra_args = "-- 'fix the build'".into();
+        let words = launch_words(&host_command(&mut codex));
+        let terminator = words.iter().position(|w| w == "--").unwrap();
+        let flag = words.iter().position(|w| w == "--no-daemon").unwrap();
+        assert!(flag < terminator, "{words:?}");
+        assert_eq!(&words[terminator..], ["--", "fix the build"], "{words:?}");
+
+        codex.extra_args = "-- --no-daemon".into();
+        let words = launch_words(&host_command(&mut codex));
+        let terminator = words.iter().position(|w| w == "--").unwrap();
+        assert_eq!(
+            words.iter().filter(|w| *w == "--no-daemon").count(),
+            2,
+            "a positional --no-daemon is not the option: {words:?}"
+        );
+        assert!(
+            words[..terminator].iter().any(|w| w == "--no-daemon"),
+            "{words:?}"
         );
     }
 
