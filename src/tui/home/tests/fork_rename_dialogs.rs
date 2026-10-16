@@ -1058,8 +1058,8 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
             &hook,
             format!(
                 r#"#!/bin/sh
-printf '%s' "" > {}.tmp
-mv {}.tmp {}
+pwd -P > {}.tmp || exit 1
+mv {}.tmp {} || exit 1
 while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done
 "#,
                 quote(&entered.to_string_lossy()),
@@ -1087,14 +1087,23 @@ while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done
             );
             std::thread::yield_now();
         }
-        let target = std::path::PathBuf::from(std::fs::read_to_string(&entered).unwrap());
+        let target = std::path::PathBuf::from(
+            std::fs::read_to_string(&entered)
+                .unwrap()
+                .trim_end_matches('\n'),
+        );
         env.view.save().unwrap();
         let saved = env.storage.load().unwrap();
         assert_eq!(saved.len(), 1);
         let canonical = &saved[0];
         assert_eq!(canonical.id, stub_id);
         assert_eq!(canonical.status, Status::Creating);
-        assert_eq!(std::path::Path::new(&canonical.project_path), target);
+        assert_eq!(
+            std::path::Path::new(&canonical.project_path)
+                .canonicalize()
+                .unwrap(),
+            target.canonicalize().unwrap(),
+        );
         assert!(canonical
             .lifecycle_reservation
             .as_ref()
@@ -1390,11 +1399,11 @@ fn sandbox_pull_releases_root_and_revalidates_creation() {
         let escape = crate::session::environment::shell_escape;
         let script = format!(
             r#"#!/bin/sh
-case "" in
+case "$1" in
   context) printf '%s' '{{"Name":"default","Endpoints":{{"docker":{{"Host":"unix:///var/run/docker.sock"}}}}}}' ;;
   info|--version) exit 0 ;;
   container)
-    case "" in
+    case "$2" in
       inspect) printf '%s\n' 'Error response from daemon: No such container: fixture' >&2; exit 1 ;;
       rm|stop|start) exit 0 ;;
       *) printf 'unsupported container command: %s\n' "$*" >&2; exit 64 ;;

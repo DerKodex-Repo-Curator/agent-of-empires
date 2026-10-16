@@ -186,7 +186,7 @@ fn right_click_trashed_row_offers_restore() {
     assert!(env.view.handle_right_click(5, row));
     let menu = env.view.context_menu.as_ref().expect("menu open");
     assert!(matches!(
-        &menu.items_for_test()[..],
+        menu.items_for_test(),
         [
             (ContextMenuAction::Restore, _),
             (ContextMenuAction::Delete, _)

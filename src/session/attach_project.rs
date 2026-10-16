@@ -1238,19 +1238,66 @@ mod tests {
         let bin = temp.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let calls = temp.join("attach-runtime-calls");
+        let live = temp.join("attach-tmux-live");
+        std::fs::write(&live, b"initial pane").unwrap();
         let tmux = bin.join("tmux");
         std::fs::write(
             &tmux,
             format!(
-                "#!/bin/sh
-printf '%s\n' \"$*\" >> '{}'
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {calls}
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -S|-L) shift 2 ;;
+        -u) shift ;;
+        *) break ;;
+    esac
+done
+case "$1" in
+    has-session)
+        test -f {live}
+        exit $?
+        ;;
+    kill-session)
+        rm -f -- {live}
+        ;;
+    new-session)
+        launch=
+        for arg in "$@"; do
+            case "$arg" in
+                'exec '*) launch="$arg"; break ;;
+            esac
+        done
+        test -n "$launch" || exit 2
+        /bin/sh -c "$launch" || exit $?
+        : > {live}
+        ;;
+    display-message)
+        test -f {live} || exit 1
+        case "$*" in
+            *'#{{pane_dead}}'*) printf '0\n' ;;
+            *'#{{pane_current_command}}'*) printf 'claude\n' ;;
+        esac
+        ;;
+esac
 exit 0
-",
-                calls.display()
+"#,
+                calls = crate::session::environment::shell_escape(&calls.to_string_lossy()),
+                live = crate::session::environment::shell_escape(&live.to_string_lossy()),
             ),
         )
         .unwrap();
         std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = bin.join("claude");
+        std::fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' agent-launch >> {}\n",
+                crate::session::environment::shell_escape(&calls.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         (crate::session::test_support::path_prepended(&bin), calls)
     }
 
@@ -1337,6 +1384,7 @@ exit 0
         let destination = plan.workspace_dir.clone();
         let quiesced = quiesce_for_conversion(&storage, &plan).unwrap();
         assert!(quiesced.pane_was_live);
+        assert!(!temp.path().join("attach-tmux-live").exists());
         let stopped_calls = std::fs::read(&calls).unwrap();
         assert!(String::from_utf8_lossy(&stopped_calls).contains("kill-session"));
 
@@ -1345,8 +1393,28 @@ exit 0
             "an admitted attach must fence profile rename"
         );
         let _ = cancel_attach(&plan, anyhow::anyhow!("test cancellation"));
+        let mut original = original;
+        original.command = temp
+            .path()
+            .join("bin/claude")
+            .to_string_lossy()
+            .into_owned();
+        storage
+            .update(|rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == original.id)
+                    .unwrap()
+                    .command
+                    .clone_from(&original.command);
+                Ok(())
+            })
+            .unwrap();
         let warnings = resume_after_conversion(&storage, &original, quiesced, None);
         assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(temp.path().join("attach-tmux-live").exists());
+        let resumed_calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(resumed_calls.contains("new-session"));
+        assert!(resumed_calls.contains("agent-launch"));
 
         assert!(
             !destination.exists(),

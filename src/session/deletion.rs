@@ -442,7 +442,7 @@ impl CommittedPurge {
                             "purge-sidecars" => {
                                 let unused = {
                                     let root = acquire_ownership_lock()?;
-                                    committed_identity_is_unused(&root, &purge.request.session_id)?
+                                    committed_identity_is_unused(&root, &purge.request.instance)?
                                 };
                                 if !unused {
                                     result.messages.push(
@@ -648,7 +648,11 @@ fn plan_purge(
             }
         }
     }
-    if request.instance.scratch && !request.keep_scratch && !paths.covers(&cwd) {
+    if request.instance.scratch
+        && !request.keep_scratch
+        && !paths.covers(&cwd)
+        && cwd.try_exists()?
+    {
         anyhow::ensure!(
             super::scratch::is_scratch_path(&cwd),
             "scratch directory is not AoE-owned"
@@ -806,20 +810,23 @@ impl PathsInUse {
     }
 }
 
-fn committed_identity_is_unused(ownership: &OwnershipGuard, id: &str) -> Result<bool> {
+fn committed_identity_is_unused(ownership: &OwnershipGuard, owner: &Instance) -> Result<bool> {
     ownership.require_exclusive()?;
     let (_, storages) =
         all_profile_storages_with_ownership(ownership).map_err(anyhow::Error::msg)?;
+    let mut unused = true;
     for storage in &storages {
-        if storage
-            .load_strict_for_worktree_ownership()?
-            .iter()
-            .any(|row| row.id == id)
-        {
-            return Ok(false);
+        for row in storage.load_strict_for_worktree_ownership()? {
+            if row.id == owner.id {
+                anyhow::ensure!(
+                    storage.profile() != owner.source_profile && row.created_at == owner.created_at,
+                    "purged session identity was reused"
+                );
+                unused = false;
+            }
         }
     }
-    Ok(true)
+    Ok(unused)
 }
 
 fn all_profile_storages_with_ownership(

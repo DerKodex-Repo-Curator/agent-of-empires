@@ -2943,10 +2943,13 @@ where
     else {
         unreachable!();
     };
+    let ownership = acquire_ownership_lock()?;
     if !(source.profile == entry.source_profile
         && target.profile == entry.target_profile
-        && source.sessions_path == entry.source_sessions_path
-        && target.sessions_path == entry.target_sessions_path
+        && super::deletion::resolve_claim_path(&entry.source_sessions_path).as_ref()
+            == Some(&source.sessions_path)
+        && super::deletion::resolve_claim_path(&entry.target_sessions_path).as_ref()
+            == Some(&target.sessions_path)
         && rows.len() == entry.ids.len()
         && entry.ids.iter().all(|id| {
             super::validate_instance_id(id).is_ok()
@@ -2962,7 +2965,6 @@ where
         tracing::error!(target: "session.store", path = %journal_path.display(), "move journal authority does not match its declared batch");
         return Ok(false);
     }
-    let ownership = acquire_ownership_lock()?;
     let mut source_storage = None;
     let mut target_storage = None;
     for (_, storage) in storages {
@@ -5056,6 +5058,73 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_recovery_accepts_aliased_header_paths_without_changing_authority() -> Result<()> {
+        let (temp, _guard, source, target, before, _after) = setup_recovery_env("alias-recovery")?;
+        let alias = temp.path().join("route-alias");
+        std::os::unix::fs::symlink(fs::canonicalize(temp.path())?, &alias)?;
+        let aliased_source = Storage::new_for_test_path(
+            source.profile(),
+            alias.join(source.sessions_path().strip_prefix(temp.path())?),
+        );
+        let aliased_target = Storage::new_for_test_path(
+            target.profile(),
+            alias.join(target.sessions_path().strip_prefix(temp.path())?),
+        );
+        run_crashing_move(&aliased_source, &aliased_target, "profile-move-target");
+        assert_eq!(source.load()?.len(), 1);
+        assert_eq!(target.load()?.len(), 1);
+        let mut scan = move_journal::scan();
+        assert_eq!(scan.entries.len(), 1);
+        let (journal_path, parsed) = scan.entries.remove(0);
+        let entry = parsed.map_err(anyhow::Error::msg)?;
+        let move_journal::MoveAuthority::Metadata {
+            source: source_authority,
+            target: target_authority,
+            ..
+        } = &entry.authority
+        else {
+            panic!("the real profile move must record metadata authority");
+        };
+        assert_ne!(entry.source_sessions_path, source_authority.sessions_path);
+        assert_ne!(entry.target_sessions_path, target_authority.sessions_path);
+        assert!(source_authority.matches(&source)?);
+        assert!(target_authority.matches(&target)?);
+        let outcome = reconcile_loaded(&[&source, &target]);
+        assert!(outcome.repaired);
+        assert!(outcome.reports.is_empty());
+        assert!(outcome.conflicts.is_empty());
+        assert!(!journal_path.exists());
+        assert!(source.load()?.is_empty());
+        let winners = target.load()?;
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].id, before.id);
+        assert_eq!(winners[0].created_at, before.created_at);
+        assert_eq!(winners[0].project_path, before.project_path);
+        assert_eq!(winners[0].group_path, "moved");
+        assert_eq!(winners[0].lifecycle_generation, before.lifecycle_generation);
+        assert!(winners[0].lifecycle_reservation.is_none());
+        assert!(!source
+            .load_with_groups()?
+            .1
+            .iter()
+            .any(|group| group.path == "work"));
+        assert!(target
+            .load_with_groups()?
+            .1
+            .iter()
+            .any(|group| group.path == "moved"));
+        let repeated = reconcile_loaded(&[&source, &target]);
+        assert!(!repeated.repaired);
+        assert!(repeated.reports.is_empty());
+        assert!(repeated.conflicts.is_empty());
+        assert!(source.load()?.is_empty());
+        assert_eq!(target.load()?.len(), 1);
+        assert!(move_journal::scan().entries.is_empty());
         Ok(())
     }
 

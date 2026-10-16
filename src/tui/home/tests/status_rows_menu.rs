@@ -1441,6 +1441,15 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
         let id = env.view.instance_at(0).id.clone();
         let storage = Storage::new_unwatched("test").unwrap();
         let durable = |storage: &Storage| storage.load().unwrap().into_iter().find(|i| i.id == id);
+        // Exercise a planning failure, before irreversible row retirement.
+        let mut config = crate::session::Config::default();
+        config.worktree.auto_cleanup = true;
+        config.worktree.delete_branch_on_cleanup = true;
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
         storage
             .update(|instances, _| {
                 let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
