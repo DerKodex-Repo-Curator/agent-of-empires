@@ -91,12 +91,14 @@ export function persistState(sessionId: string, state: AcpState): void {
 function reopenState(state: AcpState): AcpState {
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) {
     // Cold replay cannot rebuild these: queued prompts are client-held; config options and background
-    // agents may predate the replayed tail. Agent events merge idempotently into the kept records.
+    // agents may predate the replayed tail. Agent events merge idempotently into the kept records. The usage
+    // baseline rebases replayed lifetime cost; sessionUsage is dropped so a replayed boundary cannot double-count.
     return {
       ...emptyAcpState(),
       queuedPrompts: state.queuedPrompts,
       configOptions: state.configOptions,
       backgroundAgents: state.backgroundAgents,
+      usageBaseline: state.usageBaseline,
     };
   }
   return state;

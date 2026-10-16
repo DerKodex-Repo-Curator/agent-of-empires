@@ -3,7 +3,14 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type AcpState, type ActivityRow, type BackgroundAgent } from "../../lib/acpTypes";
+import {
+  applyEvent,
+  emptyAcpState,
+  type AcpEvent,
+  type AcpState,
+  type ActivityRow,
+  type BackgroundAgent,
+} from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
   cacheGet,
@@ -77,6 +84,35 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
     expect(loaded.backgroundAgents).toEqual(backgroundAgents);
     if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
     else expect(loaded).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [] });
+  });
+});
+
+describe("mid-turn reset keeps usage accounting (#4530)", () => {
+  const usage = (amount: number): AcpEvent => ({
+    UsageUpdated: { usage: { used: 1, size: 200_000, cost: { amount, currency: "USD" } } },
+  });
+  const replay = (state: AcpState, ...events: AcpEvent[]) =>
+    events.reduce((s, event, i) => applyEvent(s, { session_id: "s", seq: i + 1, event }), state);
+  const reopened = () => {
+    const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
+    const sessionUsage = { used: 1, size: 200_000, cost: { amount: 2, currency: "USD" } };
+    writeEntry("usage", {
+      ...emptyAcpState(),
+      lastSeq: 900,
+      oldestSeq: 40,
+      activity,
+      sessionUsage,
+      usageBaseline: { cost: 10 },
+    });
+    return loadPersistedState("usage")!;
+  };
+
+  it("rebases replayed lifetime cost by the cached baseline", () => {
+    expect(replay(reopened(), usage(12)).sessionUsage?.cost?.amount).toBe(2);
+  });
+
+  it("does not double-count a boundary that replays from the tail", () => {
+    expect(replay(reopened(), usage(10), "ConversationCompacted").usageBaseline?.cost).toBe(10);
   });
 });
 
