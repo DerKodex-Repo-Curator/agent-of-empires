@@ -680,6 +680,15 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         ("trash", |view, id| {
             view.selected_session = Some(id.to_string());
             view.trash_session_by_id(id);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while view.trash_poller.is_pending(id) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "trash result never drained"
+                );
+                view.apply_trash_results();
+                std::thread::yield_now();
+            }
             assert!(view.get_instance(id).unwrap().is_trashed());
         }),
     ];
@@ -703,7 +712,11 @@ fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         let inst = env.view.get_instance(&id).unwrap();
         assert!(
             !inst.is_archived() && !inst.is_trashed(),
-            "{case}: restored"
+            "{case}: restored; info_dialog={:?}",
+            env.view
+                .info_dialog
+                .as_ref()
+                .map(|dialog| (dialog.title(), dialog.message())),
         );
         assert_eq!(
             inst.status,

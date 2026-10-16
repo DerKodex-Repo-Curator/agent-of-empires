@@ -49,6 +49,7 @@ mod v039_prime_control_path;
 mod v040_worker_ownership;
 mod v041_move_journal_authority;
 mod v042_logical_resource_intents;
+mod v043_durable_purge_cleanup;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -94,7 +95,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 42;
+const CURRENT_VERSION: u32 = 43;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -243,6 +244,7 @@ const MIGRATIONS: &[Migration] = &[
         "logical_resource_intents",
         v042_logical_resource_intents::run,
     ),
+    (43, "durable_purge_cleanup", v043_durable_purge_cleanup::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::storage::{atomic_write_verified, sync_parent_directory};
 
 /// Historical journal layouts are converted by the migration registry.
-pub(crate) const MOVE_JOURNAL_VERSION: u32 = 3;
+pub(crate) const MOVE_JOURNAL_VERSION: u32 = 4;
 
 const JOURNAL_DIR_NAME: &str = ".move-journal";
 
@@ -552,6 +552,12 @@ pub(crate) enum ResourceEffect {
         path: PathBuf,
     },
     ReleaseContainer,
+    PurgeAcpEvents {
+        database: PathBuf,
+    },
+    PurgeSidecars {
+        stores: Option<super::sandbox_store_reclaim::StoreRemoval>,
+    },
     Callback {
         name: String,
         directory: PathBuf,
@@ -704,7 +710,10 @@ impl ResourceEffect {
                     keys.push(ResourceKey::path(path, true)?);
                 }
             }
-            Self::ReleaseContainer | Self::Callback { .. } => {}
+            Self::ReleaseContainer
+            | Self::Callback { .. }
+            | Self::PurgeAcpEvents { .. }
+            | Self::PurgeSidecars { .. } => {}
         }
         Ok(())
     }
@@ -767,7 +776,9 @@ impl ResourceEffect {
                 &[Some(branch.as_str())],
                 checkouts.iter().map(PathBuf::as_path),
             ),
-            Self::ReleaseContainer => Ok(EffectObservation::default()),
+            Self::ReleaseContainer | Self::PurgeAcpEvents { .. } | Self::PurgeSidecars { .. } => {
+                Ok(EffectObservation::default())
+            }
             Self::CreateDirectory { path } | Self::RemoveDirectory { path } => {
                 Ok(EffectObservation {
                     references: Vec::new(),
@@ -874,7 +885,10 @@ impl ResourceEffect {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             },
-            Self::ReleaseContainer | Self::Callback { .. } => {
+            Self::ReleaseContainer
+            | Self::Callback { .. }
+            | Self::PurgeAcpEvents { .. }
+            | Self::PurgeSidecars { .. } => {
                 anyhow::bail!("this external effect requires its original producer")
             }
         }
@@ -929,7 +943,9 @@ impl ResourceEffect {
             Self::CreateDirectory { path } => after.checkout(path)?.exists,
             Self::RemoveDirectory { path } => !after.checkout(path)?.exists,
             Self::ReleaseContainer => after.container_released == Some(true),
-            Self::Callback { .. } => true,
+            Self::Callback { .. } | Self::PurgeAcpEvents { .. } | Self::PurgeSidecars { .. } => {
+                true
+            }
         })
     }
 }
@@ -1217,7 +1233,10 @@ impl ResourceIntent {
                 continue;
             }
             match &record.effect {
-                ResourceEffect::Callback { .. } | ResourceEffect::ReleaseContainer => continue,
+                ResourceEffect::Callback { .. }
+                | ResourceEffect::ReleaseContainer
+                | ResourceEffect::PurgeAcpEvents { .. }
+                | ResourceEffect::PurgeSidecars { .. } => continue,
                 ResourceEffect::CreateWorktree {
                     repository,
                     path,

@@ -92,7 +92,6 @@ pub struct PurgeTransaction {
 #[must_use = "committed purge sidecars must be finished"]
 pub struct CommittedPurge {
     transaction: PurgeTransaction,
-    stores: std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>,
 }
 
 impl PurgeTransaction {
@@ -237,9 +236,16 @@ impl PurgeTransaction {
                 "{}",
                 self.hook_error.as_deref().unwrap_or_default()
             );
+            let quiesce = self.transaction.effect(1)?;
             self.transaction.run_effect(1, || {
-                self.request.instance.kill_all_tmux_sessions_locked();
-                Ok(((), None))
+                let (messages, observation) = execute_purge_effect(
+                    &self.request.instance,
+                    &quiesce,
+                    self.request.delete_sandbox,
+                    |_| anyhow::bail!("quiesce cannot release a container"),
+                )?;
+                self.messages.extend(messages);
+                Ok(((), observation))
             })??;
             let paths = {
                 let root = acquire_ownership_lock()?;
@@ -277,24 +283,18 @@ impl PurgeTransaction {
                     _ => {}
                 }
             }
-            let stores =
-                super::sandbox_store_reclaim::StoreRemoval::capture(&self.request.instance)
-                    .map_err(|error| error.to_string());
             let root = acquire_ownership_lock()?;
             let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
             let _lifecycle = self
                 .storage
                 .acquire_instance_lifecycle_lock_with_ownership(&root, &self.request.session_id)?;
             self.request.instance = self.transaction.retire_for_purge_with_ownership(&root)?;
-            Ok(stores)
+            Ok(())
         })();
         match prepare {
-            Ok(stores) => {
+            Ok(()) => {
                 self.active = false;
-                Ok(CommittedPurge {
-                    transaction: self,
-                    stores,
-                })
+                Ok(CommittedPurge { transaction: self })
             }
             Err(error) => {
                 let rollback = self.transaction.rollback();
@@ -319,40 +319,25 @@ impl PurgeTransaction {
         }
     }
 
-    pub fn complete_with(
-        self,
-        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
-    ) -> DeletionResult {
+    pub fn complete(self) -> DeletionResult {
         match self.begin_irreversible() {
-            Ok(committed) => committed.finish_with(
-                |id| DockerContainer::from_session_id(id).teardown(id),
-                after_teardown,
-            ),
+            Ok(committed) => committed.finish(),
             Err(result) => *result,
         }
-    }
-
-    pub fn complete(self) -> DeletionResult {
-        self.complete_with(|_| Ok(()))
     }
 }
 
 impl CommittedPurge {
     pub fn finish(self) -> DeletionResult {
-        self.finish_with(
-            |id| DockerContainer::from_session_id(id).teardown(id),
-            |_| Ok(()),
-        )
+        self.finish_with(|id| DockerContainer::from_session_id(id).teardown(id))
     }
 
     fn finish_with(
         self,
         teardown: impl FnOnce(&str) -> crate::containers::Teardown,
-        after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
     ) -> DeletionResult {
         let Self {
             transaction: mut purge,
-            stores,
         } = self;
         #[cfg(test)]
         if let Some(hook) = BEFORE_COMMITTED_PURGE_RESUME.with(|slot| slot.borrow_mut().take()) {
@@ -367,107 +352,23 @@ impl CommittedPurge {
             teardown_started: true,
             retained_instance: None,
         };
-        let mut stores = Some(stores);
         let mut teardown = Some(teardown);
         for index in 2..purge.effect_count {
             let step = (|| -> Result<()> {
                 let effect = purge.transaction.effect(index)?;
                 purge.transaction.run_effect(index, || {
-                    let mut observation = None;
-                    match &effect {
-                        ResourceEffect::ReleaseContainer => {
-                            let outcome =
-                                teardown.take().context("container teardown already ran")?(
-                                    &purge.request.instance.id,
-                                );
-                            let gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
-                            deletion_messages_for(
-                                outcome,
-                                &mut result.messages,
-                                &mut result.errors,
-                            );
-                            anyhow::ensure!(
-                                gone,
-                                "container teardown failed; purge resources remain reserved"
-                            );
-                            observation = Some(EffectObservation {
-                                container_released: Some(true),
-                                ..EffectObservation::default()
-                            });
-                        }
-                        ResourceEffect::RemoveWorktree {
-                            repository,
-                            path,
-                            force,
-                        } => {
-                            let git = GitWorktree::new(repository.clone())?;
-                            remove_managed_worktree(
-                                &git,
-                                path,
-                                repository,
-                                &purge.request.instance,
-                                *force,
-                                purge.request.delete_sandbox,
-                            )
-                            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
-                            result
-                                .messages
-                                .push(format!("Worktree removed: {}", path.display()));
-                        }
-                        ResourceEffect::Callback {
-                            name, directory, ..
-                        } => match name.as_str() {
-                            "purge-quiesce" => {
-                                purge.request.instance.kill_all_tmux_sessions_locked()
-                            }
-                            "purge-preclean" => {
-                                let _ = crate::git::cleanup::cleanup_sandbox_worktree(
-                                    &purge.request.instance,
-                                );
-                            }
-                            "purge-empty-workspace" => match std::fs::remove_dir(directory) {
-                                Ok(()) => {
-                                    result.messages.push("Workspace directory removed".into())
-                                }
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error)
-                                    if error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
-                                {
-                                    result
-                                        .messages
-                                        .push("Workspace directory kept: it is not empty".into())
-                                }
-                                Err(error) => return Err(error.into()),
-                            },
-                            "purge-sidecars" => {
-                                let unused = {
-                                    let root = acquire_ownership_lock()?;
-                                    committed_identity_is_unused(&root, &purge.request.instance)?
-                                };
-                                if !unused {
-                                    result.messages.push(
-                                        "Agent stores and hook status kept: another profile uses the session ID".into(),
-                                    );
-                                    return Ok(((), None));
-                                }
-                                if purge.request.delete_sandbox
-                                    && is_purge_sandboxed(&purge.request)
-                                {
-                                    let mut errors = Vec::new();
-                                    stage_remove_agent_stores(
-                                        &purge.request,
-                                        &mut result.messages,
-                                        stores.take(),
-                                        &mut errors,
-                                    );
-                                    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
-                                }
-                                crate::hooks::cleanup_hook_status_dir(&purge.request.instance.id);
-                            }
-                            _ => anyhow::bail!("unknown purge callback: {name}"),
+                    let (messages, observation) = execute_purge_effect(
+                        &purge.request.instance,
+                        &effect,
+                        purge.request.delete_sandbox,
+                        |id| {
+                            teardown
+                                .take()
+                                .context("container teardown already ran")
+                                .map(|teardown| teardown(id))
                         },
-                        _ => result.messages.extend(effect.execute()?),
-                    }
+                    )?;
+                    result.messages.extend(messages);
                     Ok(((), observation))
                 })??;
                 Ok(())
@@ -479,11 +380,6 @@ impl CommittedPurge {
                 ));
                 return result;
             }
-        }
-        if let Err(error) = after_teardown(&purge.request.instance) {
-            result.success = false;
-            result.errors.push(error);
-            return result;
         }
         let publication = (|| -> Result<()> {
             let root = acquire_ownership_lock()?;
@@ -503,6 +399,111 @@ impl CommittedPurge {
             ));
         }
         result
+    }
+}
+
+/// The producer and rowless recovery execute exactly the same durable cleanup.
+pub(crate) fn execute_purge_effect(
+    instance: &Instance,
+    effect: &ResourceEffect,
+    delete_sandbox: bool,
+    teardown: impl FnOnce(&str) -> Result<crate::containers::Teardown>,
+) -> Result<(Vec<String>, Option<EffectObservation>)> {
+    let mut messages = Vec::new();
+    let mut observation = None;
+    match effect {
+        ResourceEffect::ReleaseContainer => {
+            let mut errors = Vec::new();
+            deletion_messages_for(teardown(&instance.id)?, &mut messages, &mut errors);
+            anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+            observation = Some(EffectObservation {
+                container_released: Some(true),
+                ..EffectObservation::default()
+            });
+        }
+        ResourceEffect::RemoveWorktree {
+            repository,
+            path,
+            force,
+        } => {
+            remove_managed_worktree(
+                &GitWorktree::new(repository.clone())?,
+                path,
+                repository,
+                instance,
+                *force,
+                delete_sandbox,
+            )
+            .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
+            messages.push(format!("Worktree removed: {}", path.display()));
+        }
+        ResourceEffect::PurgeAcpEvents { database } => {
+            let unused = {
+                let root = acquire_ownership_lock()?;
+                committed_identity_is_unused(&root, instance)?
+            };
+            if !unused {
+                messages.push(
+                    "ACP worker and transcript kept: another profile uses the session ID".into(),
+                );
+                return Ok((messages, None));
+            }
+            crate::process::worker_registry::terminate(&instance.id)?;
+            crate::acp::event_store::purge_acp_transcript_rows(database, &instance.id)?;
+        }
+        ResourceEffect::PurgeSidecars { stores } => {
+            let unused = {
+                let root = acquire_ownership_lock()?;
+                committed_identity_is_unused(&root, instance)?
+            };
+            if !unused {
+                messages.push(
+                    "Agent stores and hook status kept: another profile uses the session ID".into(),
+                );
+                return Ok((messages, None));
+            }
+            if let Some(stores) = stores {
+                let (paths, _) = stores.remove(&instance.id)?;
+                for path in paths {
+                    messages.push(format!("Agent store removed: {}", path.display()));
+                }
+            }
+            crate::hooks::cleanup_hook_status_dir(&instance.id);
+        }
+        ResourceEffect::Callback {
+            name, directory, ..
+        } => match name.as_str() {
+            "purge-quiesce" => instance.kill_all_tmux_sessions_locked(),
+            "purge-preclean" => {
+                let _ = crate::git::cleanup::cleanup_sandbox_worktree(instance);
+            }
+            "purge-empty-workspace" => match std::fs::remove_dir(directory) {
+                Ok(()) => messages.push("Workspace directory removed".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    messages.push("Workspace directory kept: it is not empty".into())
+                }
+                Err(error) => return Err(error.into()),
+            },
+            _ => anyhow::bail!("purge callback cannot be replayed: {name}"),
+        },
+        _ => messages.extend(effect.execute()?),
+    }
+    Ok((messages, observation))
+}
+
+pub(crate) fn retryable_purge_cleanup(effect: &ResourceEffect) -> bool {
+    match effect {
+        ResourceEffect::ReleaseContainer
+        | ResourceEffect::RemoveWorktree { .. }
+        | ResourceEffect::RemoveDirectory { .. }
+        | ResourceEffect::PurgeAcpEvents { .. }
+        | ResourceEffect::PurgeSidecars { .. } => true,
+        ResourceEffect::Callback { name, .. } => matches!(
+            name.as_str(),
+            "purge-quiesce" | "purge-preclean" | "purge-empty-workspace"
+        ),
+        _ => false,
     }
 }
 
@@ -562,6 +563,9 @@ fn plan_purge(
     let mut effects = vec![
         callback("purge-hooks", cwd.clone()),
         callback("purge-quiesce", cwd.clone()),
+        ResourceEffect::PurgeAcpEvents {
+            database: crate::session::get_app_dir()?.join("acp_events.db"),
+        },
     ];
     let mut removals = Vec::new();
     let mut branches = Vec::new();
@@ -659,7 +663,14 @@ fn plan_purge(
         );
         effects.push(ResourceEffect::RemoveDirectory { path: cwd.clone() });
     }
-    effects.push(callback("purge-sidecars", cwd));
+    let stores = if request.delete_sandbox && is_purge_sandboxed(request) {
+        Some(super::sandbox_store_reclaim::StoreRemoval::capture(
+            &request.instance,
+        )?)
+    } else {
+        None
+    };
+    effects.push(ResourceEffect::PurgeSidecars { stores });
     Ok((effects, resources))
 }
 
@@ -1098,7 +1109,7 @@ fn perform_deletion_with(
             PurgeReservation::Rejected(result) => Ok(result),
             PurgeReservation::Reserved(transaction) => {
                 match transaction.run_hooks().begin_irreversible() {
-                    Ok(committed) => Ok(committed.finish_with(teardown, |_| Ok(()))),
+                    Ok(committed) => Ok(committed.finish_with(teardown)),
                     Err(result) => Ok(*result),
                 }
             }
@@ -1242,40 +1253,6 @@ fn stage_collect_preserved_worktrees(
     preserved_worktree_paths
 }
 
-/// Final stage: the session's own agent stores.
-fn stage_remove_agent_stores(
-    request: &DeletionRequest,
-    messages: &mut Vec<String>,
-    stores: Option<std::result::Result<super::sandbox_store_reclaim::StoreRemoval, String>>,
-    errors: &mut Vec<String>,
-) {
-    tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "agent_store_remove", "perform_deletion: stage");
-    let committed = stores.is_some();
-    let removal = match stores {
-        Some(stores) => stores
-            .map_err(anyhow::Error::msg)
-            .and_then(|stores| stores.remove(&request.session_id)),
-        None => crate::session::sandbox_store_reclaim::remove_stores_for(&request.instance),
-    };
-    match removal {
-        Ok((removed, _)) if removed.is_empty() => {}
-        Ok((_, freed)) => messages.push(format!(
-            "Agent store removed ({})",
-            crate::migrations::progress::format_bytes(freed)
-        )),
-        Err(error) => {
-            if committed {
-                errors.push(format!("Committed agent store cleanup failed: {error}"));
-            }
-            tracing::warn!(target: "session.store",
-                "leaving the agent store of {}: {error}", request.session_id);
-            messages.push(format!(
-                "Agent store kept ({error}); `aoe sandbox reclaim` removes it later"
-            ));
-        }
-    }
-}
-
 /// Map a container [`Teardown`](crate::containers::Teardown) outcome onto a deletion's user-facing
 /// messages and errors.
 fn deletion_messages_for(
@@ -1371,6 +1348,7 @@ mod tests {
     use crate::session::test_support::{isolate_app_dir, isolate_app_dir_at};
     use crate::session::{SandboxInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
     use serial_test::serial;
+    use std::fs;
 
     #[test]
     #[cfg(unix)]
@@ -1423,6 +1401,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(storage.load().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn acp_purge_preserves_another_profiles_identity_before_worker_or_sql_cleanup() {
+        for identity in ["same-incarnation", "new-incarnation", "corrupt-inventory"] {
+            let _home = isolate_app_dir();
+            let owner_storage = Storage::new_unwatched("retired-owner").unwrap();
+            owner_storage.update(|_, _| Ok(())).unwrap();
+            let mut owner = Instance::new("removed", "/absent");
+            owner.source_profile = owner_storage.profile().into();
+            let peer = Storage::new_unwatched("surviving-owner").unwrap();
+            if identity == "corrupt-inventory" {
+                fs::write(peer.sessions_path(), b"unreadable registry").unwrap();
+            } else {
+                let mut survivor = owner.clone();
+                survivor.source_profile = peer.profile().into();
+                survivor.project_path = "/other-checkout".into();
+                if identity == "new-incarnation" {
+                    survivor.created_at += chrono::Duration::seconds(1);
+                }
+                peer.update(|rows, _| {
+                    rows.push(survivor);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            // A read of this record would fail: a successful retention proves
+            // the worker path was not entered for the surviving owner.
+            let record = crate::process::worker_registry::record_path(&owner.id).unwrap();
+            fs::create_dir_all(record.parent().unwrap()).unwrap();
+            fs::write(&record, b"unreadable worker record").unwrap();
+            let database = crate::session::get_app_dir().unwrap().join("acp_events.db");
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE acp_events (session_id TEXT);
+                CREATE TABLE acp_attachments (session_id TEXT);",
+            )
+            .unwrap();
+            for table in ["acp_events", "acp_attachments"] {
+                conn.execute(&format!("INSERT INTO {table} VALUES (?1)"), [&owner.id])
+                    .unwrap();
+            }
+            let acp = execute_purge_effect(
+                &owner,
+                &ResourceEffect::PurgeAcpEvents { database },
+                false,
+                |_| panic!("no container cleanup"),
+            );
+            let sidecars = execute_purge_effect(
+                &owner,
+                &ResourceEffect::PurgeSidecars { stores: None },
+                false,
+                |_| panic!("no container cleanup"),
+            );
+            let retained = identity == "same-incarnation";
+            assert_eq!(acp.is_ok(), retained, "{identity}: {acp:?}");
+            assert_eq!(sidecars.is_ok(), retained, "{identity}: {sidecars:?}");
+            if let Ok((messages, _)) = acp {
+                assert!(messages
+                    .iter()
+                    .any(|message| message.contains("transcript kept")));
+            }
+            for table in ["acp_events", "acp_attachments"] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 1, "{identity}: {table} was deleted");
+            }
+            assert_eq!(fs::read(record).unwrap(), b"unreadable worker record");
+        }
     }
 
     #[test]
@@ -2124,6 +2175,196 @@ mod tests {
             })
             .unwrap();
         instance
+    }
+
+    #[test]
+    #[serial]
+    fn rowless_purge_replays_prepared_cleanup_and_observed_failure_but_not_pending() {
+        use super::super::move_journal::{self, MoveAuthority};
+        for interrupted in ["prepared", "observed-error", "pending", "conflict"] {
+            let uncertain = matches!(interrupted, "pending" | "conflict");
+            let _home = isolate_app_dir();
+            let temp = tempfile::tempdir().unwrap();
+            let _tmux = crate::session::test_support::EnvGuard::set(&[(
+                "AOE_TMUX_SOCKET",
+                temp.path().join("tmux.sock"),
+            )]);
+            let storage = Storage::new_unwatched("rowless-owner").unwrap();
+            let owner = stored_instance(&storage, "rowless-owner", &temp.path().to_string_lossy());
+            let db = crate::session::get_app_dir().unwrap().join("acp_events.db");
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE acp_events (session_id TEXT);
+                CREATE TABLE acp_attachments (session_id TEXT);",
+            )
+            .unwrap();
+            for table in ["acp_events", "acp_attachments"] {
+                conn.execute(&format!("INSERT INTO {table} VALUES (?1)"), [&owner.id])
+                    .unwrap();
+                conn.execute(&format!("INSERT INTO {table} VALUES ('other')"), [])
+                    .unwrap();
+            }
+            let committed = reserve("rowless-owner", owner.clone())
+                .run_hooks_with(|_, _| {})
+                .begin_irreversible()
+                .unwrap_or_else(|error| panic!("{error:?}"));
+            assert!(storage.load().unwrap().is_empty());
+            let transaction = &committed.transaction.transaction;
+            let index = 2;
+            match interrupted {
+                "observed-error" => {
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    let effect = transaction.effect(index).unwrap();
+                    let failed = transaction
+                        .run_effect(index, || {
+                            execute_purge_effect(&owner, &effect, false, |_| panic!("no container"))
+                        })
+                        .unwrap();
+                    assert!(failed.is_err());
+                    conn.execute_batch("ROLLBACK").unwrap();
+                }
+                "pending" | "conflict" => {
+                    let root = acquire_ownership_lock().unwrap();
+                    transaction
+                        .begin_effect_with_ownership(&root, index)
+                        .unwrap();
+                    if interrupted == "conflict" {
+                        let mut entry = transaction.journal().read().unwrap();
+                        let MoveAuthority::Resource { intent } = &mut entry.authority else {
+                            unreachable!()
+                        };
+                        intent.phase = super::super::move_journal::EffectPhase::Conflict;
+                        intent.effects[index].phase =
+                            super::super::move_journal::EffectPhase::Conflict;
+                        intent.conflict = Some("effect completion could not be observed".into());
+                        transaction.journal().rewrite(&entry).unwrap();
+                    }
+                }
+                _ => {}
+            }
+            drop(committed);
+            for _ in 0..2 {
+                let warnings =
+                    Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
+                        .unwrap();
+                assert_eq!(warnings.is_empty(), !uncertain, "{warnings:?}");
+            }
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM acp_events WHERE session_id = ?1",
+                    [&owner.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, i64::from(uncertain));
+            let other: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM acp_events WHERE session_id = 'other'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(other, 1);
+            let pending = move_journal::scan();
+            assert_eq!(pending.entries.is_empty(), !uncertain);
+            if uncertain {
+                let MoveAuthority::Resource { intent } =
+                    &pending.entries[0].1.as_ref().unwrap().authority
+                else {
+                    unreachable!()
+                };
+                let expected = if interrupted == "pending" {
+                    super::super::move_journal::EffectPhase::Pending
+                } else {
+                    super::super::move_journal::EffectPhase::Conflict
+                };
+                assert_eq!(intent.effects[index].phase, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn purge_container_dispatch_records_only_successful_release() {
+        let instance = Instance::new("container", "/absent");
+        for outcome in [
+            crate::containers::Teardown::Removed,
+            crate::containers::Teardown::AlreadyGone,
+            crate::containers::Teardown::Failed(std::io::Error::other("temporary failure").into()),
+        ] {
+            let succeeds = !matches!(outcome, crate::containers::Teardown::Failed(_));
+            let result =
+                execute_purge_effect(&instance, &ResourceEffect::ReleaseContainer, true, |_| {
+                    Ok(outcome)
+                });
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok((_, Some(observation))) = result {
+                assert_eq!(observation.container_released, Some(true));
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn rowless_prepared_workspace_cleanup_reuses_the_producer_dispatcher() {
+        let (temp, repo, old, mut owner) = worktree_fixture("feature/prepared-workspace");
+        let _home = isolate_app_dir_at(&temp.path().join("home"));
+        let _tmux = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            temp.path().join("tmux.sock"),
+        )]);
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let checkout = workspace.join("project");
+        GitWorktree::new(repo.clone())
+            .unwrap()
+            .move_worktree(&old, &checkout)
+            .unwrap();
+        owner.project_path = checkout.to_string_lossy().into_owned();
+        owner.workspace_info = Some(workspace_info(
+            &workspace,
+            vec![workspace_repo(
+                &repo,
+                &checkout,
+                "feature/prepared-workspace",
+            )],
+        ));
+        owner.worktree_info = None;
+        owner.source_profile = "prepared-workspace-owner".into();
+        let storage = Storage::new_unwatched(&owner.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        let PurgeReservation::Reserved(transaction) = PurgeTransaction::reserve(
+            storage.clone(),
+            DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                ..request(owner)
+            },
+        )
+        .unwrap() else {
+            panic!("purge was refused")
+        };
+        let committed = transaction
+            .run_hooks_with(|_, _| {})
+            .begin_irreversible()
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        drop(committed);
+        for _ in 0..2 {
+            assert!(
+                Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(!checkout.exists());
+        assert!(!workspace.exists());
+        assert!(!branch_exists(&repo, "feature/prepared-workspace"));
+        assert!(storage.load().unwrap().is_empty());
+        assert!(super::super::move_journal::scan().entries.is_empty());
     }
 
     /// A force chosen against an earlier trash lifecycle is dropped at the claim, so a row

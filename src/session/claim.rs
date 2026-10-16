@@ -424,6 +424,63 @@ impl ResourceReservation {
         Ok(latest)
     }
 
+    pub(crate) fn record_rename_preflight_with_ownership(
+        &self,
+        root: &super::storage::OwnershipGuard,
+        observed: &Instance,
+    ) -> anyhow::Result<()> {
+        root.require_exclusive()?;
+        let mut entry = self.lock_entry()?;
+        let MoveAuthority::Resource { intent } = &mut entry.authority else {
+            anyhow::bail!("rename has no resource intent")
+        };
+        let profile = ProfileAuthority::capture(&self.storage)?;
+        anyhow::ensure!(
+            intent.operation == LifecycleOperation::Rename
+                && !intent.rollback
+                && intent.owner.matches(&profile, observed)
+                && intent.row_is_reserved(&profile, observed, self.journal.id())
+                && !observed.status.blocks_worktree_edit(),
+            "rename preflight has no owned quiescent observation"
+        );
+        intent.verify_after(true)?;
+        super::deletion::ensure_resource_intent_available(root, &self.journal, intent)?;
+        let before = intent
+            .before
+            .as_ref()
+            .context("rename has no original row")?;
+        self.storage
+            .update_with_intent(root, &self.journal, |rows, _| {
+                let current = rows
+                    .iter_mut()
+                    .find(|row| row.id == self.id)
+                    .context("rename owner disappeared during preflight")?;
+                anyhow::ensure!(
+                    intent.row_is_reserved(&profile, current, self.journal.id()),
+                    "rename owner was superseded during preflight"
+                );
+                anyhow::ensure!(
+                    !current.status.blocks_worktree_edit()
+                        || (current.status == before.status
+                            && current.idle_entered_at == before.idle_entered_at
+                            && current.last_accessed_at == before.last_accessed_at),
+                    "session became active during rename preflight"
+                );
+                current.merge_passive_status_patch(
+                    &self.id,
+                    &super::instance::PassiveStatusPatch {
+                        status: observed.status,
+                        lifecycle_generation: intent.owner.generation,
+                        idle_entered_at: observed.idle_entered_at,
+                        last_accessed_at: None,
+                    },
+                );
+                Ok(())
+            })?;
+        intent.quiesced = true;
+        self.journal.rewrite(&entry)
+    }
+
     fn owner_is_current(&self, intent: &ResourceIntent) -> anyhow::Result<bool> {
         let profile = ProfileAuthority::capture(&self.storage)?;
         if profile.sessions_path != intent.owner.profile.sessions_path {
@@ -806,7 +863,8 @@ impl ResourceReservation {
         } else {
             for effect in &intent.effects {
                 anyhow::ensure!(
-                    effect.retained || intent.effect_goal_reached(effect)?,
+                    effect.retained
+                        || (effect.error.is_none() && intent.effect_goal_reached(effect)?),
                     "external effect did not reach its requested namespace state"
                 );
             }
@@ -951,6 +1009,53 @@ impl ResourceReservation {
             "optional cleanup has no verified unchanged completed result"
         );
         effect.retained = true;
+        self.journal.rewrite(&entry)
+    }
+
+    fn retry_purge_cleanup_with_ownership(
+        &self,
+        root: &super::storage::OwnershipGuard,
+        index: usize,
+    ) -> anyhow::Result<()> {
+        root.require_exclusive()?;
+        let mut entry = self.lock_entry()?;
+        let MoveAuthority::Resource { intent } = &mut entry.authority else {
+            anyhow::bail!("resource transaction has no resource intent")
+        };
+        anyhow::ensure!(
+            intent.operation == LifecycleOperation::Purge
+                && !intent.rollback
+                && intent.phase != EffectPhase::Conflict
+                && self.owner_is_current(intent)?
+                && !self
+                    .storage
+                    .load_strict_for_worktree_ownership()?
+                    .iter()
+                    .any(|row| row.id == self.id),
+            "cleanup is not an owned irreversible purge"
+        );
+        intent.verify_after(true)?;
+        super::deletion::ensure_resource_intent_available(root, &self.journal, intent)?;
+        let record = intent
+            .effects
+            .get_mut(index)
+            .context("invalid cleanup index")?;
+        anyhow::ensure!(
+            record.phase == EffectPhase::Applied
+                && record.before.is_some()
+                && record.after.is_some()
+                && record.error.is_some()
+                && !record.retained
+                && !record.compensation
+                && super::deletion::retryable_purge_cleanup(&record.effect),
+            "cleanup has no retryable completed failure"
+        );
+        record.phase = EffectPhase::Prepared;
+        record.before = None;
+        record.after = None;
+        record.error = None;
+        intent.phase = EffectPhase::Applied;
+        intent.conflict = None;
         self.journal.rewrite(&entry)
     }
 
@@ -1115,12 +1220,21 @@ impl ResourceReservation {
                 self.journal.rewrite(&entry)?;
                 anyhow::bail!("{reason}");
             }
+            anyhow::ensure!(
+                intent.phase != EffectPhase::Conflict,
+                "{}",
+                intent
+                    .conflict
+                    .as_deref()
+                    .unwrap_or("resource intent retains a conflict")
+            );
             let rows = self.storage.load_strict_for_worktree_ownership()?;
             let current = rows.iter().find(|row| row.id == self.id);
             if intent
                 .effects
                 .iter()
                 .all(|effect| effect.phase == EffectPhase::Prepared && effect.before.is_none())
+                && (intent.operation != LifecycleOperation::Purge || current.is_some())
                 && !current.is_some_and(|row| {
                     row.lifecycle_reservation.as_ref().is_some_and(|lease| {
                         lease.resource_intent.as_deref() == Some(self.journal.id())
@@ -1166,31 +1280,90 @@ impl ResourceReservation {
             return Ok(true);
         }
         if purge {
+            let (owner, delete_sandbox) = {
+                let entry = self.lock_entry()?;
+                let MoveAuthority::Resource { intent } = &entry.authority else {
+                    unreachable!()
+                };
+                anyhow::ensure!(
+                    !intent.rollback && intent.phase != EffectPhase::Conflict,
+                    "purge has a retained conflict"
+                );
+                let mut owner = intent
+                    .before
+                    .clone()
+                    .context("purge has no original owner")?;
+                anyhow::ensure!(
+                    owner.id == intent.owner.id && owner.created_at == intent.owner.created_at,
+                    "purge original incarnation differs from its owner"
+                );
+                owner
+                    .source_profile
+                    .clone_from(&intent.owner.profile.profile);
+                anyhow::ensure!(intent.effects.iter().any(|record|
+                    matches!(&record.effect, super::move_journal::ResourceEffect::Callback { name, .. }
+                        if name == "purge-hooks")
+                        && record.phase == EffectPhase::Applied && record.error.is_none()),
+                    "purge hooks have no completed successful observation");
+                let delete_sandbox = intent.effects.iter().any(|record| {
+                    matches!(
+                        record.effect,
+                        super::move_journal::ResourceEffect::ReleaseContainer
+                    )
+                });
+                (owner, delete_sandbox)
+            };
             for index in 0..count {
                 let (prepared, failed, retained) = {
                     let entry = self.lock_entry()?;
                     let MoveAuthority::Resource { intent } = &entry.authority else {
                         unreachable!()
                     };
-                    let effect = &intent.effects[index];
+                    let record = &intent.effects[index];
                     (
-                        effect.phase == EffectPhase::Prepared,
-                        effect.error.is_some(),
-                        effect.retained,
+                        record.phase == EffectPhase::Prepared,
+                        record.error.is_some(),
+                        record.retained,
                     )
                 };
-                if prepared {
-                    let effect = self.effect(index)?;
-                    if let Err(error) = self
-                        .run_effect(index, || effect.execute().map(|warnings| (warnings, None)))?
-                    {
-                        let root = super::storage::acquire_ownership_lock()?;
-                        self.retain_unchanged_optional_with_ownership(&root, index)
-                            .with_context(|| format!("purge cleanup failed: {error:#}"))?;
-                    }
-                } else if failed && !retained {
+                let effect = self.effect(index)?;
+                if failed && !retained {
                     let root = super::storage::acquire_ownership_lock()?;
-                    self.retain_unchanged_optional_with_ownership(&root, index)?;
+                    let _identity =
+                        super::storage::acquire_session_identity_lock_with_ownership(&root)?;
+                    let _lifecycle = self
+                        .storage
+                        .acquire_instance_lifecycle_lock_with_ownership(&root, &self.id)?;
+                    if super::deletion::retryable_purge_cleanup(&effect) {
+                        self.retry_purge_cleanup_with_ownership(&root, index)?;
+                    } else {
+                        self.retain_unchanged_optional_with_ownership(&root, index)?;
+                        continue;
+                    }
+                }
+                if prepared || (failed && !retained) {
+                    if let Err(error) = self.run_effect(index, || {
+                        super::deletion::execute_purge_effect(
+                            &owner,
+                            &effect,
+                            delete_sandbox,
+                            |id| {
+                                Ok(crate::containers::DockerContainer::from_session_id(id)
+                                    .teardown(id))
+                            },
+                        )
+                    })? {
+                        if matches!(
+                            effect,
+                            super::move_journal::ResourceEffect::DeleteBranch { .. }
+                        ) {
+                            let root = super::storage::acquire_ownership_lock()?;
+                            self.retain_unchanged_optional_with_ownership(&root, index)
+                                .with_context(|| format!("purge cleanup failed: {error:#}"))?;
+                        } else {
+                            return Err(error.context("purge cleanup retained for retry"));
+                        }
+                    }
                 }
             }
         }

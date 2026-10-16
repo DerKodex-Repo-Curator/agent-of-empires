@@ -616,3 +616,251 @@ fn post_effect_resource_reservation_rejects_supersession_and_commits_owner() {
         assert!(repo.find_reference("refs/heads/new").is_ok(), "{change}");
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn terminal_rename_consumes_fresh_status_and_preserves_late_active_status() {
+    for kind in ["workdir", "same"] {
+        for durable_status in [
+            super::super::Status::Running,
+            super::super::Status::Waiting,
+            super::super::Status::Starting,
+            super::super::Status::Stopped,
+        ] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(kind != "workdir");
+            let (root, storage, mut row) = fixture();
+            let _tmux = crate::session::test_support::EnvGuard::set(&[(
+                "AOE_TMUX_SOCKET",
+                root.path().join("absent-tmux.sock"),
+            )]);
+            row.view = crate::session::View::Terminal;
+            row.status = durable_status;
+            storage
+                .update(|rows, _| {
+                    rows[0] = row.clone();
+                    Ok(())
+                })
+                .unwrap();
+            let committed = perform(request(&row, kind), |_, _| Ok(())).unwrap();
+            assert!(root.path().join("new/tracked").exists());
+            assert!(!root.path().join("old").exists());
+            let latest = storage.load().unwrap().remove(0);
+            assert!(!latest.status.blocks_worktree_edit());
+            assert_eq!(latest.id, row.id);
+            assert_eq!(latest.project_path, committed.instance.project_path);
+            assert!(latest.lifecycle_reservation.is_none());
+            assert!(move_journal::scan().entries.is_empty());
+        }
+    }
+
+    let _app = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let (root, storage, mut row) = fixture();
+    let _tmux = crate::session::test_support::EnvGuard::set(&[(
+        "AOE_TMUX_SOCKET",
+        root.path().join("absent-tmux.sock"),
+    )]);
+    row.view = crate::session::View::Terminal;
+    row.status = super::super::Status::Idle;
+    storage
+        .update(|rows, _| {
+            rows[0] = row.clone();
+            Ok(())
+        })
+        .unwrap();
+    let result = perform(request(&row, "same"), |_, _| {
+        storage.update(|rows, _| {
+            rows[0].status = super::super::Status::Running;
+            rows[0].group_path = "concurrent annotation".into();
+            Ok(())
+        })
+    });
+    assert!(result.is_err());
+    assert!(root.path().join("old/tracked").exists());
+    assert!(!root.path().join("new").exists());
+    let latest = storage.load().unwrap().remove(0);
+    assert_eq!(latest.status, super::super::Status::Running);
+    assert_eq!(latest.group_path, "concurrent annotation");
+}
+
+#[test]
+#[serial_test::serial]
+fn terminal_rename_keeps_creating_deleting_and_fresh_launch_gates() {
+    for gate in ["creating", "deleting", "launch"] {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let (root, storage, mut row) = fixture();
+        row.view = crate::session::View::Terminal;
+        row.status = match gate {
+            "creating" => super::super::Status::Creating,
+            "deleting" => super::super::Status::Deleting,
+            _ => super::super::Status::Stopped,
+        };
+        if gate == "launch" {
+            row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        }
+        storage
+            .update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(perform(request(&row, "same"), |_, _| panic!(
+            "admission must refuse"
+        ))
+        .is_err());
+        assert!(root.path().join("old/tracked").exists());
+        assert!(!root.path().join("new").exists());
+        assert!(move_journal::scan().entries.is_empty());
+    }
+}
+
+#[test]
+#[serial_test::serial]
+#[serial_test::serial(hook_base)]
+fn live_terminal_is_probed_even_when_saved_status_is_nonblocking() {
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        return;
+    }
+    for status in [
+        super::super::Status::Stopped,
+        super::super::Status::Idle,
+        super::super::Status::Error,
+    ] {
+        let (_hooks, _base, _directory) = crate::hooks::test_support::BaseGuard::ready();
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let (root, storage, mut row) = fixture();
+        let _tmux = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            root.path().join("live-tmux.sock"),
+        )]);
+        row.view = crate::session::View::Terminal;
+        row.tool = "settl".into();
+        row.status = status;
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        struct KillSession(String);
+        impl Drop for KillSession {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+            }
+        }
+        let _cleanup = KillSession(name.clone());
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "sleep 60"])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let hooks = crate::hooks::hook_status_dir(&row.id).unwrap();
+        std::fs::create_dir_all(&hooks).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(hooks.join("status"), "running").unwrap();
+        storage
+            .update(|rows, _| {
+                rows[0] = row.clone();
+                Ok(())
+            })
+            .unwrap();
+        row.last_error = Some("probe cooldown".into());
+        row.last_error_check = Some(std::time::Instant::now());
+        assert!(
+            observe_terminal_preflight(&row).is_err(),
+            "{status:?}: stale status bypassed live probe"
+        );
+        assert!(
+            perform(request(&row, "same"), |_, _| Ok(())).is_err(),
+            "{status:?}"
+        );
+        assert!(root.path().join("old/tracked").exists());
+        assert!(!root.path().join("new").exists());
+        assert_eq!(storage.load().unwrap()[0].status, status);
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn rename_final_gate_preserves_status_published_after_git() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let (root, storage, row) = fixture();
+    let writer = storage.clone();
+    let result = with_after_effects(
+        move |ownership, original, _| {
+            writer
+                .update_with_ownership(ownership, |rows, _| {
+                    let current = rows.iter_mut().find(|row| row.id == original.id).unwrap();
+                    current.status = super::super::Status::Running;
+                    current.group_path = "late annotation".into();
+                    Ok(())
+                })
+                .unwrap();
+        },
+        || perform(request(&row, "same"), |_, _| Ok(())),
+    );
+    assert!(result.is_err());
+    assert!(root.path().join("old/tracked").exists());
+    assert!(!root.path().join("new").exists());
+    let latest = storage.load().unwrap().remove(0);
+    assert_eq!(latest.status, super::super::Status::Running);
+    assert_eq!(latest.group_path, "late annotation");
+}
+
+#[test]
+#[serial_test::serial]
+fn structured_rename_preserves_live_baseline_gate_when_disk_status_is_idle() {
+    for kind in ["workdir", "same"] {
+        for active in [
+            crate::session::Status::Running,
+            crate::session::Status::Waiting,
+        ] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(kind != "workdir");
+            let (root, storage, mut row) = fixture();
+            row.status = crate::session::Status::Idle;
+            storage
+                .update(|rows, _| {
+                    rows[0] = row.clone();
+                    Ok(())
+                })
+                .unwrap();
+            let mut baseline = row.clone();
+            baseline.status = active;
+            let error = perform(request(&baseline, kind), |_, _| {
+                panic!("live structured baseline must reject before callback")
+            })
+            .err()
+            .expect("live structured session must reject");
+            assert!(matches!(
+                error.downcast_ref::<RenameRejected>(),
+                Some(RenameRejected::Active)
+            ));
+            assert!(root.path().join("old/tracked").exists());
+            assert!(!root.path().join("new").exists());
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(durable.status, crate::session::Status::Idle);
+            assert_eq!(durable.lifecycle_generation, row.lifecycle_generation);
+            assert!(durable.lifecycle_reservation.is_none());
+            let git = git2::Repository::open(&row.project_path).unwrap();
+            assert_eq!(git.head().unwrap().shorthand().unwrap(), "topic");
+            assert!(git.find_reference("refs/heads/new").is_err());
+            assert!(move_journal::scan().entries.is_empty());
+        }
+    }
+}

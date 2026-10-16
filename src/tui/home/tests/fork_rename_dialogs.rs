@@ -1595,3 +1595,90 @@ esac
         }
     }
 }
+
+#[test]
+#[serial]
+fn creation_admission_returns_busy_before_root_or_nested_locks_are_released() {
+    for layer in [
+        "root-exclusive",
+        "root-shared",
+        "identity",
+        "transition",
+        "storage",
+    ] {
+        let mut env = setup_creation_test_env();
+        let app = crate::session::get_app_dir().unwrap();
+        let profile = env.storage.sessions_path().parent().unwrap().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let held: Box<dyn std::any::Any> = match layer {
+                "root-exclusive" => {
+                    Box::new(crate::session::storage::acquire_ownership_lock().unwrap())
+                }
+                "root-shared" => {
+                    Box::new(crate::session::storage::acquire_ownership_read().unwrap())
+                }
+                "identity" => Box::new(
+                    crate::session::storage::acquire_storage_flock(&app, ".title-mutation.lock")
+                        .unwrap(),
+                ),
+                "transition" => Box::new(
+                    crate::session::storage::acquire_storage_flock(
+                        &app,
+                        crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                    )
+                    .unwrap(),
+                ),
+                "storage" => Box::new(
+                    crate::session::storage::acquire_storage_flock(&profile, ".storage.lock")
+                        .unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            ready_tx.send(()).unwrap();
+            let requested_release = release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            drop(held);
+            released_tx.send(requested_release).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        env.view.request_creation(
+            creation_data(&env.project_dir, "Busy retry", "unpublished"),
+            None,
+        );
+        let busy_title = env
+            .view
+            .info_dialog
+            .as_ref()
+            .map(|dialog| dialog.title().to_string());
+        let no_pending = !env.view.is_creation_pending() && env.view.creating_stub_id.is_none();
+        let _ = release_tx.send(());
+        let returned_while_held = released_rx.recv().unwrap();
+        holder.join().unwrap();
+        assert!(returned_while_held, "{layer}: input waited for the holder");
+        assert_eq!(
+            busy_title.as_deref(),
+            Some("Session operation in progress"),
+            "{layer}"
+        );
+        assert!(no_pending, "{layer}");
+        assert!(env.storage.load().unwrap().is_empty(), "{layer}");
+        assert!(
+            queued.try_recv().is_err(),
+            "{layer}: worker must not have been queued"
+        );
+        assert!(env.view.creating_provisional_group_paths.is_empty());
+        env.view.info_dialog = None;
+        env.view
+            .request_creation(creation_data(&env.project_dir, "Busy retry", ""), None);
+        assert!(
+            env.view.is_creation_pending(),
+            "{layer}: retry should be admitted"
+        );
+        assert!(drain_creation_result(&mut env.view).is_some(), "{layer}");
+    }
+}

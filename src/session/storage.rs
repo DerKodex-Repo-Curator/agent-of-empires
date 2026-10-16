@@ -428,6 +428,17 @@ pub(crate) fn acquire_ownership_lock() -> Result<OwnershipGuard> {
     ownership_lock(false)
 }
 
+pub(crate) fn try_acquire_ownership_lock() -> Result<Option<OwnershipGuard>> {
+    Ok(
+        try_acquire_storage_flock(&get_app_dir()?, ".workspace-claim.lock")?.map(|lock| {
+            OwnershipGuard {
+                _held: lock.held,
+                exclusive: true,
+            }
+        }),
+    )
+}
+
 fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
     profile_dir
         .parent()
@@ -780,6 +791,13 @@ pub(crate) fn acquire_session_identity_lock_with_ownership(
 ) -> Result<StorageFlock> {
     ownership.verify()?;
     acquire_storage_flock(ownership.app_dir(), SESSION_IDENTITY_LOCK_FILENAME)
+}
+
+pub(crate) fn try_acquire_session_identity_lock_with_ownership(
+    ownership: &OwnershipGuard,
+) -> Result<Option<StorageFlock>> {
+    ownership.verify()?;
+    try_acquire_storage_flock(ownership.app_dir(), SESSION_IDENTITY_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
@@ -1267,6 +1285,35 @@ impl Storage {
         Ok(lock)
     }
 
+    pub(crate) fn try_acquire_instance_lifecycle_lock_with_ownership(
+        &self,
+        ownership: &OwnershipGuard,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        ownership.verify()?;
+        self.verify_profile_available()?;
+        super::validate_instance_id(instance_id)?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("sessions path has no profile directory")?;
+        let (file, path) = open_existing_storage_lock_file(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                self.verify_profile_available()?;
+                Ok(Some(StorageFlock {
+                    held: HeldFlock { file, path },
+                    ownership: None,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn verify_profile_available(&self) -> Result<()> {
         let dir = self
             .sessions_path
@@ -1479,6 +1526,53 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         self.update_scoped(ownership, None, f)
+    }
+
+    /// `None` means contention: the mutation closure has not run.
+    pub(crate) fn try_update_with_ownership<F, R>(
+        &self,
+        ownership: &OwnershipGuard,
+        f: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        ownership.verify()?;
+        self.verify_profile_available()?;
+        let _mutex = match self.save_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("sessions path has no profile directory")?;
+        let (file, path) = open_storage_lock_file(
+            app_dir_for_profile_dir(profile_dir),
+            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+        )?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let _transition = StorageFlock {
+            held: HeldFlock { file, path },
+            ownership: None,
+        };
+        let (file, path) = open_existing_storage_lock_file(profile_dir, STORAGE_LOCK_FILENAME)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let _flock = StorageFlock {
+            held: HeldFlock { file, path },
+            ownership: None,
+        };
+        self.verify_profile_available()?;
+        self.update_under_lock(None, f).map(Some)
     }
 
     pub(crate) fn update_with_intent<F, R>(
@@ -5885,5 +5979,72 @@ mod tests {
         journal_entry_paths(storage)
             .next()
             .expect("journal entry on disk")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_try_update_never_runs_closure_under_nested_contention() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("try-admission").unwrap();
+        storage.update(|_, _| Ok(())).unwrap();
+        let root = acquire_ownership_lock().unwrap();
+        let mut called = false;
+        let mutex = storage
+            .save_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(storage
+            .try_update_with_ownership(&root, |_, _| {
+                called = true;
+                Ok(())
+            })
+            .unwrap()
+            .is_none());
+        assert!(!called);
+        drop(mutex);
+        let profile = storage.sessions_path.parent().unwrap();
+        for (directory, name) in [
+            (
+                root.app_dir(),
+                crate::migrations::v027_isolate_sandbox_stores::LOCK,
+            ),
+            (profile, STORAGE_LOCK_FILENAME),
+        ] {
+            let holder = acquire_storage_flock(directory, name).unwrap();
+            assert!(storage
+                .try_update_with_ownership(&root, |_, _| {
+                    called = true;
+                    Ok(())
+                })
+                .unwrap()
+                .is_none());
+            assert!(!called);
+            drop(holder);
+        }
+        let id = Instance::new("lifecycle", "/absent").id;
+        let holder = storage
+            .acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+            .unwrap();
+        assert!(storage
+            .try_acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+            .unwrap()
+            .is_none());
+        drop(holder);
+        assert!(storage
+            .try_acquire_instance_lifecycle_lock_with_ownership(&root, &id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            storage
+                .try_update_with_ownership(&root, |rows, _| {
+                    called = true;
+                    rows.push(Instance::new("admitted", "/absent"));
+                    Ok(7)
+                })
+                .unwrap(),
+            Some(7)
+        );
+        assert!(called);
+        assert_eq!(storage.load().unwrap().len(), 1);
     }
 }

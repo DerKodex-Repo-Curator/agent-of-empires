@@ -111,9 +111,9 @@ async fn purge_session_artifacts(
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    let transcript_purged = instance.is_structured();
+    let structured = instance.is_structured();
 
-    let deletion_result = if transcript_purged {
+    let deletion_result = if structured {
         // Commit the row removal before deleting the ACP transcript, so a lost
         // restore/generation race leaves both intact and a successful commit
         // makes later cleanup failures non-restorable by construction.
@@ -146,7 +146,6 @@ async fn purge_session_artifacts(
                     }
                 }
                 state.acp_supervisor.forget_session(id);
-                state.acp_event_store.delete_session(id);
 
                 tokio::task::spawn_blocking(move || committed.finish())
                     .await
@@ -187,9 +186,6 @@ async fn purge_session_artifacts(
         } else {
             deletion_result.errors.join("; ")
         };
-        if !transcript_purged {
-            return Err(errs);
-        }
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,

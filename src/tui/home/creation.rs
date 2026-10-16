@@ -150,37 +150,43 @@ impl HomeView {
         }
 
         let provisional_creation = match (|| -> anyhow::Result<_> {
-            let storage = Storage::open(&data.profile, self.file_watch.clone())?;
-            let provisional =
-                crate::session::builder::ProvisionalCreation::capture(&storage, &stub)?;
-            let saved = (|| {
-                let root = crate::session::storage::acquire_ownership_lock()?;
-                let _identity =
-                    crate::session::storage::acquire_session_identity_lock_with_ownership(&root)?;
-                let _lifecycle =
-                    storage.acquire_instance_lifecycle_lock_with_ownership(&root, &stub.id)?;
-                storage.update_with_ownership(&root, |rows, _| {
-                    anyhow::ensure!(
-                        !rows.iter().any(|row| row.id == stub.id),
-                        "Creating identity already exists"
-                    );
-                    rows.push(stub.clone());
-                    Ok(())
-                })
-            })();
-            if let Err(error) = saved {
-                let cleanup =
-                    retire_provisional_stub(&data.profile, &stub.id, &provisional, &HashSet::new());
-                return Err(match cleanup {
-                    Ok(()) => error,
-                    Err(cleanup) => {
-                        error.context(format!("Creating placeholder cleanup failed: {cleanup:#}"))
-                    }
-                });
-            }
-            Ok(std::sync::Arc::new(provisional))
+            let Some(root) = crate::session::storage::try_acquire_ownership_lock()? else {
+                return Ok(None);
+            };
+            let storage =
+                Storage::open_with_ownership(&data.profile, self.file_watch.clone(), &root)?;
+            let Some(_identity) =
+                crate::session::storage::try_acquire_session_identity_lock_with_ownership(&root)?
+            else {
+                return Ok(None);
+            };
+            let Some(_lifecycle) =
+                storage.try_acquire_instance_lifecycle_lock_with_ownership(&root, &stub.id)?
+            else {
+                return Ok(None);
+            };
+            let saved = storage.try_update_with_ownership(&root, |rows, _| {
+                anyhow::ensure!(
+                    !rows.iter().any(|row| row.id == stub.id),
+                    "Creating identity already exists"
+                );
+                let provisional =
+                    crate::session::builder::ProvisionalCreation::capture(&storage, &stub)?;
+                rows.push(stub.clone());
+                Ok(provisional)
+            })?;
+            // This insertion never changes groups. Its only write publishes atomically,
+            // so a returned write error needs no compensating Root acquisition.
+            Ok(saved.map(std::sync::Arc::new))
         })() {
-            Ok(provisional) => Some(provisional),
+            Ok(Some(provisional)) => Some(provisional),
+            Ok(None) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Session operation in progress",
+                    "Another session operation is in progress. No changes were saved. Try again when it finishes.",
+                ));
+                return;
+            }
             Err(error) => {
                 self.info_dialog = Some(InfoDialog::sized_to_fit(
                     "Creation Failed",

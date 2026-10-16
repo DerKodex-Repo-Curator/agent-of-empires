@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 
 use crate::session::move_journal::{
     LegacyScope, MoveAuthority, MoveJournalEntry, ProfileAuthority, ResourceKey,
-    MOVE_JOURNAL_VERSION,
 };
 
 #[derive(Deserialize)]
@@ -102,7 +101,7 @@ pub fn run() -> Result<()> {
         let bytes = fs::read(&path)?;
         let header: Header = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding journal header {}", path.display()))?;
-        if header.version == MOVE_JOURNAL_VERSION {
+        if header.version == 3 {
             let _: MoveJournalEntry = serde_json::from_slice(&bytes)?;
             continue;
         }
@@ -128,7 +127,7 @@ pub fn run() -> Result<()> {
         crate::session::backup_before_migration(&path)?;
         associate_reservations(&path, &scope, &recorded, &profiles)?;
         let migrated = MoveJournalEntry {
-            version: MOVE_JOURNAL_VERSION,
+            version: 3,
             ids: header.ids,
             source_profile: header.source_profile,
             target_profile: header.target_profile,

@@ -568,6 +568,7 @@ async fn empty_trash(profile: &str) -> Result<()> {
     let mut removed = 0usize;
     let mut restored_after_teardown = 0usize;
     let mut kept_for_retry = 0usize;
+    let mut cleanup_pending = 0usize;
     let mut being_restored_elsewhere = 0usize;
     let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
@@ -609,13 +610,18 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 continue;
             }
         };
-        let result = transaction.run_hooks().complete_with(|instance| {
-            super::purge_acp_transcript(instance).map_err(|error| {
-                format!("transcript not purged, keeping session in trash: {error}")
-            })
-        });
+        let result = transaction.run_hooks().complete();
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
+        }
+        if result.disposition == crate::session::deletion::DeletionDisposition::Removed
+            && !result.success
+        {
+            cleanup_pending += 1;
+            eprintln!(
+                "Warning ({}): session removed; cleanup remains pending recovery",
+                inst.title
+            );
         }
         match result.disposition {
             crate::session::deletion::DeletionDisposition::Removed => removed += 1,
@@ -646,7 +652,10 @@ async fn empty_trash(profile: &str) -> Result<()> {
             outcome.restored_after_teardown
         );
     }
-    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
+    let mut parts = vec![format!("removed {} session record(s)", outcome.removed)];
+    if cleanup_pending > 0 {
+        parts.push(format!("{cleanup_pending} cleanup(s) pending recovery"));
+    }
     if outcome.kept_for_retry > 0 {
         parts.push(format!("kept {} for retry", outcome.kept_for_retry));
     }
@@ -1628,8 +1637,6 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     let title_requested = args.title.is_some();
     let branch_only = args.branch.is_some();
     let baseline = inst;
-    let branch_rename_requested = args.rename_branch;
-    let refresh_tied_status = args.branch.is_none() && (args.title.is_some() || args.rename_branch);
     let result = tokio::task::spawn_blocking(move || {
         crate::session::rename::perform(
             crate::session::rename::Request {
@@ -1643,26 +1650,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 },
                 file_watch: crate::file_watch::FileWatchService::noop(),
             },
-            |original, moves| {
-                if refresh_tied_status
-                    && (moves || branch_rename_requested)
-                    && original.tie_workdir_applies(
-                        crate::session::config::profile_config::resolve_config_or_warn(
-                            &original.source_profile,
-                        )
-                        .session
-                        .tie_workdir_to_name,
-                    )
-                {
-                    let mut live = original.clone();
-                    crate::tmux::refresh_session_cache();
-                    live.update_status_with_metadata(None, None);
-                    if live.status.blocks_worktree_edit() {
-                        return Err(crate::session::rename::RenameRejected::Active.into());
-                    }
-                }
-                Ok(())
-            },
+            |_, _| Ok(()),
         )
     })
     .await??;
@@ -2084,12 +2072,18 @@ mod rename_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let worktree = dir.path().join("agent-old");
-        std::fs::create_dir(&worktree).unwrap();
+        let (repo_dir, repo) = crate::git::test_support::init_repo();
+        let base = repo.head().unwrap().shorthand().unwrap().to_string();
+        crate::git::GitWorktree::new(repo_dir.path().to_path_buf())
+            .unwrap()
+            .with_init_submodules(false)
+            .create_worktree("agent-old", &worktree, true, Some(&base))
+            .unwrap();
         let mut target = Instance::new("Busy", worktree.to_str().unwrap());
         target.tool = AGENT.to_string();
         target.worktree_info = Some(crate::session::WorktreeInfo {
             branch: "agent-old".into(),
-            main_repo_path: dir.path().join("repo").to_str().unwrap().into(),
+            main_repo_path: repo_dir.path().to_str().unwrap().into(),
             managed_by_aoe: true,
             created_at: chrono::Utc::now(),
             base_branch: None,
@@ -2143,14 +2137,13 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            error.to_string().contains("while the session is active"),
-            "{error}"
-        );
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Active)
+        ));
         assert!(worktree.is_dir());
         let unchanged = storage.load().unwrap().remove(0);
         assert_eq!(unchanged.project_path, worktree.to_str().unwrap());
-        assert_eq!(unchanged.lifecycle_generation, 0);
         assert!(unchanged.lifecycle_reservation.is_none());
     }
 
@@ -2184,15 +2177,8 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         }
     };
 
-    let mut baseline = inst.clone();
+    let baseline = inst.clone();
     let committed = tokio::task::spawn_blocking(move || {
-        // Status polling consumes the profile registry populated by config resolution.
-        crate::session::config::profile_config::resolve_config_or_warn(&baseline.source_profile);
-        crate::tmux::refresh_session_cache();
-        baseline.update_status_with_metadata(None, None);
-        if baseline.status.blocks_worktree_edit() {
-            return Err(crate::session::rename::RenameRejected::Active.into());
-        }
         crate::session::rename::perform(
             crate::session::rename::Request {
                 baseline,
@@ -2202,15 +2188,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
                 },
                 file_watch: crate::file_watch::FileWatchService::noop(),
             },
-            |original, _| {
-                let mut live = original.clone();
-                crate::tmux::refresh_session_cache();
-                live.update_status_with_metadata(None, None);
-                if live.status.blocks_worktree_edit() {
-                    return Err(crate::session::rename::RenameRejected::Active.into());
-                }
-                Ok(())
-            },
+            |_, _| Ok(()),
         )
     })
     .await??;

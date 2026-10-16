@@ -639,6 +639,7 @@ fn directory_bytes(root: &Path) -> u64 {
 /// shared legacy store owns no per-instance directory to remove, and v027 may
 /// be publishing the private one it will own, so it is left to the reclaim
 /// pass.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct StoreRemoval {
     app: PathBuf,
     roots: Vec<PathBuf>,
@@ -683,25 +684,37 @@ impl StoreRemoval {
         Ok(Self { app, roots })
     }
 
-    pub(crate) fn remove(self, id: &str) -> Result<(Vec<PathBuf>, u64)> {
+    pub(crate) fn remove(&self, id: &str) -> Result<(Vec<PathBuf>, u64)> {
         let other_namespaces = also_owned(&self.app);
         let mut removed = Vec::new();
         let mut freed = 0;
-        for path in self.roots {
-            let root = AnchoredDir::open(&path)?;
+        for path in &self.roots {
+            // A previous completed attempt may have removed an earlier root.
+            // Never resolve replacement authority from current configuration.
+            let root = match AnchoredDir::open(path) {
+                Ok(root) => root,
+                Err(_error)
+                    if matches!(fs::symlink_metadata(path),
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue
+                }
+                Err(error) => return Err(error),
+            };
             if !has_content_owner(&self.app, &other_namespaces, id, &root)? {
                 tracing::warn!(target: "session.store", path = %path.display(), "preserving sandbox original with unproven native content ownership");
                 continue;
             }
-            let bytes = directory_bytes(&path);
-            remove_owned_store(&self.app, &other_namespaces, id, &path)?;
+            let bytes = directory_bytes(path);
+            remove_owned_store(&self.app, &other_namespaces, id, path)?;
             freed += bytes;
-            removed.push(path);
+            removed.push(path.clone());
         }
         Ok((removed, freed))
     }
 }
 
+#[cfg(test)]
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
 ) -> Result<(Vec<PathBuf>, u64)> {
@@ -1171,6 +1184,35 @@ mod tests {
                 assert!(!path.exists());
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn durable_store_receipt_retries_after_a_partially_completed_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(directory.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        app_with_rows(&app, &[]);
+        let id = "1111111111111111";
+        let first = owned_store(&app, &directory.path().join("first-home"), id, 40);
+        let second_home = directory.path().join("second-home");
+        let second = second_home.join(".claude/sandbox-v2").join(id);
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&second, b"temporarily not a directory").unwrap();
+        let receipt = StoreRemoval {
+            app: app.clone(),
+            roots: vec![first.clone(), second.clone()],
+        };
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        assert!(receipt.remove(id).is_err());
+        assert!(!first.exists(), "first root was already removed");
+        fs::remove_file(&second).unwrap();
+        assert_eq!(owned_store(&app, &second_home, id, 20), second);
+        let restored: StoreRemoval = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.remove(id).unwrap().0, vec![second.clone()]);
+        assert!(!second.exists());
+        assert!(restored.remove(id).unwrap().0.is_empty());
     }
 
     /// Removing one store takes time, and a container for a later candidate

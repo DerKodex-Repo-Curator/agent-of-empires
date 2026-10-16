@@ -1689,10 +1689,37 @@ fn rename_cache_patch_publishes_only_rename_owned_fields() {
 #[tokio::test]
 #[serial_test::serial]
 async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
+    if !crate::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        return;
+    }
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let paths = tempfile::tempdir().unwrap();
+    let _tmux = crate::session::test_support::EnvGuard::set(&[(
+        "AOE_TMUX_SOCKET",
+        paths.path().join("rename-api-tmux.sock"),
+    )]);
     let title_path = paths.path().join("my-session");
     let branch_path = paths.path().join("branch-only");
+    let branch_main = real_rename_worktree(paths.path(), "branch-only");
+    {
+        let checkout = git2::Repository::open(&branch_path).unwrap();
+        checkout
+            .find_branch("branch-only", git2::BranchType::Local)
+            .unwrap()
+            .rename("existing-branch", false)
+            .unwrap();
+    }
+    let main_repo = git2::Repository::open(&branch_main).unwrap();
+    let base = main_repo.head().unwrap().shorthand().unwrap().to_owned();
+    crate::git::GitWorktree::new(std::path::PathBuf::from(&branch_main))
+        .unwrap()
+        .with_init_submodules(false)
+        .create_worktree("my-session", &title_path, true, Some(&base))
+        .unwrap();
     let title_id = "rename-title-only".to_string();
     let branch_id = "rename-branch-only".to_string();
 
@@ -1703,15 +1730,7 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     title_only.id = title_id.clone();
     title_only.status = Status::Running;
     title_only.view = crate::session::View::Structured;
-    title_only.worktree_info = Some(worktree(
-        "my-session",
-        paths
-            .path()
-            .join("missing-repo")
-            .to_string_lossy()
-            .into_owned(),
-        None,
-    ));
+    title_only.worktree_info = Some(worktree("my-session", branch_main.clone(), None));
 
     let mut branch_only = Instance::new(
         "Branch Only",
@@ -1719,20 +1738,51 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
     );
     branch_only.id = branch_id.clone();
     branch_only.status = Status::Running;
-    branch_only.worktree_info = Some(worktree(
-        "existing-branch",
-        paths
-            .path()
-            .join("missing-repo")
-            .to_string_lossy()
-            .into_owned(),
-        None,
-    ));
+    branch_only.tool = "rename-api-status-agent".into();
+    branch_only.worktree_info = Some(worktree("existing-branch", branch_main, None));
 
-    let (_storage, state) = build_rename_test_state(
+    let (storage, state) = build_rename_test_state(
         vec![title_only.clone(), branch_only.clone()],
         vec![title_only, branch_only],
     );
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(storage.profile());
+    let profile_config =
+        crate::session::config::profile_config::get_profile_config_path(storage.profile()).unwrap();
+    std::fs::write(&profile_config,
+        "[[agents.rename-api-status-agent.status_rules]]\nstatus = \"running\"\ncontains = \"api-agent-busy\"\n",
+    ).unwrap();
+    let tmux_name = crate::tmux::Session::generate_name(&branch_id, "Branch Only");
+    let _kill = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_name.clone());
+    let created = crate::tmux::tmux_command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_name,
+            "printf 'api-agent-busy\\n'; sleep 300",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let captured = crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", &tmux_name])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&captured.stdout).contains("api-agent-busy") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent pane never painted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     state.acp_supervisor.test_insert_worker(&title_id).await;
 
     // The title changes, but its slug already matches both the cwd leaf
@@ -1798,6 +1848,10 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
         rejected.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
         Some("existing-branch"),
         "the active branch-only request must be rejected before git mutation"
+    );
+    assert_eq!(
+        crate::git::GitWorktree::get_current_branch(&branch_path).unwrap(),
+        "existing-branch",
     );
 }
 

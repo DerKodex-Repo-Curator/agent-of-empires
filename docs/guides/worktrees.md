@@ -20,6 +20,8 @@ Without `-b`, selecting an explicit remote-tracking ref such as `origin/main` ca
 
 In the TUI, enable the Worktree checkbox in the new-session dialog (`n`); the directory is derived from the session title. `Ctrl+P` on the Worktree field sets an explicit name, attaches to an existing branch, picks a base branch, or configures extra repos, and `Ctrl+P` on the Base field opens a branch picker over local and remote-tracking branches. The web wizard's **Worktree** row opens the same controls, with a base-branch typeahead and an **Attach to existing branch** toggle.
 
+If another session operation owns the registry or its migration/storage locks, TUI creation immediately reports **Session operation in progress** instead of waiting on the input thread. Nothing is saved or queued; retry after that operation finishes.
+
 ## Naming
 
 A worktree session's title and its directory stay tied by default (`session.tie_workdir_to_name`), which applies only to aoe-managed worktree sessions:
@@ -46,6 +48,8 @@ Turn the setting off to relabel sessions freely while they run and to edit the d
 | REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name", "rename_branch" }` |
 
 Renaming moves the checkout with `git worktree move`, keeping its parent directory and swapping only the final component. It works only on aoe-managed worktrees of a stopped session. Source and destination claims in other profiles prevent the move, including absent paths reserved for restoring trashed sessions.
+
+Terminal workdir edits make a fresh, reserved observation before changing Git, rather than treating an old saved Running status as proof that the session still runs. Creating/deleting sessions, fresh launches, active terminal observations and structured-worker lifecycle gates still prevent unsafe moves. A newer active status published during the edit also prevents publication.
 
 ### When the directory moves outside aoe
 
@@ -102,6 +106,8 @@ Ownership admission and profile creation, rename and deletion share one applicat
 Cancelling creation hides its pending row in the current TUI while the active hook finishes. The resource reservation remains until verified rollback; cleanup failures remain visible as conflicts.
 
 The application directory's `.move-journal` records logical profiles, session incarnations and generations, and the planned before/after Git resources. CLI session commands, daemon startup and TUI loads recover completed effects before using session snapshots. A live operation holds its own parent-only journal lease; Git and hooks do not inherit it. If a process disappears before an external effect's completion is recorded, recovery retains an explicit conflict rather than assuming that its child stopped or that its reservation expired.
+
+Permanent purge records transcript and sidecar cleanup before retiring the session row. If cleanup then fails, the session remains removed and its durable intent retains the exact cleanup request for recovery; it is not kept in trash or resurrected. Recovery retries a cleanup that returned an observed error, but never treats an interrupted `Pending` effect as safe to rerun. Historical unfinished or failed sandbox-store cleanup without the original removal receipt remains an explicit conflict rather than selecting roots from today's configuration; completed cleanup keeps its recorded evidence.
 
 AoE runs plain Git with the repository's configured hooks. It does not inject a hook proxy, `core.hooksPath` or `GIT_EXEC_PATH`. These reservations coordinate AoE commands, not independent Git commands or filesystem edits, and do not make Git and JSON one atomic transaction.
 

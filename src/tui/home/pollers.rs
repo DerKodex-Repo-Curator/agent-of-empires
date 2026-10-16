@@ -24,6 +24,12 @@ impl HomeView {
                         self.instances.shift_remove(&result.session_id);
                         self.rebuild_group_trees();
                         self.rebuild_flat_items();
+                        if !result.success && !result.errors.is_empty() {
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Session removed; cleanup incomplete",
+                                &result.errors.join("; "),
+                            ));
+                        }
                     }
                     DeletionDisposition::KeptRestored => {
                         if let (Some(current), Some(retained)) = (

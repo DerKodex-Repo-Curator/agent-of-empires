@@ -159,6 +159,38 @@ fn rename_failure(
     }
 }
 
+/// A one-shot terminal observation must not inherit Stopped's poll short circuit
+/// or Error's display cooldown. Unknown tmux ownership never proves quiescence.
+fn observe_terminal_preflight(original: &Instance) -> Result<Instance> {
+    super::config::profile_config::resolve_config(&original.source_profile)?;
+    let refresh = crate::tmux::refresh_session_cache();
+    let session = original.tmux_session()?;
+    let existence = crate::tmux::resolved_agent_existence(&original.id, &session, refresh);
+    anyhow::ensure!(
+        existence != crate::tmux::SessionExistence::Unknown,
+        "Could not determine whether the terminal session is running"
+    );
+    let mut observed = original.clone();
+    observed.last_error_check = None;
+    observed.last_start_time = None;
+    if existence == crate::tmux::SessionExistence::Absent {
+        observed.status = super::Status::Stopped;
+        observed.idle_entered_at = None;
+        observed.last_error = None;
+    }
+    if existence == crate::tmux::SessionExistence::Present {
+        observed.archived_at = None;
+        if observed.status == super::Status::Stopped {
+            observed.status = super::Status::Idle;
+        }
+    }
+    observed.update_status_once(None, Some(session.name()));
+    if observed.status.blocks_worktree_edit() {
+        return Err(RenameRejected::Active.into());
+    }
+    Ok(observed)
+}
+
 pub(crate) fn perform(
     mut request: Request,
     preflight: impl FnOnce(&Instance, bool) -> Result<()>,
@@ -304,8 +336,12 @@ pub(crate) fn perform(
     drop(rows);
     if edits_git {
         if requires_quiescence
-            && (original.status.blocks_worktree_edit()
-                || request.baseline.status.blocks_worktree_edit())
+            && (matches!(
+                original.status,
+                super::Status::Creating | super::Status::Deleting
+            ) || (original.is_structured()
+                && (original.status.blocks_worktree_edit()
+                    || request.baseline.status.blocks_worktree_edit())))
         {
             return Err(RenameRejected::Active.into());
         }
@@ -445,18 +481,34 @@ pub(crate) fn perform(
         effects,
         Vec::new(),
     )?;
-    intent.quiesced =
-        !original.status.blocks_worktree_edit() && !request.baseline.status.blocks_worktree_edit();
+    intent.quiesced = !requires_quiescence && !original.status.blocks_worktree_edit();
     let admission =
         ResourceReservation::admit_with_ownership(&storage, &guards.root, intent, reserved)?;
     original = admission.instance;
     let transaction = admission.transaction;
     drop(guards);
 
-    match transaction.run_effect(0, || preflight(&original, moves).map(|()| ((), None))) {
-        Ok(Ok(())) => {}
+    let observed = match transaction.run_effect(0, || {
+        preflight(&original, moves)?;
+        let observed = if requires_quiescence && !original.is_structured() {
+            observe_terminal_preflight(&original)?
+        } else {
+            original.clone()
+        };
+        Ok((observed, None))
+    }) {
+        Ok(Ok(observed)) => observed,
         Ok(Err(error)) => return Err(rename_failure(&transaction, error, true)),
         Err(error) => return Err(rename_failure(&transaction, error, false)),
+    };
+    if requires_quiescence {
+        let recorded = (|| -> Result<()> {
+            let guards = lock(&storage, &original.id)?;
+            transaction.record_rename_preflight_with_ownership(&guards.root, &observed)
+        })();
+        if let Err(error) = recorded {
+            return Err(rename_failure(&transaction, error, true));
+        }
     }
     for index in 1..count {
         let effect = transaction.effect(index)?;
@@ -485,16 +537,6 @@ pub(crate) fn perform(
     }
     let execution = (|| -> Result<Instance> {
         let guards = lock(&storage, &original.id)?;
-        if requires_quiescence {
-            let current = storage
-                .load_strict_for_worktree_ownership()?
-                .into_iter()
-                .find(|row| row.id == original.id && row.created_at == original.created_at)
-                .context("original session disappeared before rename publication")?;
-            if current.status.blocks_worktree_edit() {
-                return Err(RenameRejected::Active.into());
-            }
-        }
         #[cfg(test)]
         if let Some(hook) = AFTER_EFFECTS.with(|slot| slot.borrow_mut().take()) {
             let entry = transaction.journal().read()?;
@@ -509,6 +551,16 @@ pub(crate) fn perform(
                     .as_ref()
                     .context("rename has no requested row")?,
             );
+        }
+        if requires_quiescence {
+            let current = storage
+                .load_strict_for_worktree_ownership()?
+                .into_iter()
+                .find(|row| row.id == original.id && row.created_at == original.created_at)
+                .context("original session disappeared before rename publication")?;
+            if current.status.blocks_worktree_edit() {
+                return Err(RenameRejected::Active.into());
+            }
         }
         transaction
             .publish_with_ownership(&guards.root, |rows, candidate| {

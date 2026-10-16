@@ -163,14 +163,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             anyhow::bail!("{detail}: {removed_title}");
         }
     };
-    let result = transaction.run_hooks().complete_with(|instance| {
-        super::purge_acp_transcript(instance).map_err(|error| {
-            format!(
-                "Session teardown succeeded but its transcript could not be purged, so the session \
-                 record was kept (retry, or remove it once the event store is reachable): {error}"
-            )
-        })
-    });
+    let result = transaction.run_hooks().complete();
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -192,6 +185,11 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         return Ok(());
     }
     if !result.success {
+        if result.disposition == crate::session::deletion::DeletionDisposition::Removed {
+            anyhow::bail!(
+                "Session removed, but cleanup is incomplete; its durable recovery intent was retained"
+            );
+        }
         anyhow::bail!(
             "Session teardown failed, so the session record was kept (retry, or fix the \
              underlying cause and remove it again)"
