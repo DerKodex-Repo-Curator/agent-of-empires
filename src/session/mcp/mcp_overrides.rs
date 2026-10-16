@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 
 use super::project_mcp::{convert_standard, ProjectMcpServer, ProjectMcpTransport};
 
+/// Entry keys owned by the typed model; anything else in an entry is hand-added and kept on update.
+const TRANSPORT_KEYS: [&str; 6] = ["command", "args", "env", "type", "url", "headers"];
+
 /// The standard `mcpServers` entry for a server, omitting empty collections.
 fn server_to_entry(server: &ProjectMcpServer) -> Value {
     let strings = |map: &std::collections::BTreeMap<String, String>| {
@@ -242,6 +245,27 @@ fn stored_server(servers: &Map<String, Value>, name: &str) -> Option<ProjectMcpS
     convert_standard(name.to_string(), raw).ok()
 }
 
+/// The named global entry, parsed on its own so malformed neighbours do not matter.
+/// `None` if the file or entry is absent; an error if that entry is malformed.
+pub fn read_global_server(name: &str) -> Result<Option<ProjectMcpServer>> {
+    let path = crate::session::get_app_dir()?.join("mcp.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let Some(entry) = parse_root(&text)?
+        .get("mcpServers")
+        .and_then(|v| v.get(name))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let raw = serde_json::from_value(entry)
+        .with_context(|| format!("MCP server \"{name}\" in global mcp.json is malformed"))?;
+    convert_standard(name.to_string(), raw).map(Some)
+}
+
 /// Adds a global server. The name may shadow a lower layer but not another global entry.
 pub fn create_global_server(
     name: &str,
@@ -268,7 +292,20 @@ pub fn update_global_server(
             return Err(missing(name));
         }
         let server = build_server(name, input, stored_server(servers, name).as_ref())?;
-        servers.insert(name.to_string(), server_to_entry(&server));
+        let Value::Object(fresh) = server_to_entry(&server) else {
+            unreachable!("server_to_entry returns an object")
+        };
+        match servers.get_mut(name) {
+            Some(Value::Object(existing)) => {
+                for key in TRANSPORT_KEYS {
+                    existing.remove(key);
+                }
+                existing.extend(fresh);
+            }
+            _ => {
+                servers.insert(name.to_string(), Value::Object(fresh));
+            }
+        }
         Ok(server)
     })
 }
@@ -373,6 +410,38 @@ mod tests {
 
     fn global(app_dir: &std::path::Path) -> Vec<ProjectMcpServer> {
         load_global_mcp_servers(app_dir).unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_keeps_unknown_entry_keys_and_reads_one_entry() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("mcp.json"),
+            r#"{ "mcpServers": {
+                "fs": { "command": "k", "env": { "A": "1" }, "timeout": 30 },
+                "broken": { "args": [] } } }"#,
+        )
+        .unwrap();
+
+        assert_eq!(read_global_server("fs").unwrap().unwrap().name, "fs");
+        assert!(read_global_server("broken").is_err());
+        assert!(read_global_server("nope").unwrap().is_none());
+
+        let remote = McpServerInput::Http {
+            url: "https://e/mcp".into(),
+            headers: vec![],
+        };
+        update_global_server("fs", &remote).unwrap();
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(app_dir.join("mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw["mcpServers"]["fs"],
+            serde_json::json!({ "type": "http", "url": "https://e/mcp", "timeout": 30 })
+        );
     }
 
     #[test]

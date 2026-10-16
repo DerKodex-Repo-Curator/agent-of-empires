@@ -3,11 +3,11 @@
 use anyhow::{bail, Result};
 use clap::{Subcommand, ValueEnum};
 
-use crate::session::mcp::mcp_model::{load_global_mcp_servers, resolve_surface, McpSurfaceView};
+use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
 use crate::session::mcp::mcp_overrides::{
     self, classify_missing, McpServerInput, McpWriteError, SecretEntry,
 };
-use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
+use crate::session::mcp::project_mcp::ProjectMcpTransport;
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommands {
@@ -230,11 +230,7 @@ fn merged_secrets(
 }
 
 fn edit(profile: &str, args: McpEditArgs) -> Result<()> {
-    let app_dir = crate::session::get_app_dir()?;
-    let stored: Option<ProjectMcpServer> = load_global_mcp_servers(&app_dir)?
-        .into_iter()
-        .find(|s| s.name == args.name);
-    let Some(stored) = stored else {
+    let Some(stored) = mcp_overrides::read_global_server(&args.name)? else {
         return Err(write_failure(McpWriteError::NotFound(args.name), profile));
     };
     let is_http = stored.kind() == "http";
