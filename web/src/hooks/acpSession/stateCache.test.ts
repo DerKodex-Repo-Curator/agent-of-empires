@@ -3,7 +3,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
+import { emptyAcpState, type AcpState, type ActivityRow, type BackgroundAgent } from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
   cacheSet,
@@ -39,10 +39,35 @@ describe("loadPersistedState", () => {
 
   it("preserves stored values", () => {
     const elicitation = { nonce: "e-1", message: "Pick", questions: [], resolved: null };
-    writeEntry("seq", { ...emptyAcpState(), oldestSeq: 42, pendingElicitations: [elicitation] });
+    const activity = [{ id: "u", kind: "user_prompt", text: "u", at: "t" }];
+    writeEntry("seq", { ...emptyAcpState(), oldestSeq: 42, activity, pendingElicitations: [elicitation] });
     const loaded = loadPersistedState("seq");
     expect(loaded?.oldestSeq).toBe(42);
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
+});
+
+describe("loadPersistedState mid-turn cache (#4530)", () => {
+  const act = (id: string, kind: ActivityRow["kind"]): ActivityRow => ({ id, kind, text: id, at: "t" }) as ActivityRow;
+  const queued = [{ id: "q1", text: "next", queuedAt: "2026-01-01T00:00:00Z" }];
+  const entry = (activity: ActivityRow[], oldestSeq: number) => ({
+    ...emptyAcpState(),
+    lastSeq: 900,
+    oldestSeq,
+    activity,
+    queuedPrompts: queued,
+  });
+
+  it.each([
+    ["no prompt, older history pending", [act("t", "tool_start")], 40, false],
+    ["prompt loaded", [act("u", "user_prompt"), act("t", "tool_start")], 40, true],
+    ["no prompt, whole history loaded", [act("t", "tool_start")], 1, true],
+  ])("%s", (_name, activity, oldestSeq, kept) => {
+    writeEntry("mid", entry(activity, oldestSeq));
+    const loaded = loadPersistedState("mid")!;
+    expect(loaded.queuedPrompts).toEqual(queued);
+    if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
+    else expect(loaded).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [] });
   });
 });
 

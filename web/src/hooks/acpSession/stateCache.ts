@@ -1,6 +1,7 @@
 // Per-session ACP state: an in-memory LRU backed by versioned localStorage entries.
 
 import { useCallback, useSyncExternalStore } from "react";
+import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
 import { emptyAcpState, normaliseTurnState, type AcpState, type BackgroundAgent } from "../../lib/acpTypes";
 import {
   STORAGE_KEY_PREFIX,
@@ -102,7 +103,12 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
       return undefined;
     }
     // Merge over defaults so entries from an older bundle gain newly added fields.
-    return normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) });
+    const loaded = normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) });
+    // Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
+    if (loaded.oldestSeq > 1 && lastUserBoundaryIndex(loaded.activity) < 0) {
+      return { ...emptyAcpState(), queuedPrompts: loaded.queuedPrompts };
+    }
+    return loaded;
   } catch {
     return undefined;
   }
