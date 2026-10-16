@@ -1054,7 +1054,10 @@ impl AgentDef {
         };
         let mut words = options.iter();
         while let Some(word) = words.next() {
-            if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
+            // A remote TUI has no local app server, and Codex rejects the combination.
+            if word == "--remote" || word.starts_with("--remote=") {
+                return None;
+            } else if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
                 words.next();
             } else if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
                 return None;
@@ -1176,6 +1179,7 @@ const CODEX_NON_TUI_SUBCOMMANDS: &[&str] = &[
     "migrate-rollouts",
     "unarchive",
     "cloud",
+    "cloud-tasks",
     "exec-server",
     "features",
     "help",
