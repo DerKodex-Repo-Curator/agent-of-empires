@@ -355,6 +355,58 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("serve.pid"))
 }
 
+/// Held by a foreground `aoe serve` for its lifetime and by `aoe migrate` for its run,
+/// so the two never overlap. The OS drops it with the process.
+#[derive(Debug)]
+pub struct ServeLock {
+    _file: std::fs::File,
+}
+
+pub fn try_lock_serve() -> Result<Option<ServeLock>> {
+    try_lock_serve_at(&crate::session::get_app_dir()?.join("serve.lock"))
+}
+
+/// Taken in `main` before startup migrations, so no migration write by a starting
+/// server can overlap `aoe migrate`. Commands that do not start a server take none.
+pub fn lock_for_startup(args: &ServeArgs) -> Result<Option<ServeLock>> {
+    if args.stop || args.status || args.restart {
+        return Ok(None);
+    }
+    match try_lock_serve()? {
+        Some(lock) => Ok(Some(lock)),
+        None => match daemon_pid() {
+            Some(pid) if pid != std::process::id() => Err(daemon_running_error(pid)),
+            _ => bail!(
+                "another aoe serve or `aoe migrate` is starting or running; retry once it finishes"
+            ),
+        },
+    }
+}
+
+fn daemon_running_error(pid: u32) -> anyhow::Error {
+    anyhow::anyhow!(
+        "aoe serve daemon already running (PID {pid}).\n\n  \
+         Status:  aoe serve --status\n  \
+         Open UI: aoe url\n  \
+         Stop:    aoe serve --stop"
+    )
+}
+
+fn try_lock_serve_at(path: &std::path::Path) -> Result<Option<ServeLock>> {
+    use fs2::FileExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(ServeLock { _file: file })),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
     pub schema: u32,
@@ -734,7 +786,7 @@ pub fn daemon_pid() -> Option<u32> {
 }
 
 #[tracing::instrument(target = "cli.serve", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
+pub async fn run(profile: &str, mut args: ServeArgs, serve_lock: Option<ServeLock>) -> Result<()> {
     if args.stop {
         return stop_daemon().await;
     }
@@ -753,13 +805,7 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
 
     if let Some(existing) = daemon_pid() {
         if existing != std::process::id() {
-            bail!(
-                "aoe serve daemon already running (PID {}).\n\n  \
-                 Status:  aoe serve --status\n  \
-                 Open UI: aoe url\n  \
-                 Stop:    aoe serve --stop",
-                existing
-            );
+            return Err(daemon_running_error(existing));
         }
     }
 
@@ -873,8 +919,11 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     }
 
     if args.daemon {
+        // The child takes its own lock before its own startup migrations.
+        drop(serve_lock);
         return start_daemon(profile, &args);
     }
+    let _serve_lock = serve_lock;
 
     apply_cityhall_bundle().await?;
 
@@ -1396,6 +1445,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_server_start_takes_the_startup_lock() {
+        use crate::cli::{Cli, Commands};
+        use clap::Parser;
+        for flag in ["--stop", "--status", "--restart"] {
+            let Some(Commands::Serve(args)) =
+                Cli::try_parse_from(["aoe", "serve", flag]).unwrap().command
+            else {
+                panic!("expected serve");
+            };
+            assert!(lock_for_startup(&args).unwrap().is_none(), "{flag}");
+        }
+    }
+
+    #[test]
+    fn serve_and_migrate_exclude_each_other_in_both_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        let daemon = try_lock_serve_at(&path).unwrap().expect("first holder");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(daemon);
+        let migrate = try_lock_serve_at(&path)
+            .unwrap()
+            .expect("free after release");
+        assert!(try_lock_serve_at(&path).unwrap().is_none());
+        drop(migrate);
+    }
+
+    #[test]
     fn daemon_pid_must_be_positive() {
         let cases = [
             ("42", Some(42)),
@@ -1775,7 +1852,7 @@ mod tests {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
                 let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                if let Err(e) = run(&profile, args).await {
+                if let Err(e) = run(&profile, args, None).await {
                     let msg = e.to_string();
                     assert!(
                         !msg.contains("does not exist") && !msg.contains("aoe profile create"),
@@ -1795,7 +1872,7 @@ mod tests {
             let (_guard, profiles) = armed_profiles_dir();
             let (profile, args) =
                 dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "ghost-profile"]);
-            let msg = run(&profile, args)
+            let msg = run(&profile, args, None)
                 .await
                 .expect_err("unknown profile must refuse a fresh start")
                 .to_string();
@@ -1816,7 +1893,7 @@ mod tests {
         async fn fresh_start_lets_a_known_profile_through_to_argument_validation() {
             let (_guard, _profiles) = armed_profiles_dir();
             let (profile, args) = dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "real"]);
-            let msg = run(&profile, args)
+            let msg = run(&profile, args, None)
                 .await
                 .expect_err("--behind-proxy without --allowed-host is refused")
                 .to_string();
