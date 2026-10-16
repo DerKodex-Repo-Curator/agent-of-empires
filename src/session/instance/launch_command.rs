@@ -168,7 +168,8 @@ fn apply_first_launch_agent_name(
 }
 
 /// Keep a host agent's app server in its own process so its hooks run under this pane's env.
-/// Withheld unless the launch's own executable and environment can be probed.
+/// Withheld unless the launch's own executable and environment can be probed; the launch then
+/// runs that executable.
 fn apply_no_daemon_flag(
     cmd: &mut String,
     agent: Option<&crate::agents::AgentDef>,
@@ -192,12 +193,14 @@ fn apply_no_daemon_flag(
     if words[..options_end].iter().any(|w| w == flag) {
         return;
     }
-    if options_end == words.len() {
-        cmd.push_str(&format!(" {flag}"));
-    } else {
-        words.insert(options_end, flag.to_owned());
-        *cmd = shell_words::join(words);
-    }
+    // The pane runs this through a login shell whose startup files may change PATH, so name the
+    // executable that was probed.
+    let Some(program) = command.get_program().to_str() else {
+        return;
+    };
+    words[0] = program.to_owned();
+    words.insert(options_end, flag.to_owned());
+    *cmd = shell_words::join(words);
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
@@ -3232,6 +3235,69 @@ mod tests {
                 "extra_args {extra_args:?}: {command}"
             );
         }
+    }
+
+    /// The pane runs the launch through a login shell, so the executable probed for the flag must
+    /// be the one that runs even when the shell's startup files put another install first.
+    #[test]
+    #[serial_test::serial]
+    fn codex_no_daemon_runs_the_probed_install_despite_a_login_shell_path() {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let ran = temp_home.path().join("ran");
+        let install = |dir: &str, help: &str| {
+            let dir = temp_home.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; *) echo \"{}: $*\" > {};; esac\nexit 0\n",
+                    shell_escape(help),
+                    dir.display(),
+                    shell_escape(ran.to_str().unwrap()),
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        };
+        let probed = install("probed", "      --no-daemon  Run without the daemon");
+        let login = install("login", "      --model <MODEL>");
+        std::fs::write(
+            temp_home.path().join(".profile"),
+            format!(
+                "export PATH={}:$PATH\n",
+                shell_escape(login.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", format!("{}:/usr/bin:/bin", probed.display())),
+            ("SHELL", "/bin/sh".to_string()),
+        ]);
+        crate::agents::forget_agent_help_for_test();
+        let mut codex = tool_instance("codex", project.to_str().unwrap());
+        let command = host_command(&mut codex);
+
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HOME", temp_home.path())
+            .env("PATH", format!("{}:/usr/bin:/bin", probed.display()))
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+        let ran = std::fs::read_to_string(&ran).unwrap();
+        assert_eq!(
+            ran.trim(),
+            format!("{}: --no-daemon", probed.display()),
+            "{command}"
+        );
     }
 
     /// Each case starts from a launch that is named, then changes one thing that must keep the
