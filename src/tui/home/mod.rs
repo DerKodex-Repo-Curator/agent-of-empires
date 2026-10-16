@@ -341,6 +341,7 @@ pub struct HomeView {
     creating_provisional_creation:
         Option<std::sync::Arc<crate::session::builder::ProvisionalCreation>>,
     creating_provisional_group_paths: HashSet<String>,
+    cancelled_creations: HashMap<String, creation::CancelledCreation>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,

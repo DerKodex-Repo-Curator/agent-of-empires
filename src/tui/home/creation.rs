@@ -8,6 +8,12 @@ pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _lifecycle: crate::session::StorageFlock,
 }
 
+pub(super) struct CancelledCreation {
+    pub(super) profile: String,
+    pub(super) provisional: std::sync::Arc<crate::session::builder::ProvisionalCreation>,
+    groups: HashSet<String>,
+}
+
 fn retire_provisional_stub(
     profile: &str,
     id: &str,
@@ -268,7 +274,7 @@ impl HomeView {
         }
     }
 
-    /// Cancel the current creation; the worker stops at its next step and rolls back.
+    /// Hide the cancelled creation while its worker finishes the hook and verified rollback.
     pub fn cancel_creation(&mut self) {
         if let Some(cancel) = self.creation_cancel.take() {
             cancel.cancel();
@@ -288,6 +294,15 @@ impl HomeView {
                         "Cancellation cleanup failed",
                         &format!("{error:#}"),
                     ));
+                } else {
+                    self.cancelled_creations.insert(
+                        stub_id.clone(),
+                        CancelledCreation {
+                            profile,
+                            provisional,
+                            groups,
+                        },
+                    );
                 }
                 if let Err(error) = self.reload() {
                     self.info_dialog = Some(InfoDialog::sized_to_fit(
@@ -313,8 +328,9 @@ impl HomeView {
             Ok(outcome) => outcome,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                if self.creating_stub_id.is_some() {
+                if self.creating_stub_id.is_some() || !self.cancelled_creations.is_empty() {
                     self.cancel_creation();
+                    self.cancelled_creations.clear();
                     let recovery = Storage::recover_pending_moves(self.file_watch.clone());
                     let message = match recovery {
                         Ok(notices) => {
@@ -334,8 +350,7 @@ impl HomeView {
         };
         let result = outcome.result;
 
-        // A cancelled request's stub is already gone; the fields below may belong to a
-        // newer request, so leave them alone.
+        // A late result must settle its own cancelled placeholder, never a newer request's.
         if outcome.cancelled || matches!(result, CreationResult::Cancelled) {
             match result {
                 CreationResult::Success(mut success) => {
@@ -350,6 +365,31 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
                 }
                 CreationResult::Cancelled => {}
+            }
+            if let Some(provisional) = outcome.provisional_creation {
+                let id = provisional.instance_id();
+                if self.cancelled_creations.get(id).is_some_and(|cancelled| {
+                    std::sync::Arc::ptr_eq(&cancelled.provisional, &provisional)
+                }) {
+                    let cancelled = self.cancelled_creations.remove(id).unwrap();
+                    if let Err(error) = retire_provisional_stub(
+                        &cancelled.profile,
+                        id,
+                        &cancelled.provisional,
+                        &cancelled.groups,
+                    ) {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Cancellation cleanup failed",
+                            &format!("{error:#}"),
+                        ));
+                    }
+                    if let Err(error) = self.reload() {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Cancellation reload failed",
+                            &format!("{error:#}"),
+                        ));
+                    }
+                }
             }
             return None;
         }

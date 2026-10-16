@@ -122,6 +122,10 @@ impl ProvisionalCreation {
         })
     }
 
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.id
+    }
+
     pub(crate) fn verify_profile(&self, storage: &super::Storage) -> Result<()> {
         anyhow::ensure!(
             self.profile.matches(storage)?,

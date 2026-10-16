@@ -52,11 +52,12 @@ pub struct CreationOutcome {
     pub result: CreationResult,
     /// Cancelled after the worker's last check: a `Success` still needs rollback.
     pub cancelled: bool,
+    pub provisional_creation: Option<std::sync::Arc<builder::ProvisionalCreation>>,
 }
 
 pub struct CreationPoller {
     request_tx: mpsc::Sender<(CreationRequest, mpsc::Sender<HookProgress>)>,
-    result_rx: mpsc::Receiver<(CreationResult, CancellationToken)>,
+    result_rx: mpsc::Receiver<(CreationOutcome, CancellationToken)>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
     _handle: thread::JoinHandle<()>,
@@ -79,7 +80,7 @@ impl CreationPoller {
     pub fn new() -> Self {
         let (request_tx, request_rx) =
             mpsc::channel::<(CreationRequest, mpsc::Sender<HookProgress>)>();
-        let (result_tx, result_rx) = mpsc::channel::<(CreationResult, CancellationToken)>();
+        let (result_tx, result_rx) = mpsc::channel::<(CreationOutcome, CancellationToken)>();
         let (progress_tx, progress_rx) = mpsc::channel::<HookProgress>();
         #[cfg(test)]
         let result_queued_observer =
@@ -90,6 +91,7 @@ impl CreationPoller {
         let handle = thread::spawn(move || {
             while let Ok((request, prog_tx)) = request_rx.recv() {
                 let cancel = request.cancel.clone();
+                let provisional_creation = request.provisional_creation.clone();
                 let mut active = None;
                 let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     Self::create_instance(request, &prog_tx, &mut active)
@@ -122,8 +124,13 @@ impl CreationPoller {
                         CreationResult::Error(message)
                     }
                 };
-                if let Err(error) = result_tx.send((result, cancel)) {
-                    if let (CreationResult::Success(mut success), _) = error.0 {
+                let outcome = CreationOutcome {
+                    result,
+                    cancelled: false,
+                    provisional_creation,
+                };
+                if let Err(error) = result_tx.send((outcome, cancel)) {
+                    if let CreationResult::Success(mut success) = error.0 .0.result {
                         if let Err(error) = success.build_result.rollback() {
                             tracing::error!(target: "session.create", "Disconnected creation rollback failed: {error:#}");
                         }
@@ -326,13 +333,11 @@ impl CreationPoller {
         }
     }
 
-    fn received(&mut self, received: (CreationResult, CancellationToken)) -> CreationOutcome {
-        let (result, cancel) = received;
+    fn received(&mut self, received: (CreationOutcome, CancellationToken)) -> CreationOutcome {
+        let (mut outcome, cancel) = received;
         self.in_flight = self.in_flight.saturating_sub(1);
-        CreationOutcome {
-            result,
-            cancelled: cancel.is_cancelled(),
-        }
+        outcome.cancelled = cancel.is_cancelled();
+        outcome
     }
 
     pub fn try_recv_progress(&self) -> Option<HookProgress> {

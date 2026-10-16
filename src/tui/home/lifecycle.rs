@@ -417,6 +417,7 @@ impl HomeView {
             creating_stub_id: None,
             creating_provisional_creation: None,
             creating_provisional_group_paths: HashSet::new(),
+            cancelled_creations: HashMap::new(),
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -745,6 +746,17 @@ impl HomeView {
             ));
         }
         self.move_intent_conflicts = outcome.conflicts;
+        for (profile, instances, _) in &mut loads {
+            instances.retain(|row| {
+                !self
+                    .cancelled_creations
+                    .get(&row.id)
+                    .is_some_and(|cancelled| {
+                        cancelled.profile == *profile
+                            && matches!(cancelled.provisional.matches_instance(row), Ok(true))
+                    })
+            });
+        }
 
         for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed

@@ -99,6 +99,8 @@ Git hooks may call AoE. Commands that touch a checkout or branch reserved by the
 
 Ownership admission and profile creation, rename and deletion share one application namespace fence. Git, Docker and user callbacks run outside the namespace, identity, lifecycle and storage locks. A durable, generation-bound reservation protects the operation's affected paths and refs until publication or verified rollback. Unreadable profile inventories refuse destructive operations.
 
+Cancelling creation hides its pending row in the current TUI while the active hook finishes. The resource reservation remains until verified rollback; cleanup failures remain visible as conflicts.
+
 The application directory's `.move-journal` records logical profiles, session incarnations and generations, and the planned before/after Git resources. CLI session commands, daemon startup and TUI loads recover completed effects before using session snapshots. A live operation holds its own parent-only journal lease; Git and hooks do not inherit it. If a process disappears before an external effect's completion is recorded, recovery retains an explicit conflict rather than assuming that its child stopped or that its reservation expired.
 
 AoE runs plain Git with the repository's configured hooks. It does not inject a hook proxy, `core.hooksPath` or `GIT_EXEC_PATH`. These reservations coordinate AoE commands, not independent Git commands or filesystem edits, and do not make Git and JSON one atomic transaction.

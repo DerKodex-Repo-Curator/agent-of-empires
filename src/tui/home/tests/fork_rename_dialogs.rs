@@ -1012,7 +1012,31 @@ fn cancel_during_on_create_skips_on_launch() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    let pending = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.title == "Hooked")
+        .unwrap();
+    assert!(pending
+        .lifecycle_reservation
+        .as_ref()
+        .unwrap()
+        .resource_intent
+        .is_some());
     view.cancel_creation();
+    assert!(view.get_instance(&pending.id).is_none());
+    view.reload().unwrap();
+    view.save().unwrap();
+    assert!(view.get_instance(&pending.id).is_none());
+    let durable = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == pending.id)
+        .unwrap();
+    assert_eq!(durable.created_at, pending.created_at);
+    assert_eq!(durable.lifecycle_reservation, pending.lifecycle_reservation);
     std::fs::write(project_dir.join("release"), b"").unwrap();
 
     assert_eq!(drain_creation_result(&mut view), None);
