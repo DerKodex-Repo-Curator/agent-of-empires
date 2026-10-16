@@ -183,6 +183,35 @@ describe("clipboard", () => {
   });
 });
 
+describe("reconnect", () => {
+  it("replays the desired grid, window and cadence on the new socket", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => {
+        result.current.sendResize(100, 30);
+        result.current.setWindow(500);
+        result.current.setCadence(false);
+      });
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close", { code: 1006 })));
+      act(() => vi.advanceTimersByTime(60_000));
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      expect(next.json()).toEqual(
+        expect.arrayContaining([
+          { type: "resize", cols: 100, rows: 30 },
+          { type: "window", lines: 500 },
+          { type: "cadence", fast: false },
+        ]),
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("size owner", () => {
   it("claims a vacant lock on open and waits for the owner verdict", () => {
     const { result, ws } = mount();
