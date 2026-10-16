@@ -77,6 +77,10 @@ pub struct McpEditArgs {
     #[arg(long = "arg", allow_hyphen_values = true)]
     pub args: Vec<String>,
 
+    /// Remove all arguments (stdio only).
+    #[arg(long, conflicts_with = "args")]
+    pub clear_args: bool,
+
     /// Set an environment variable as KEY=VALUE; repeatable (stdio only).
     #[arg(long, value_parser = parse_kv)]
     pub env: Vec<(String, String)>,
@@ -260,7 +264,9 @@ fn edit_input(stored: &ProjectMcpServer, args: &McpEditArgs) -> Result<McpServer
             )?;
             McpServerInput::Stdio {
                 command: args.command.clone().unwrap_or(command),
-                args: if args.args.is_empty() {
+                args: if args.clear_args {
+                    Vec::new()
+                } else if args.args.is_empty() {
                     old_args
                 } else {
                     args.args.clone()
@@ -274,6 +280,7 @@ fn edit_input(stored: &ProjectMcpServer, args: &McpEditArgs) -> Result<McpServer
                 &[
                     ("--command", args.command.is_some()),
                     ("--arg", !args.args.is_empty()),
+                    ("--clear-args", args.clear_args),
                     ("--env", !args.env.is_empty()),
                     ("--unset-env", !args.unset_env.is_empty()),
                 ],
@@ -393,4 +400,73 @@ fn transport_detail(r: &crate::session::mcp::mcp_model::RedactedMcpServer) -> St
         s.push_str(&format!("  [headers: {}]", r.header_names.join(", ")));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(args: &[&str]) -> ProjectMcpServer {
+        ProjectMcpServer {
+            name: "fs".into(),
+            transport: ProjectMcpTransport::Stdio {
+                command: "mcp-fs".into(),
+                args: args.iter().map(ToString::to_string).collect(),
+                env: Default::default(),
+            },
+        }
+    }
+
+    fn edit_args(argv: &[&str]) -> McpEditArgs {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            edit: McpEditArgs,
+        }
+        Wrap::try_parse_from(
+            std::iter::once("t")
+                .chain(["fs"])
+                .chain(argv.iter().copied()),
+        )
+        .unwrap()
+        .edit
+    }
+
+    fn stdio_args(input: McpServerInput) -> Vec<String> {
+        match input {
+            McpServerInput::Stdio { args, .. } => args,
+            _ => panic!("stdio"),
+        }
+    }
+
+    #[test]
+    fn edit_args_keep_replace_clear_and_empty_string_differ() {
+        let old = stored(&["--root", "."]);
+        let run = |argv: &[&str]| stdio_args(edit_input(&old, &edit_args(argv)).unwrap());
+        assert_eq!(run(&[]), ["--root", "."]);
+        assert_eq!(run(&["--arg", "x"]), ["x"]);
+        assert_eq!(run(&["--arg="]), [""]);
+        assert!(run(&["--clear-args"]).is_empty());
+    }
+
+    #[test]
+    fn clear_args_conflicts_with_arg_and_rejects_remote_servers() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            edit: McpEditArgs,
+        }
+        assert!(Wrap::try_parse_from(["t", "fs", "--clear-args", "--arg", "x"]).is_err());
+
+        let remote = ProjectMcpServer {
+            name: "r".into(),
+            transport: ProjectMcpTransport::Http {
+                url: "https://e/mcp".into(),
+                headers: Default::default(),
+            },
+        };
+        assert!(edit_input(&remote, &edit_args(&["--clear-args"])).is_err());
+    }
 }

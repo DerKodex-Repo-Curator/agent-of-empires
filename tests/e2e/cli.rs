@@ -967,6 +967,8 @@ fn cli_mcp_add_edit_remove_flow() {
     assert_eq!(fs["envNames"], json!(["TOKEN"]));
     h.run_cli_ok(&["mcp", "edit", "fs", "--unset-env", "TOKEN"]);
     assert!(!mcp_json().contains("SUPER_SECRET"));
+    h.run_cli_ok(&["mcp", "edit", "fs", "--clear-args"]);
+    assert!(!mcp_json().contains("--root"));
 
     let before = mcp_json();
     for args in [

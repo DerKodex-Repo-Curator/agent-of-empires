@@ -1506,6 +1506,7 @@ Edit an AoE-owned MCP server. Secrets you do not mention keep their stored value
 
 * `--command <COMMAND>` — Replace the executable (stdio only)
 * `--arg <ARGS>` — Replace all arguments; repeat for several (stdio only)
+* `--clear-args` — Remove all arguments (stdio only)
 * `--env <ENV>` — Set an environment variable as KEY=VALUE; repeatable (stdio only)
 * `--unset-env <UNSET_ENV>` — Remove an environment variable by name; repeatable (stdio only)
 * `--url <URL>` — Replace the URL (http and sse only)
