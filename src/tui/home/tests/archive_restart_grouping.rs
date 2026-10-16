@@ -2326,8 +2326,15 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None, false)
-            .unwrap();
+        view.move_to_profile_with_ownership(
+            &crate::session::storage::acquire_ownership_lock().unwrap(),
+            "moved",
+            "beta",
+            requested,
+            None,
+            false,
+        )
+        .unwrap();
     }
 
     let reloaded =

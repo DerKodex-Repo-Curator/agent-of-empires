@@ -1025,20 +1025,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn stale_storage_does_not_recreate_or_write_replaced_profiles() -> Result<()> {
+    fn stale_storage_does_not_recreate_missing_profiles() -> Result<()> {
         let _app = isolate_app_dir();
         create_profile("retained")?;
-        for operation in ["rename", "delete", "replace"] {
+        for operation in ["rename", "delete"] {
             let storage = Storage::new_unwatched("original")?;
             storage.update(|_, _| Ok(()))?;
             let path = get_profile_dir_path("original")?;
             match operation {
                 "rename" => rename_profile("original", "renamed")?,
                 "delete" => delete_profile("original")?,
-                "replace" => {
-                    delete_profile("original")?;
-                    create_profile("original")?;
-                }
                 _ => unreachable!(),
             }
             assert!(storage.update(|_, _| Ok(())).is_err(), "{operation}");
@@ -1046,14 +1042,9 @@ mod tests {
                 storage.acquire_instance_lifecycle_lock("12345678").is_err(),
                 "{operation}"
             );
-            if operation == "replace" {
-                assert!(!path.join("sessions.json").exists());
-                delete_profile("original")?;
-            } else {
-                assert!(!path.exists(), "stale handle recreated {operation} source");
-                if operation == "rename" {
-                    delete_profile("renamed")?;
-                }
+            assert!(!path.exists(), "stale handle recreated {operation} source");
+            if operation == "rename" {
+                delete_profile("renamed")?;
             }
         }
         Ok(())

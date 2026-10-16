@@ -1284,9 +1284,11 @@ mod tests {
                     let profile_dir = crate::session::get_profile_dir(storage.profile()).unwrap();
                     std::fs::rename(&profile_dir, profile_dir.with_extension("retired")).unwrap();
                     replacement = super::super::Storage::new_unwatched(storage.profile()).unwrap();
+                    let mut replacement_row = original.clone();
+                    replacement_row.created_at += chrono::Duration::seconds(1);
                     replacement
                         .update(|rows, _| {
-                            rows.push(original.clone());
+                            rows.push(replacement_row);
                             Ok(())
                         })
                         .unwrap();
@@ -1297,7 +1299,15 @@ mod tests {
                 if change == "corrupt" {
                     std::fs::write(storage.sessions_path(), b"[{broken").unwrap();
                 }
-                let before = std::fs::read(observed_storage.sessions_path()).unwrap();
+                let before = if matches!(change, "corrupt" | "checkout") {
+                    None
+                } else {
+                    Some(
+                        observed_storage
+                            .load_strict_for_worktree_ownership()
+                            .unwrap(),
+                    )
+                };
                 drop(ReservationCleanup::new(
                     &storage, &original, operation, generation,
                 ));
@@ -1309,12 +1319,38 @@ mod tests {
                         decide_restore_claim(&mut rows, &original.id, Utc::now()),
                         Ok(RestoreClaimDecision::Claimed(_))
                     ));
+                } else if let Some(before) = before {
+                    let after = observed_storage
+                        .load_strict_for_worktree_ownership()
+                        .unwrap();
+                    assert_eq!(after.len(), before.len(), "{operation:?}/{change}");
+                    for (before, after) in before.iter().zip(&after) {
+                        assert_eq!(after.id, before.id, "{operation:?}/{change}");
+                        assert_eq!(
+                            after.created_at, before.created_at,
+                            "{operation:?}/{change}"
+                        );
+                        assert_eq!(
+                            after.project_path, before.project_path,
+                            "{operation:?}/{change}"
+                        );
+                        assert_eq!(
+                            after.lifecycle_generation, before.lifecycle_generation,
+                            "{operation:?}/{change}"
+                        );
+                        assert_eq!(
+                            after.lifecycle_reservation, before.lifecycle_reservation,
+                            "{operation:?}/{change}"
+                        );
+                    }
                 } else {
                     assert_eq!(
                         std::fs::read(observed_storage.sessions_path()).unwrap(),
-                        before,
-                        "{operation:?}/{change}"
+                        b"[{broken"
                     );
+                    assert!(observed_storage
+                        .load_strict_for_worktree_ownership()
+                        .is_err());
                 }
             }
         }

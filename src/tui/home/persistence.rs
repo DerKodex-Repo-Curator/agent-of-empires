@@ -247,20 +247,7 @@ impl HomeView {
         }
     }
 
-    /// Acquire the per-session title flock and then the source profile's per-instance
-    /// lifecycle flock, and replace the TUI snapshot with the authoritative source row.
-    /// Only TUI-owned launch configuration is merged from the snapshot; lifecycle and
-    /// runtime fields stay as reloaded under the lifecycle lock.
-    pub(in crate::tui) fn lock_session_mutation_and_reload(
-        &mut self,
-        id: &str,
-    ) -> anyhow::Result<SessionMutationGuards> {
-        let ownership = crate::session::storage::acquire_ownership_read()?;
-        let mut guards = self.lock_session_mutation_and_reload_with_ownership(&ownership, id)?;
-        guards._ownership = Some(ownership);
-        Ok(guards)
-    }
-
+    /// The caller retains namespace ownership until these guards are released.
     pub(in crate::tui) fn lock_session_mutation_and_reload_with_ownership(
         &mut self,
         ownership: &crate::session::storage::OwnershipGuard,
@@ -319,7 +306,6 @@ impl HomeView {
             authoritative_last_accessed_at.max(snapshot.last_accessed_at);
         self.instances.insert(id.to_string(), authoritative);
         Ok(SessionMutationGuards {
-            _ownership: None,
             _session_title: session_title,
             _lifecycle: lifecycle,
         })
@@ -327,8 +313,9 @@ impl HomeView {
 
     /// Move a row between profiles as one dual-locked storage transaction,
     /// then publish the committed row in memory.
-    pub(in crate::tui) fn move_to_profile(
+    pub(in crate::tui) fn move_to_profile_with_ownership(
         &mut self,
+        ownership: &crate::session::storage::OwnershipGuard,
         id: &str,
         target: &str,
         mut requested: Instance,
@@ -350,11 +337,10 @@ impl HomeView {
                 && !current.has_fresh_lifecycle_reservation(chrono::Utc::now()),
             "Cannot move session {id} between profiles while a lifecycle operation is in progress"
         );
-        let ownership = crate::session::storage::acquire_ownership_lock()?;
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::open_with_ownership(target, self.file_watch.clone(), &ownership)?,
+                Storage::open_with_ownership(target, self.file_watch.clone(), ownership)?,
             );
         }
         let source = self
@@ -366,7 +352,7 @@ impl HomeView {
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
         let mut moved = source.move_instance_to_with_ownership(
-            &ownership,
+            ownership,
             target_storage,
             (&before, &requested),
             account_swap,

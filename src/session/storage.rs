@@ -1616,8 +1616,9 @@ impl Storage {
     }
 
     /// Move a batch between profiles as one dual-locked transaction.
-    pub(crate) fn move_instances_to<F>(
+    pub(crate) fn move_instances_to_with_ownership<F>(
         &self,
+        ownership: &OwnershipGuard,
         target: &Storage,
         changes: &[(Instance, Instance)],
         group_move: &GroupMovePlan,
@@ -1626,7 +1627,8 @@ impl Storage {
     where
         F: FnMut(&[Instance], &[Instance]) -> Result<()>,
     {
-        self.move_instances_to_inner(
+        self.move_instances_to_inner_with_ownership(
+            ownership,
             target,
             changes,
             MoveTransactionPlan {
@@ -1634,12 +1636,12 @@ impl Storage {
                 merge_complete_post: false,
                 account_swap: false,
             },
-            validate_target,
-            |_| Ok(()),
+            (validate_target, |_| Ok(()), None),
             sync_resolved_parent_directory,
         )
     }
 
+    #[cfg(test)]
     fn move_instances_to_inner<F, B, S>(
         &self,
         target: &Storage,
@@ -4241,8 +4243,12 @@ mod tests {
             (second.clone(), second_after.clone()),
         ];
         let group_move = GroupMovePlan::subtree("", "moved");
-        let rejected =
-            source.move_instances_to(&target, &changes, &group_move, |existing, candidates| {
+        let rejected = source.move_instances_to_with_ownership(
+            &acquire_ownership_lock()?,
+            &target,
+            &changes,
+            &group_move,
+            |existing, candidates| {
                 if candidates.iter().any(|candidate| {
                     existing.iter().any(|row| {
                         row.title == candidate.title
@@ -4253,7 +4259,8 @@ mod tests {
                     return Err(anyhow!("duplicate"));
                 }
                 Ok(())
-            });
+            },
+        );
         assert!(rejected.is_err());
         assert_eq!(source.load()?.len(), 2);
         assert_eq!(target.load()?.len(), 1);
@@ -4270,7 +4277,8 @@ mod tests {
                 .unread = true;
             Ok(())
         })?;
-        let moved = source.move_instances_to(
+        let moved = source.move_instances_to_with_ownership(
+            &acquire_ownership_lock()?,
             &target,
             &changes,
             &group_move,
@@ -4356,7 +4364,8 @@ mod tests {
         })?;
         target.update(|_instances, _groups| Ok(()))?;
 
-        let moved = source.move_instances_to(
+        let moved = source.move_instances_to_with_ownership(
+            &acquire_ownership_lock()?,
             &target,
             &[],
             &GroupMovePlan::subtree("empty", "renamed"),
@@ -4412,7 +4421,8 @@ mod tests {
             Ok(())
         })?;
         let error = source
-            .move_instances_to(
+            .move_instances_to_with_ownership(
+                &acquire_ownership_lock()?,
                 &target,
                 &[(before, after)],
                 &GroupMovePlan::subtree("team", "moved"),
@@ -4883,7 +4893,12 @@ mod tests {
         }
         let legacy: Arrange = |_, b, before| push_copy(b, before);
         let wrong_version: Arrange = |a, b, before| {
-            copy_and_record(|e| e.version = move_journal::MOVE_JOURNAL_VERSION + 1)(a, b, before)
+            push_copy(b, before)?;
+            let mut entry = fresh_journal_entry(a, b, &before.id);
+            let path = move_journal::record(&entry)?;
+            entry.version = move_journal::MOVE_JOURNAL_VERSION + 1;
+            fs::write(path, serde_json::to_vec_pretty(&entry)?)?;
+            Ok(())
         };
         // Stores untouched since before the entry, so only its age disqualifies it.
         let expired: Arrange = |a, b, before| {
@@ -5081,11 +5096,11 @@ mod tests {
         if let move_journal::MoveAuthority::Metadata { rows, .. } = &mut entry.authority {
             rows.push(journal_delta(&source, &target, &vanished_id));
         }
-        move_journal::record(&entry)?;
         source.update(|rows, _| {
             rows.retain(|row| row.id != vanished_id);
             Ok(())
         })?;
+        move_journal::record(&entry)?;
 
         let outcome = reconcile_loaded(&[&source, &target]);
 
@@ -5095,7 +5110,11 @@ mod tests {
             !source.load()?.iter().any(|row| row.id == before.id),
             "loser copy removed"
         );
-        assert_eq!(target.load()?.len(), 1, "winner kept");
+        let winners = target.load()?;
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].id, before.id);
+        assert!(!source.load()?.iter().any(|row| row.id == vanished_id));
+        assert!(!winners.iter().any(|row| row.id == vanished_id));
         assert!(
             !journal_entry_scan_ids(&source)
                 .iter()
@@ -5272,27 +5291,87 @@ mod tests {
     }
 
     #[test]
-    fn chained_move_journals_apply_newest_intent_first() -> Result<()> {
-        let (_temp, _guard, a, b, before, _after) = setup_recovery_env("chain")?;
-        push_copy(&b, &before)?;
-        let now = now_ms();
-        let mut j1 = fresh_journal_entry(&a, &b, &before.id);
-        j1.created_at_epoch_ms = now;
-        let mut j2 = fresh_journal_entry(&b, &a, &before.id);
-        j2.group_move_source_path = "moved".to_string();
-        j2.group_move_target_path = "work".to_string();
-        j2.created_at_epoch_ms = now;
-        move_journal::record(&j1)?;
-        move_journal::record(&j2)?;
+    fn unresolved_move_refuses_a_competing_move_and_remains_recoverable() -> Result<()> {
+        let (temp, _guard, a, b, before, _after) = setup_recovery_env("chain")?;
+        let c = Storage::new_for_test_path(
+            "chain-third",
+            temp.path().join("chain-third/sessions.json"),
+        );
+        c.update(|_, _| Ok(()))?;
+        run_crashing_move(&a, &b, "profile-move-target");
+        assert_eq!(journal_entry_count(&a), 1);
+        let (a_rows, a_groups) = a.load_with_groups()?;
+        let (b_rows, b_groups) = b.load_with_groups()?;
+        let (c_rows, c_groups) = c.load_with_groups()?;
+        assert_eq!(a_rows.len(), 1);
+        assert_eq!(b_rows.len(), 1);
+        assert!(c_rows.is_empty());
+        let reverse_before = b_rows[0].clone();
+        let mut reverse_after = reverse_before.clone();
+        reverse_after.group_path = "work".into();
+        let refused = b.move_instances_to_with_ownership(
+            &acquire_ownership_lock()?,
+            &c,
+            &[(reverse_before, reverse_after)],
+            &GroupMovePlan::single("moved", "work"),
+            |_, _| Ok(()),
+        );
+        assert!(
+            refused.is_err(),
+            "an unresolved move must reserve its session"
+        );
+        for (storage, expected_rows, expected_groups) in [
+            (&a, &a_rows, &a_groups),
+            (&b, &b_rows, &b_groups),
+            (&c, &c_rows, &c_groups),
+        ] {
+            let (rows, groups) = storage.load_with_groups()?;
+            assert_eq!(rows.len(), expected_rows.len());
+            assert_eq!(&groups, expected_groups);
+            for (row, expected) in rows.iter().zip(expected_rows) {
+                assert_eq!(row.id, expected.id);
+                assert_eq!(row.created_at, expected.created_at);
+                assert_eq!(row.title, expected.title);
+                assert_eq!(row.project_path, expected.project_path);
+                assert_eq!(row.group_path, expected.group_path);
+                assert_eq!(row.worktree_info, expected.worktree_info);
+                assert_eq!(row.lifecycle_generation, expected.lifecycle_generation);
+                assert_eq!(row.lifecycle_reservation, expected.lifecycle_reservation);
+            }
+        }
+        assert_eq!(
+            journal_entry_count(&a),
+            1,
+            "the unadmitted competing intent was retired"
+        );
 
-        let outcome = reconcile_loaded(&[&a, &b]);
+        let outcome = reconcile_loaded(&[&a, &b, &c]);
 
         assert!(outcome.repaired);
         assert!(outcome.reports.is_empty());
-        assert_eq!(a.load()?.len(), 1, "new reverse-move target survives");
-        assert!(b.load()?.is_empty(), "superseded profile is emptied");
+        assert!(outcome.conflicts.is_empty());
+        assert!(
+            a.load()?.is_empty(),
+            "the original interrupted move source loses"
+        );
+        let winners = b.load()?;
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].id, before.id);
+        assert_eq!(winners[0].created_at, before.created_at);
+        assert_eq!(winners[0].project_path, before.project_path);
+        assert_eq!(winners[0].group_path, "moved");
+        assert_eq!(winners[0].lifecycle_generation, before.lifecycle_generation);
+        assert!(winners[0].lifecycle_reservation.is_none());
+        assert!(c.load()?.is_empty());
         assert_eq!(journal_entry_count(&a), 0);
-        assert_eq!(journal_entry_count(&b), 0);
+        let repeated = reconcile_loaded(&[&a, &b, &c]);
+        assert!(!repeated.repaired);
+        assert!(repeated.reports.is_empty());
+        assert!(repeated.conflicts.is_empty());
+        assert!(a.load()?.is_empty());
+        assert_eq!(b.load()?.len(), 1);
+        assert!(c.load()?.is_empty());
+        assert_eq!(journal_entry_count(&a), 0);
         Ok(())
     }
 

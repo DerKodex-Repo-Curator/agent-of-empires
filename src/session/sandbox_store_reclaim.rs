@@ -1158,8 +1158,14 @@ mod tests {
             }
             let result = receipt.remove(&instance.id);
             if replace {
-                assert!(result.is_err());
+                let (removed, freed) = result.unwrap();
+                assert!(removed.is_empty());
+                assert_eq!(freed, 0);
                 assert_eq!(fs::read(path.join("sentinel")).unwrap(), b"replacement");
+                assert_eq!(
+                    fs::read(path.with_extension("original").join("credentials")).unwrap(),
+                    b"original"
+                );
             } else {
                 assert_eq!(result.unwrap().0, vec![path.clone()]);
                 assert!(!path.exists());

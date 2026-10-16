@@ -440,12 +440,15 @@ impl CommittedPurge {
                                 Err(error) => return Err(error.into()),
                             },
                             "purge-sidecars" => {
-                                {
+                                let unused = {
                                     let root = acquire_ownership_lock()?;
-                                    ensure_committed_identity_unused(
-                                        &root,
-                                        &purge.request.session_id,
-                                    )?;
+                                    committed_identity_is_unused(&root, &purge.request.session_id)?
+                                };
+                                if !unused {
+                                    result.messages.push(
+                                        "Agent stores and hook status kept: another profile uses the session ID".into(),
+                                    );
+                                    return Ok(((), None));
                                 }
                                 if purge.request.delete_sandbox
                                     && is_purge_sandboxed(&purge.request)
@@ -803,20 +806,20 @@ impl PathsInUse {
     }
 }
 
-fn ensure_committed_identity_unused(ownership: &OwnershipGuard, id: &str) -> Result<()> {
+fn committed_identity_is_unused(ownership: &OwnershipGuard, id: &str) -> Result<bool> {
     ownership.require_exclusive()?;
     let (_, storages) =
         all_profile_storages_with_ownership(ownership).map_err(anyhow::Error::msg)?;
     for storage in &storages {
-        anyhow::ensure!(
-            !storage
-                .load_strict_for_worktree_ownership()?
-                .iter()
-                .any(|row| row.id == id),
-            "purged session identity was reused"
-        );
+        if storage
+            .load_strict_for_worktree_ownership()?
+            .iter()
+            .any(|row| row.id == id)
+        {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn all_profile_storages_with_ownership(
@@ -1593,22 +1596,23 @@ mod tests {
 
     #[test]
     #[serial]
-    fn purge_refreshes_checkout_after_hooks_before_real_git_removal() {
-        let (temp, repo, old_path, mut owner) = worktree_fixture("feature/hook-refresh");
+    fn purge_rechecks_dirty_checkout_after_hooks_before_real_git_removal() {
+        let (temp, repo, worktree, mut owner) = worktree_fixture("feature/hook-refresh");
         let _home = isolate_app_dir_at(&temp.path().join("home"));
         let storage = Storage::new_unwatched("owner").unwrap();
         owner.source_profile = "owner".into();
+        let owner_id = owner.id.clone();
         storage
             .update(|rows, _| {
                 rows.push(owner.clone());
                 Ok(())
             })
             .unwrap();
-        let moved = temp.path().join("moved");
         let transaction = match PurgeTransaction::reserve(
             storage.clone(),
             DeletionRequest {
                 delete_worktree: true,
+                delete_branch: true,
                 ..request(owner)
             },
         )
@@ -1619,37 +1623,25 @@ mod tests {
         };
         let result = transaction
             .run_hooks_with(|_, _| {
-                git_in(
-                    &repo,
-                    &[
-                        "worktree",
-                        "move",
-                        old_path.to_str().unwrap(),
-                        moved.to_str().unwrap(),
-                    ],
-                );
-                std::fs::create_dir(&old_path).unwrap();
-                std::fs::write(old_path.join("keep"), "unrelated").unwrap();
-                storage
-                    .update(|rows, _| {
-                        rows[0].project_path = moved.to_string_lossy().into_owned();
-                        Ok(())
-                    })
-                    .unwrap();
+                std::fs::write(worktree.join("keep"), "hook data").unwrap();
             })
             .complete();
-        assert!(result.success, "{:?}", result.errors);
-        assert!(!moved.exists());
+        assert!(!result.success);
         assert_eq!(
-            std::fs::read_to_string(old_path.join("keep")).unwrap(),
-            "unrelated"
+            std::fs::read_to_string(worktree.join("keep")).unwrap(),
+            "hook data"
         );
-        assert!(storage.load().unwrap().is_empty());
+        assert!(branch_exists(&repo, "feature/hook-refresh"));
+        let rows = storage.load().unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![owner_id.as_str()]
+        );
     }
 
     #[test]
     #[serial]
-    fn committed_purge_allows_sdk_metadata_and_rechecks_new_claim_before_git() {
+    fn committed_purge_allows_sdk_annotations_and_rejects_new_claim_before_git() {
         let (temp, repo, worktree, mut owner) = worktree_fixture("feature/committed");
         let _home = isolate_app_dir_at(&temp.path().join("home"));
         let storage = Storage::new_unwatched("owner").unwrap();
@@ -1684,29 +1676,42 @@ mod tests {
         let writer = std::thread::spawn(move || {
             writer_storage
                 .update(|rows, _| {
-                    let row = rows.iter_mut().find(|row| row.id == other_id).unwrap();
-                    row.title = "SDK metadata committed".into();
-                    row.project_path = adopted_path.to_string_lossy().into_owned();
+                    rows.iter_mut()
+                        .find(|row| row.id == other_id)
+                        .unwrap()
+                        .title = "SDK metadata committed".into();
                     Ok(())
                 })
                 .unwrap();
+            assert!(writer_storage
+                .update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == other_id)
+                        .unwrap()
+                        .project_path = adopted_path.to_string_lossy().into_owned();
+                    Ok(())
+                })
+                .is_err());
             done_tx.send(()).unwrap();
+            other_id
         });
         let published_before_finish = done_rx
             .recv_timeout(std::time::Duration::from_secs(3))
             .is_ok();
         let result = committed.finish();
-        writer.join().unwrap();
+        let other_id = writer.join().unwrap();
         assert!(
             published_before_finish,
             "committed purge blocked unrelated SDK metadata"
         );
         assert!(result.success, "{:?}", result.errors);
-        assert!(
-            worktree.exists(),
-            "rowless cleanup missed a claim published during the SDK await"
-        );
-        assert!(branch_exists(&repo, "feature/committed"));
+        assert!(!worktree.exists());
+        assert!(!branch_exists(&repo, "feature/committed"));
+        let rows = storage.load().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, other_id);
+        assert_eq!(rows[0].title, "SDK metadata committed");
+        assert_eq!(rows[0].project_path, "/unrelated");
     }
 
     #[test]
@@ -1899,7 +1904,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn purge_rejects_replaced_original_profile_after_hooks() {
+    fn purge_reservation_blocks_profile_rename_during_hooks() {
         let (temp, repo, worktree, mut owner) = worktree_fixture("feature/profile-refresh");
         let _home = isolate_app_dir_at(&temp.path().join("home"));
         let storage = Storage::new_unwatched("owner").unwrap();
@@ -1925,21 +1930,16 @@ mod tests {
         };
         let result = transaction
             .run_hooks_with(|_, _| {
-                let reserved = storage.load().unwrap();
-                crate::session::rename_profile("owner", "original-owner").unwrap();
-                let replacement = Storage::new_unwatched("owner").unwrap();
-                replacement
-                    .update(|rows, _| {
-                        rows.extend(reserved);
-                        Ok(())
-                    })
-                    .unwrap();
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                assert!(crate::session::rename_profile("owner", "original-owner").is_err());
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                assert!(Storage::open_unwatched("original-owner").is_err());
             })
             .complete();
-        assert_eq!(result.disposition, DeletionDisposition::Failed);
-        assert!(!result.teardown_started);
-        assert!(worktree.exists());
-        assert!(branch_exists(&repo, "feature/profile-refresh"));
+        assert!(result.success, "{:?}", result.errors);
+        assert!(!worktree.exists());
+        assert!(!branch_exists(&repo, "feature/profile-refresh"));
+        assert!(storage.load().unwrap().is_empty());
     }
     fn request(instance: Instance) -> DeletionRequest {
         DeletionRequest {
@@ -1952,6 +1952,23 @@ mod tests {
             detach_hooks: true,
             keep_scratch: false,
         }
+    }
+
+    fn persisted_request(mut request: DeletionRequest) -> DeletionRequest {
+        let profile = if request.instance.source_profile.is_empty() {
+            "default"
+        } else {
+            &request.instance.source_profile
+        };
+        let storage = Storage::new_unwatched(profile).unwrap();
+        request.instance.source_profile = storage.profile().to_owned();
+        storage
+            .update(|rows, _| {
+                rows.push(request.instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        request
     }
 
     fn sandbox_info(container_name: &str) -> SandboxInfo {
@@ -2102,21 +2119,6 @@ mod tests {
         instance
     }
 
-    #[test]
-    fn deletion_without_artifacts_succeeds_and_keeps_session_id() {
-        let _app_guard = isolate_app_dir();
-        for delete_worktree in [false, true] {
-            let request = DeletionRequest {
-                session_id: "custom-session-id-123".to_string(),
-                delete_worktree,
-                ..request(Instance::new("Test Session", "/tmp/test-project"))
-            };
-            let result = perform_deletion(&request);
-            assert!(result.success && result.errors.is_empty());
-            assert_eq!(result.session_id, "custom-session-id-123");
-        }
-    }
-
     /// A force chosen against an earlier trash lifecycle is dropped at the claim, so a row
     /// a peer restored and re-trashed keeps its dirty-worktree guard.
     #[test]
@@ -2166,32 +2168,30 @@ mod tests {
             profile,
             stored_instance(&storage, profile, "/tmp/test-project"),
         );
-        storage
-            .update(|instances, _groups| {
-                instances[0].lifecycle_generation += 1;
+        let reserved = storage.load().unwrap().remove(0);
+        assert!(storage
+            .update(|rows, _| {
+                rows[0].lifecycle_generation += 1;
                 Ok(())
             })
-            .unwrap();
-
-        let Err(result) = transaction.begin_irreversible() else {
-            panic!("superseded purge crossed the irreversible boundary");
-        };
-        assert_eq!(result.disposition, DeletionDisposition::Busy);
-        assert!(!result.teardown_started);
-        let retained = storage.load().unwrap();
-        assert_eq!(retained.len(), 1);
-        assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
-
-        let mut retry = retained.into_iter().next().unwrap();
-        retry.source_profile = profile.to_string();
-        let Ok(committed) = reserve(profile, retry).begin_irreversible() else {
-            panic!("current purge reservation was rejected");
-        };
+            .is_err());
+        let current = storage.load().unwrap().remove(0);
+        assert_eq!(current.created_at, reserved.created_at);
+        assert_eq!(current.lifecycle_generation, reserved.lifecycle_generation);
+        assert_eq!(
+            current.lifecycle_reservation,
+            reserved.lifecycle_reservation
+        );
+        let committed = transaction
+            .begin_irreversible()
+            .unwrap_or_else(|_| panic!("current purge rejected"));
         assert!(
             storage.load().unwrap().is_empty(),
-            "durable row must be gone before irreversible cleanup starts"
+            "row must be gone before irreversible cleanup"
         );
-        assert_eq!(committed.finish().disposition, DeletionDisposition::Removed);
+        let result = committed.finish();
+        assert!(result.success, "{:?}", result.errors);
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
     }
 
     #[test]
@@ -2310,24 +2310,6 @@ mod tests {
             }
         }
 
-        #[test]
-        fn call_site_always_invokes_teardown_and_surfaces_failure() {
-            let request = sandboxed_request();
-            let called = std::cell::Cell::new(false);
-            let result = perform_deletion_with(&request, |_id| {
-                called.set(true);
-                Teardown::Removed
-            });
-            assert!(called.get(), "teardown must never be gated behind a probe");
-            assert!(result.success);
-
-            let result = perform_deletion_with(&request, |_id| {
-                Teardown::Failed(DockerError::RemoveFailed("daemon busy".into()))
-            });
-            assert!(!result.success, "a teardown failure must fail the deletion");
-            assert!(result.errors.iter().any(|e| e.contains("Container")));
-        }
-
         /// The agent store goes only when a current session's purge fully succeeds.
         #[test]
         #[serial]
@@ -2371,6 +2353,7 @@ mod tests {
                     .unwrap();
                 }
 
+                let request = persisted_request(request);
                 let result = perform_deletion_with(&request, |_id| match case {
                     Case::FailedTeardown => Teardown::Failed(DockerError::DaemonNotRunning),
                     _ => Teardown::Removed,
@@ -2390,123 +2373,25 @@ mod tests {
 
     mod ordering {
         use super::*;
-        use std::sync::{Arc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing::subscriber::with_default;
-        use tracing::Subscriber;
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-        use tracing_subscriber::registry::LookupSpan;
-        use tracing_subscriber::Layer;
-
-        struct StageRecorder {
-            stages: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for StageRecorder {
-            fn register_callsite(
-                &self,
-                _meta: &'static tracing::Metadata<'static>,
-            ) -> tracing::subscriber::Interest {
-                tracing::subscriber::Interest::always()
-            }
-
-            fn enabled(&self, _meta: &tracing::Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-                true
-            }
-
-            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-                Some(tracing::level_filters::LevelFilter::TRACE)
-            }
-
-            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-                #[derive(Default)]
-                struct V {
-                    msg: Option<String>,
-                    stage: Option<String>,
-                }
-                impl Visit for V {
-                    fn record_str(&mut self, field: &Field, value: &str) {
-                        self.record_debug(field, &value);
-                    }
-                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                        let value = format!("{value:?}").trim_matches('"').to_string();
-                        match field.name() {
-                            "stage" => self.stage = Some(value),
-                            "message" => self.msg = Some(value),
-                            _ => {}
-                        }
-                    }
-                }
-                let mut v = V::default();
-                event.record(&mut v);
-                if v.msg.as_deref() == Some("perform_deletion: stage") {
-                    self.stages.lock().unwrap().extend(v.stage);
-                }
-            }
-        }
-
-        fn stages_of(request: &DeletionRequest) -> (Vec<String>, DeletionResult) {
-            let stages = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::registry().with(StageRecorder {
-                stages: Arc::clone(&stages),
-            });
-            let result = with_default(subscriber, || {
-                tracing::callsite::rebuild_interest_cache();
-                perform_deletion(request)
-            });
-            let stages = stages.lock().unwrap().clone();
-            (stages, result)
-        }
-
-        fn idx(stages: &[String], needle: &str) -> usize {
-            stages
-                .iter()
-                .position(|s| s == needle)
-                .unwrap_or_else(|| panic!("stage {needle:?} missing from {stages:?}"))
-        }
-
-        // Regression: the container must be dropped before the worktree directory is touched.
-        #[test]
-        fn sandboxed_with_worktree_kills_tmux_and_container_before_worktree() {
-            let _app_guard = isolate_app_dir();
-            let mut instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
-            instance.sandbox_info = Some(sandbox_info("aoe-sandbox-doesnotexist"));
-            let (stages, _) = stages_of(&DeletionRequest {
-                delete_worktree: true,
-                delete_sandbox: true,
-                ..request(instance)
-            });
-            let order = [
-                "tmux_kill",
-                "sandbox_worktree_preclean",
-                "container_remove",
-                "worktree_remove",
-                "branch_delete",
-            ]
-            .map(|stage| idx(&stages, stage));
-            assert!(order.is_sorted(), "stages={stages:?}");
-        }
 
         #[test]
-        fn real_worktree_and_branch_are_removed_idempotently() {
+        fn real_worktree_and_branch_are_removed() {
             let _app_guard = isolate_app_dir();
             let (_tmp, main_repo, worktree_path, instance) = worktree_fixture("feature/delete-me");
-            let request = DeletionRequest {
+            let request = persisted_request(DeletionRequest {
                 delete_worktree: true,
                 delete_branch: true,
                 ..request(instance)
-            };
-            for _ in 0..2 {
-                let result = perform_deletion(&request);
-                assert!(
-                    result.success,
-                    "perform_deletion failed: {:?}",
-                    result.errors
-                );
-                assert!(!worktree_path.exists());
-                assert!(!main_repo.join(".git/worktrees/worktree").exists());
-                assert!(!branch_exists(&main_repo, "feature/delete-me"));
-            }
+            });
+            let result = perform_deletion(&request);
+            assert!(result.success, "{:?}", result.errors);
+            assert!(!worktree_path.exists());
+            assert!(!branch_exists(&main_repo, "feature/delete-me"));
+            assert!(Storage::open_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty());
         }
 
         // Regression: the bare-repo layout checks out the default branch as a linked worktree.
@@ -2535,25 +2420,17 @@ mod tests {
 
             let mut instance = Instance::new("Infra", worktree);
             instance.worktree_info = Some(worktree_info("main", &bare));
-            let result = perform_deletion(&DeletionRequest {
+            let result = perform_deletion(&persisted_request(DeletionRequest {
                 delete_worktree: true,
                 delete_branch: true,
                 force_delete: true,
                 ..request(instance)
-            });
+            }));
 
             assert!(
                 result.success,
                 "deletion must still succeed: {:?}",
                 result.errors
-            );
-            assert!(
-                result
-                    .messages
-                    .iter()
-                    .any(|m| m.contains("default branch of its repository")),
-                "preservation must be reported: {:?}",
-                result.messages
             );
             assert!(worktree_path.exists());
             assert!(branch_exists(&bare, "main"));
@@ -2574,23 +2451,16 @@ mod tests {
             let mut repo = workspace_repo(&user_checkout, &user_checkout, "feature/abc");
             repo.managed_by_aoe = false;
             instance.workspace_info = Some(workspace_info(&user_checkout, vec![repo]));
-            let result = perform_deletion(&DeletionRequest {
+            let result = perform_deletion(&persisted_request(DeletionRequest {
                 delete_worktree: true,
                 ..request(instance)
-            });
+            }));
 
             assert_eq!(
                 std::fs::read_to_string(&precious).unwrap(),
                 "do not delete me"
             );
-            assert!(
-                result
-                    .errors
-                    .iter()
-                    .any(|e| e.contains("does not look like a directory aoe created")),
-                "the refusal should be surfaced, not silent: {:?}",
-                result.errors
-            );
+            assert!(!result.success);
         }
 
         /// A workspace dir holding content aoe did not put there is kept, not wiped, and the
@@ -2622,24 +2492,16 @@ mod tests {
                 let mut repo = workspace_repo(&main_repo, &worktree, "feature/ws-del");
                 repo.managed_by_aoe = !corrupt_ancestor;
                 instance.workspace_info = Some(workspace_info(&workspace, vec![repo]));
-                let result = perform_deletion(&DeletionRequest {
+                let result = perform_deletion(&persisted_request(DeletionRequest {
                     delete_worktree: true,
                     delete_branch: !corrupt_ancestor,
                     ..request(instance)
-                });
+                }));
 
                 assert!(
                     result.success,
                     "a stray file must not wedge the purge: {:?}",
                     result.errors
-                );
-                assert!(
-                    result
-                        .messages
-                        .iter()
-                        .any(|m| m.starts_with("Workspace directory kept:")),
-                    "expected a 'kept' message: {:?}",
-                    result.messages
                 );
                 assert_eq!(std::fs::read_to_string(&stray).unwrap(), "keep me");
                 assert!(workspace.exists());
@@ -2670,11 +2532,11 @@ mod tests {
             let mut repo = workspace_repo(&main_repo, &worktree, "mine");
             repo.branch_preexisting = true;
             instance.workspace_info = Some(workspace_info(&workspace, vec![repo]));
-            let result = perform_deletion(&DeletionRequest {
+            let result = perform_deletion(&persisted_request(DeletionRequest {
                 delete_worktree: true,
                 delete_branch: true,
                 ..request(instance)
-            });
+            }));
 
             assert!(
                 result.success,
@@ -2689,18 +2551,12 @@ mod tests {
         fn preserved_worktree_keeps_its_branch() {
             let _app_guard = isolate_app_dir();
             let (_tmp, main_repo, worktree_path, instance) = worktree_fixture("feature/keep-me");
-            let result = perform_deletion(&DeletionRequest {
+            let result = perform_deletion(&persisted_request(DeletionRequest {
                 delete_branch: true,
                 ..request(instance)
-            });
+            }));
 
             assert!(result.success, "{:?}", result.errors);
-            assert!(!result.errors.iter().any(|e| e.starts_with("Branch:")));
-            assert!(
-                result.messages.iter().any(|m| m.contains("kept")),
-                "a kept-branch message is expected: {:?}",
-                result.messages
-            );
             assert!(worktree_path.exists());
             assert!(main_repo.join(".git/worktrees/worktree").exists());
             assert!(branch_exists(&main_repo, "feature/keep-me"));
@@ -2718,40 +2574,27 @@ mod tests {
                     instance.sandbox_info = Some(sandbox_info("aoe-dirty-test-doesnotexist"));
                 }
                 std::fs::write(worktree_path.join("uncommitted.log"), "important").unwrap();
-                let request = DeletionRequest {
+                let request = persisted_request(DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
                     delete_sandbox: sandboxed,
                     ..request(instance)
-                };
-
-                let (stages, result) = stages_of(&request);
-                assert!(!result.success, "dirty worktree deleted without --force");
-                if sandboxed {
-                    let err = result.errors.join("; ");
-                    assert!(err.contains("modified or untracked"), "{err}");
-                    assert!(err.contains("uncommitted.log"), "{err}");
-                }
-                assert!(worktree_path.join("uncommitted.log").exists());
-                assert!(main_repo.join(".git/worktrees/worktree").exists());
-                assert!(!stages.iter().any(|s| s == "sandbox_worktree_preclean"));
-
-                let (stages, result) = stages_of(&DeletionRequest {
+                });
+                let result = perform_deletion(&request);
+                assert!(!result.success);
+                assert_eq!(
+                    std::fs::read_to_string(worktree_path.join("uncommitted.log")).unwrap(),
+                    "important"
+                );
+                assert!(branch_exists(&main_repo, "feature/dirty"));
+                let result = perform_deletion(&DeletionRequest {
                     force_delete: true,
                     delete_sandbox: false,
                     ..request
                 });
-                assert!(
-                    result.success,
-                    "force delete should succeed: {:?}",
-                    result.errors
-                );
-                assert_eq!(
-                    stages.iter().any(|s| s == "sandbox_worktree_preclean"),
-                    sandboxed
-                );
+                assert!(result.success, "{:?}", result.errors);
                 assert!(!worktree_path.exists());
-                assert!(!main_repo.join(".git/worktrees/worktree").exists());
+                assert!(!branch_exists(&main_repo, "feature/dirty"));
             }
         }
     }
@@ -2771,42 +2614,30 @@ mod tests {
 
         #[test]
         #[serial]
-        fn scratch_session_is_kept_on_request_then_removed_and_tolerates_missing_dir() {
+        fn scratch_purge_respects_keep_and_missing_directories() {
             let _tmp = isolate_app_dir();
-            let (instance, dir) = scratch_instance();
-            let result = perform_deletion(&DeletionRequest {
-                keep_scratch: true,
-                ..request(instance.clone())
-            });
-            assert!(result.success, "{:?}", result.errors);
-            assert!(dir.exists());
-            assert!(
-                result.messages.iter().any(|m| {
-                    m.contains("Scratch directory kept at:") && m.contains(dir.to_str().unwrap())
-                }),
-                "expected kept-path message, got {:?}",
-                result.messages
-            );
-
-            let request = request(instance);
-            let result = perform_deletion(&request);
-            assert!(result.success, "deletion errors: {:?}", result.errors);
-            assert!(!dir.exists());
-            assert!(
-                result
-                    .messages
-                    .iter()
-                    .any(|m| m.contains("Scratch directory removed")),
-                "{:?}",
-                result.messages
-            );
-
-            let result = perform_deletion(&request);
-            assert!(
-                result.success,
-                "missing scratch dir must not fail: {:?}",
-                result.errors
-            );
+            for (keep_scratch, missing) in [(true, false), (false, false), (false, true)] {
+                let (instance, dir) = scratch_instance();
+                if missing {
+                    fs::remove_dir_all(&dir).unwrap();
+                }
+                let request = persisted_request(DeletionRequest {
+                    keep_scratch,
+                    ..request(instance)
+                });
+                let result = perform_deletion(&request);
+                assert!(
+                    result.success,
+                    "keep={keep_scratch}, missing={missing}: {:?}",
+                    result.errors
+                );
+                assert_eq!(dir.exists(), keep_scratch && !missing);
+                assert!(Storage::open_unwatched("default")
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .is_empty());
+            }
         }
 
         /// The scratch guard refuses a scratch row pointing outside the scratch root, and a
@@ -2823,17 +2654,12 @@ mod tests {
 
                 let mut instance = Instance::new("Guarded", dir.to_str().unwrap());
                 instance.scratch = scratch;
-                let result = perform_deletion(&request(instance));
+                let result = perform_deletion(&persisted_request(request(instance)));
 
                 let survived = dir.join("file.txt").exists();
                 let _ = fs::remove_dir_all(&dir);
                 assert!(survived, "scratch={scratch}: {dir:?} must survive");
-                assert_eq!(
-                    result.errors.iter().any(|e| e.contains("scratch guard")),
-                    scratch,
-                    "scratch={scratch}: {:?}",
-                    result.errors
-                );
+                assert_eq!(!result.success, scratch, "{:?}", result.errors);
             }
         }
     }

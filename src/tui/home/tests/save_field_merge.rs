@@ -280,8 +280,15 @@ fn test_move_to_profile_commits_without_pending_bookkeeping() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "moved/group".to_string();
-    view.move_to_profile(&id, "target", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
         .unwrap();
 
@@ -321,8 +328,15 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
 
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path = "newgrp".to_string();
-    view.move_to_profile(&id, "test", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "test",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(
         !view
             .pending_deletions
@@ -338,8 +352,15 @@ fn test_move_to_profile_save_roundtrip_persists_under_target() {
     );
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path.clear();
-    view.move_to_profile(&id, "target", requested, None, false)
-        .unwrap();
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        None,
+        false,
+    )
+    .unwrap();
     view.save().expect("save must succeed across profiles");
 
     let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -474,15 +495,20 @@ fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
         })
         .unwrap();
 
-    let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+    let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
+    let guards = view
+        .lock_session_mutation_and_reload_with_ownership(&ownership, &id)
+        .unwrap();
     let authoritative = view.get_instance(&id).cloned().unwrap();
     assert_eq!(authoritative.title, "peer-new-title");
     assert_eq!(authoritative.lifecycle_generation, 7);
     assert_eq!(authoritative.status, Status::Running);
 
     let requested = authoritative.clone();
-    view.move_to_profile(&id, "target", requested, None, false)
+    view.move_to_profile_with_ownership(&ownership, &id, "target", requested, None, false)
         .unwrap();
+    drop(guards);
+    drop(ownership);
     view.save().unwrap();
 
     let target = Storage::new_unwatched("target")
@@ -529,7 +555,11 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         .unwrap();
 
     assert!(
-        view.lock_session_mutation_and_reload(&id).is_err(),
+        view.lock_session_mutation_and_reload_with_ownership(
+            &crate::session::storage::acquire_ownership_lock().unwrap(),
+            &id
+        )
+        .is_err(),
         "a fresh reservation must reject profile-move admission"
     );
     assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
@@ -565,8 +595,15 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
 
     let requested = view.get_instance(&id).unwrap().clone();
     let baseline = requested.clone();
-    view.move_to_profile(&id, "target", requested, Some(&baseline), false)
-        .expect("stale reservation must not block profile move");
+    view.move_to_profile_with_ownership(
+        &crate::session::storage::acquire_ownership_lock().unwrap(),
+        &id,
+        "target",
+        requested,
+        Some(&baseline),
+        false,
+    )
+    .expect("stale reservation must not block profile move");
     assert!(source.load().unwrap().is_empty());
     assert!(Storage::new_unwatched("target")
         .unwrap()

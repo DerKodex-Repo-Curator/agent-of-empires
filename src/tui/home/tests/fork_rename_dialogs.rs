@@ -812,72 +812,6 @@ fn queued_creation_result_does_not_block_exclusive_ownership() {
 
 #[test]
 #[serial]
-fn queued_creation_rejects_replaced_plain_scratch_and_managed_directories() {
-    for kind in ["plain", "scratch", "managed"] {
-        let mut env = setup_creation_test_env();
-        let queued = env.view.creation_poller.observe_next_queued_result();
-        let mut data = creation_data(&env.project_dir, "Original", "");
-        data.scratch = kind == "scratch";
-        if kind == "managed" {
-            data.worktree_enabled = true;
-            data.worktree_branch = Some("queued-original".into());
-            data.create_new_branch = true;
-        }
-        env.view.request_creation(data, None);
-        queued
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("worker queued its real result");
-        let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
-        let git = crate::git::GitWorktree::new(env.project_dir.clone()).unwrap();
-        let path = match kind {
-            "managed" => {
-                git.list_worktrees()
-                    .unwrap()
-                    .into_iter()
-                    .find(|entry| entry.branch.as_deref() == Some("queued-original"))
-                    .unwrap()
-                    .path
-            }
-            "scratch" => std::fs::read_dir(crate::session::get_app_dir().unwrap().join("scratch"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-            _ => env.project_dir.clone(),
-        };
-        if kind == "managed" {
-            git.remove_worktree(&path, false).unwrap();
-            git.create_worktree("queued-original", &path, false, None)
-                .unwrap();
-        } else {
-            let retired = env._temp.path().join("retired-original");
-            std::fs::rename(&path, retired).unwrap();
-            std::fs::create_dir_all(&path).unwrap();
-        }
-        std::fs::write(path.join("replacement-marker"), b"keep").unwrap();
-        drop(ownership);
-        assert_eq!(drain_creation_result(&mut env.view), None, "{kind}");
-        assert!(env.view.info_dialog.is_some(), "{kind}");
-        assert!(env.storage.load().unwrap().is_empty(), "{kind}");
-        assert_eq!(
-            std::fs::read(path.join("replacement-marker")).unwrap(),
-            b"keep",
-            "{kind}"
-        );
-        if kind == "managed" {
-            assert!(git
-                .list_worktrees()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.path == path));
-            assert!(git.branch_exists("queued-original").unwrap());
-        }
-    }
-}
-
-#[test]
-#[serial]
 fn queued_creation_cannot_publish_into_a_replacement_profile() {
     let mut env = setup_creation_test_env();
     let queued = env.view.creation_poller.observe_next_queued_result();
@@ -923,7 +857,10 @@ fn apply_creation_results_finalizes_persisted_stub() {
         _guard,
         _temp,
     } = setup_creation_test_env();
-
+    let initial_sessions_created = crate::session::config::AppStateConfig::load()
+        .unwrap()
+        .sessions_created;
+    let queued = view.creation_poller.observe_next_queued_result();
     view.request_creation(
         creation_data(&project_dir, "Async Test", "async-success"),
         None,
@@ -932,95 +869,70 @@ fn apply_creation_results_finalizes_persisted_stub() {
     let stub_id = view
         .creating_stub_id
         .clone()
-        .expect("request should install a Creating stub");
+        .expect("canonical Creating row");
     view.save().unwrap();
-    let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
+    let (creating, creating_groups) = storage.load_with_groups().unwrap();
+    assert_eq!(creating.len(), 1);
+    let stub = &creating[0];
+    assert_eq!(stub.id, stub_id);
+    assert_eq!(stub.status, Status::Creating);
+    assert!(stub.lifecycle_reservation_is_owned(
+        crate::session::LifecycleOperation::Create,
+        stub.lifecycle_generation
+    ));
+    assert!(creating_groups
+        .iter()
+        .any(|group| group.path == "async-success"));
+    queued
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("real producer result queued");
+    let session_id = drain_creation_result(&mut view).expect("creation finalized");
+    assert_eq!(session_id, stub_id);
     assert_eq!(
         crate::session::config::AppStateConfig::load()
             .unwrap()
             .sessions_created,
-        0
+        initial_sessions_created + 1
     );
-    assert_eq!(persisted_while_creating.len(), 1);
-    assert_eq!(persisted_while_creating[0].id, stub_id);
-    assert_eq!(
-        persisted_while_creating[0].status,
-        crate::session::Status::Creating
-    );
-    assert!(
-        groups_while_creating
-            .iter()
-            .any(|group| group.path == "async-success"),
-        "the intervening save should persist the stub's provisional group"
-    );
-
-    let session_id = drain_creation_result(&mut view)
-        .expect("apply_creation_results should return Some(session_id)");
-    assert_eq!(
-        crate::session::config::AppStateConfig::load()
-            .unwrap()
-            .sessions_created,
-        1
-    );
-    assert!(
-        view.creating_provisional_group_paths.is_empty(),
-        "finalization must leave no provisional group paths behind"
-    );
-    assert!(
-        view.get_instance(&session_id).is_some(),
-        "created session should be findable after apply_creation_results"
-    );
-    assert!(
-        !view
-            .pending_added
-            .get("default")
-            .is_some_and(|pending| pending.contains(&session_id)),
-        "a row committed by finalization is not a provisional pending add"
-    );
-    let (persisted_after_finalization, groups_after_finalization) =
-        storage.load_with_groups().unwrap();
-    assert_eq!(
-        persisted_after_finalization.len(),
-        1,
-        "finalization should replace the persisted stub with one real row"
-    );
-    assert_eq!(persisted_after_finalization[0].id, session_id);
-    assert!(
-        persisted_after_finalization
-            .iter()
-            .all(|instance| instance.id != stub_id
-                && instance.status != crate::session::Status::Creating),
-        "the persisted Creating stub must not survive finalization"
-    );
-    assert!(
-        groups_after_finalization
-            .iter()
-            .any(|group| group.path == "async-success"),
-        "the finalized row's group should remain persisted"
-    );
-    assert!(
-        view.get_instance(&stub_id).is_none(),
-        "the in-memory Creating stub must be replaced too"
-    );
-
+    assert!(view.creating_provisional_group_paths.is_empty());
+    assert!(!view
+        .pending_added
+        .get("default")
+        .is_some_and(|pending| pending.contains(&session_id)));
+    let (finalized, groups) = storage.load_with_groups().unwrap();
+    assert_eq!(finalized.len(), 1);
+    let row = &finalized[0];
+    assert_eq!(row.id, stub.id);
+    assert_eq!(row.created_at, stub.created_at);
+    assert_eq!(row.lifecycle_generation, stub.lifecycle_generation);
+    assert_ne!(row.status, Status::Creating);
+    assert_eq!(row.lifecycle_reservation, None);
+    let live = view
+        .get_instance(&stub_id)
+        .expect("same identity finalized in memory");
+    assert_eq!(live.created_at, stub.created_at);
+    assert_eq!(live.lifecycle_generation, stub.lifecycle_generation);
+    assert_ne!(live.status, Status::Creating);
+    assert_eq!(live.lifecycle_reservation, None);
+    assert!(groups.iter().any(|group| group.path == "async-success"));
     storage
-        .update(|instances, _groups| {
-            instances.retain(|instance| instance.id != session_id);
+        .update(|rows, _| {
+            rows.retain(|row| row.id != session_id);
             Ok(())
         })
         .unwrap();
     view.save().unwrap();
     assert!(
         view.get_instance(&session_id).is_none(),
-        "save must evict the peer-deleted finalized row from memory"
+        "save evicts the peer-deleted finalized row"
     );
     assert!(
-        !storage
+        storage
             .load()
             .unwrap()
             .iter()
-            .any(|instance| instance.id == session_id),
-        "a peer-deleted finalized row must not be resurrected by save"
+            .all(|row| row.id != session_id),
+        "save must not resurrect a committed row"
     );
 }
 
@@ -1122,14 +1034,12 @@ fn cancel_during_on_create_skips_on_launch() {
 #[serial]
 fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
     use std::os::unix::fs::PermissionsExt;
-
     struct ReleaseNative<'a>(&'a std::path::Path);
     impl Drop for ReleaseNative<'_> {
         fn drop(&mut self) {
             let _ = std::fs::write(self.0, b"release");
         }
     }
-
     for claimant in [
         "none",
         "foreign",
@@ -1137,7 +1047,7 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
         "queued",
         "shutdown-unchanged",
         "shutdown-redirected",
-        "shutdown-adopted",
+        "shutdown-runtime-status",
     ] {
         let mut env = setup_creation_test_env();
         let entered = env._temp.path().join("native-entered");
@@ -1147,7 +1057,11 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
         std::fs::write(
             &hook,
             format!(
-                "#!/bin/sh\nprintf '%s' \"$PWD\" > {}.tmp\nmv {}.tmp {}\nwhile [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done\n",
+                r#"#!/bin/sh
+printf '%s' "" > {}.tmp
+mv {}.tmp {}
+while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done
+"#,
                 quote(&entered.to_string_lossy()),
                 quote(&entered.to_string_lossy()),
                 quote(&entered.to_string_lossy()),
@@ -1171,47 +1085,56 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
                 std::time::Instant::now() < deadline,
                 "native callback did not enter"
             );
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::yield_now();
         }
         let target = std::path::PathBuf::from(std::fs::read_to_string(&entered).unwrap());
         env.view.save().unwrap();
         let saved = env.storage.load().unwrap();
-        assert!(saved
-            .iter()
-            .any(|row| row.id == stub_id && row.status == Status::Creating));
-        let mut owner_id = match claimant {
+        assert_eq!(saved.len(), 1);
+        let canonical = &saved[0];
+        assert_eq!(canonical.id, stub_id);
+        assert_eq!(canonical.status, Status::Creating);
+        assert_eq!(std::path::Path::new(&canonical.project_path), target);
+        assert!(canonical
+            .lifecycle_reservation
+            .as_ref()
+            .unwrap()
+            .resource_intent
+            .is_some());
+        let redirected = env._temp.path().join("unrelated-checkout");
+        std::fs::create_dir(&redirected).unwrap();
+        std::fs::write(redirected.join("keep"), b"unrelated").unwrap();
+        let before = std::fs::read(env.storage.sessions_path()).unwrap();
+        match claimant {
             "foreign" => {
                 let mut owner = Instance::new("Foreign creator", target.to_str().unwrap());
-                owner.status = Status::Creating;
-                owner.worktree_info = Some(crate::session::WorktreeInfo {
-                    branch: "native-stub".into(),
-                    main_repo_path: env.project_dir.to_str().unwrap().into(),
-                    managed_by_aoe: false,
-                    created_at: chrono::Utc::now(),
-                    base_branch: None,
-                });
-                let id = owner.id.clone();
-                env.storage
+                owner.source_profile = "default".into();
+                owner.worktree_info = canonical.worktree_info.clone();
+                let error = env
+                    .storage
                     .update(|rows, _| {
                         rows.push(owner);
                         Ok(())
                     })
-                    .unwrap();
-                Some(id)
+                    .expect_err("reserved checkout cannot be adopted");
+                assert!(error.to_string().contains("busy"), "{error:#}");
+                assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), before);
             }
             "redirected" | "shutdown-redirected" => {
-                env.storage
+                let error = env
+                    .storage
                     .update(|rows, _| {
                         rows.iter_mut()
                             .find(|row| row.id == stub_id)
                             .unwrap()
-                            .project_path = target.to_str().unwrap().into();
+                            .project_path = redirected.to_string_lossy().into_owned();
                         Ok(())
                     })
-                    .unwrap();
-                Some(stub_id.clone())
+                    .expect_err("reserved owner cannot be redirected");
+                assert!(error.to_string().contains("busy"), "{error:#}");
+                assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), before);
             }
-            "shutdown-adopted" => {
+            "shutdown-runtime-status" => {
                 env.storage
                     .update(|rows, _| {
                         rows.iter_mut()
@@ -1221,74 +1144,71 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
                         Ok(())
                     })
                     .unwrap();
-                Some(stub_id.clone())
+                let rows = env.storage.load().unwrap();
+                assert_eq!(rows[0].id, canonical.id);
+                assert_eq!(rows[0].created_at, canonical.created_at);
+                assert_eq!(rows[0].lifecycle_generation, canonical.lifecycle_generation);
+                assert_eq!(
+                    rows[0].lifecycle_reservation,
+                    canonical.lifecycle_reservation
+                );
             }
-            _ => None,
-        };
+            _ => {}
+        }
         std::fs::write(&release, b"release").unwrap();
         queued
             .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("worker queued its real result");
+            .expect("real producer result queued");
         if claimant == "queued" {
-            env.storage
+            let before = std::fs::read(env.storage.sessions_path()).unwrap();
+            let error = env
+                .storage
                 .update(|rows, _| {
                     rows.iter_mut()
                         .find(|row| row.id == stub_id)
                         .unwrap()
-                        .project_path = target.to_string_lossy().into_owned();
+                        .project_path = redirected.to_string_lossy().into_owned();
                     Ok(())
                 })
-                .unwrap();
-            owner_id = Some(stub_id.clone());
+                .expect_err("queued result still owns its resource intent");
+            assert!(error.to_string().contains("busy"), "{error:#}");
+            assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), before);
         }
         if claimant.starts_with("shutdown-") {
             env.view.cleanup_pending_creation();
             env.view.save().unwrap();
-            let rows = env.storage.load().unwrap();
-            if claimant == "shutdown-unchanged" {
-                assert!(rows.iter().all(|row| row.id != stub_id));
-                assert!(!target.exists());
-            } else {
-                let row = rows
-                    .iter()
-                    .find(|row| row.id == stub_id)
-                    .expect("peer claimant must survive shutdown");
-                if claimant == "shutdown-adopted" {
-                    assert_eq!(row.status, Status::Running);
-                    assert_eq!(row.project_path, env.project_dir.to_string_lossy());
-                    assert_eq!(
-                        env.view.get_instance(&stub_id).unwrap().status,
-                        Status::Running
-                    );
-                } else {
-                    assert_eq!(std::path::Path::new(&row.project_path), target);
-                    assert_eq!(std::fs::read(target.join("README.md")).unwrap(), b"test\n");
-                }
-            }
-            continue;
-        }
-        let created = drain_creation_result(&mut env.view);
-        env.view.save().unwrap();
-        if let Some(owner_id) = owner_id {
-            assert_eq!(created, None, "{claimant} must invalidate publication");
             assert!(env
                 .storage
                 .load()
                 .unwrap()
                 .iter()
-                .any(|row| row.id == owner_id));
+                .all(|row| row.id != stub_id));
+            assert!(env.view.get_instance(&stub_id).is_none());
+            assert!(!target.exists());
+            assert!(git2::Repository::open(&env.project_dir)
+                .unwrap()
+                .find_branch("native-stub", git2::BranchType::Local)
+                .is_err());
         } else {
-            let id =
-                created.expect("saving the unchanged originating stub must not cancel creation");
+            assert_eq!(drain_creation_result(&mut env.view), Some(stub_id.clone()));
+            env.view.save().unwrap();
             let rows = env.storage.load().unwrap();
-            assert!(rows.iter().any(|row| row.id == id));
-            assert!(rows.iter().all(|row| row.id != stub_id));
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, canonical.id);
+            assert_eq!(rows[0].created_at, canonical.created_at);
+            assert_eq!(rows[0].lifecycle_generation, canonical.lifecycle_generation);
+            assert_ne!(rows[0].status, Status::Creating);
+            assert_eq!(rows[0].lifecycle_reservation, None);
+            assert_eq!(std::fs::read(target.join("README.md")).unwrap(), b"test\n");
+            assert!(git2::Repository::open(&env.project_dir)
+                .unwrap()
+                .find_branch("native-stub", git2::BranchType::Local)
+                .is_ok());
         }
-        assert_eq!(std::fs::read(target.join("README.md")).unwrap(), b"test\n");
-        assert!(git2::Repository::open(&env.project_dir)
-            .unwrap()
-            .find_branch("native-stub", git2::BranchType::Local)
-            .is_ok());
+        assert_eq!(
+            std::fs::read(redirected.join("keep")).unwrap(),
+            b"unrelated"
+        );
     }
 }
 
@@ -1296,169 +1216,113 @@ fn saving_creating_stub_during_native_checkout_preserves_claim_authority() {
 #[test]
 #[serial]
 fn apply_creation_results_rolls_back_on_peer_collision() {
-    let CreationTestEnv {
-        mut view,
-        storage,
-        project_dir,
-        _guard,
-        _temp,
-    } = setup_creation_test_env();
-
-    // Use a real created branch/worktree so rollback proves it preserves
-    // resources referenced by the persisted winner.
-    let preexisting_group = "existing-empty";
-    let transient_group = "existing-empty/collision";
-    view.group_trees
-        .get_mut("default")
-        .expect("default profile should have a group tree")
-        .create_group(preexisting_group);
-    view.save().unwrap();
-    assert!(
-        storage
-            .load_with_groups()
+    for managed in [false, true] {
+        let mut env = setup_creation_test_env();
+        let parent = "existing-empty";
+        let child = "existing-empty/collision";
+        env.view
+            .group_trees
+            .get_mut("default")
             .unwrap()
-            .1
-            .iter()
-            .any(|group| group.path == preexisting_group),
-        "the parent group must be intentionally persisted before the request"
-    );
-    let branch = "raced-worktree";
-    let mut raced = creation_data(&project_dir, "Raced title", transient_group);
-    raced.worktree_enabled = true;
-    raced.worktree_branch = Some(branch.to_string());
-    raced.create_new_branch = true;
-    let queued = view.creation_poller.observe_next_queued_result();
-    view.request_creation(raced, None);
-    let raced_stub_id = view
-        .creating_stub_id
-        .clone()
-        .expect("raced request should install a Creating stub");
-    view.save().unwrap();
-    let (raced_rows, raced_groups) = storage.load_with_groups().unwrap();
-    assert!(raced_rows.iter().any(|instance| {
-        instance.id == raced_stub_id && instance.status == crate::session::Status::Creating
-    }));
-    assert!(
-        raced_groups
-            .iter()
-            .any(|group| group.path == transient_group),
-        "the intervening save should persist the raced stub's child group"
-    );
-
-    let main_repo_path = project_dir.canonicalize().unwrap();
-    let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
-    queued
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("worker queued its real result before the publication collision");
-    let winner_path = git
-        .list_worktrees()
-        .unwrap()
-        .into_iter()
-        .find(|worktree| worktree.branch.as_deref() == Some(branch))
-        .expect("successful producer must leave its worktree registered")
-        .path;
-
-    let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
-    owner.source_profile = "default".to_string();
-    owner.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: branch.to_string(),
-        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
-        managed_by_aoe: false,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
-    let owner_id = owner.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(owner);
+            .create_group(parent);
+        env.view.save().unwrap();
+        let mut data = creation_data(&env.project_dir, "Raced title", child);
+        data.worktree_enabled = managed;
+        if managed {
+            data.worktree_branch = Some("raced-worktree".into());
+            data.create_new_branch = true;
+        }
+        let queued = env.view.creation_poller.observe_next_queued_result();
+        env.view.request_creation(data, None);
+        let id = env.view.creating_stub_id.clone().unwrap();
+        env.view.save().unwrap();
+        queued
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("real producer result queued");
+        let (rows, groups) = env.storage.load_with_groups().unwrap();
+        assert_eq!(rows.len(), 1);
+        let canonical = &rows[0];
+        assert_eq!(canonical.id, id);
+        assert_eq!(canonical.status, Status::Creating);
+        assert!(groups.iter().any(|group| group.path == child));
+        let path = std::path::PathBuf::from(&canonical.project_path);
+        std::fs::write(path.join("winner-marker"), b"keep").unwrap();
+        let mut owner = Instance::new("Raced title", path.to_str().unwrap());
+        owner.source_profile = "default".into();
+        owner.worktree_info = canonical.worktree_info.clone();
+        if let Some(info) = &mut owner.worktree_info {
+            info.managed_by_aoe = false;
+        }
+        let owner_id = owner.id.clone();
+        let before = std::fs::read(env.storage.sessions_path()).unwrap();
+        let insertion = env.storage.update(|rows, _| {
+            rows.push(owner);
             Ok(())
-        })
-        .unwrap();
-
-    let unexpected_id = drain_creation_result(&mut view);
-    assert_eq!(unexpected_id, None);
-    assert!(
-        view.creating_provisional_group_paths.is_empty(),
-        "rollback must leave no provisional group paths behind"
-    );
-    assert_eq!(
-        view.get_instance(&owner_id)
-            .map(|row| row.project_path.as_str()),
-        Some(winner_path.to_str().unwrap()),
-        "duplicate rejection must reload the authoritative owner",
-    );
-    assert!(
-        winner_path.is_dir(),
-        "rollback must preserve the winner's worktree"
-    );
-    assert!(
-        git.list_worktrees()
-            .unwrap()
-            .iter()
-            .any(|worktree| worktree.path == winner_path),
-        "winner worktree must remain registered"
-    );
-    assert!(
-        git2::Repository::open(&main_repo_path)
-            .unwrap()
-            .find_branch(branch, git2::BranchType::Local)
-            .is_ok(),
-        "rollback must preserve the winner's branch"
-    );
-    assert!(
-        view.group_trees.get("default").is_none_or(|tree| tree
-            .get_all_groups()
-            .iter()
-            .all(|group| group.path != transient_group)),
-        "duplicate rejection must discard the stub's provisional group"
-    );
-    assert!(
-        view.group_trees
-            .get("default")
-            .is_some_and(|tree| tree.group_exists(preexisting_group)),
-        "duplicate rejection must preserve an intentionally pre-existing empty group"
-    );
-
-    view.save().unwrap();
-    let (persisted, groups) = storage.load_with_groups().unwrap();
-    assert_eq!(
-        persisted
-            .iter()
-            .filter(|instance| {
-                instance.title == "Raced title"
-                    && std::path::Path::new(&instance.project_path) == winner_path
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        persisted.len(),
-        1,
-        "duplicate rejection should leave only the authoritative peer row"
-    );
-    assert!(
-        persisted.iter().all(|instance| {
-            instance.id != raced_stub_id && instance.status != crate::session::Status::Creating
-        }),
-        "duplicate rejection must remove the persisted Creating stub"
-    );
-    assert!(
-        groups.iter().all(|group| group.path != transient_group),
-        "a later save must not persist the rejected stub's group"
-    );
-    assert!(
-        groups.iter().any(|group| group.path == preexisting_group),
-        "a later save must preserve the pre-existing empty parent group"
-    );
-
-    storage
-        .update(|instances, _groups| {
-            instances.retain(|instance| instance.id != owner_id);
-            Ok(())
-        })
-        .unwrap();
-    git.remove_worktree(&winner_path, true).unwrap();
-    git.delete_branch(branch).unwrap();
+        });
+        if managed {
+            let error = insertion.expect_err("managed checkout is reserved until publication");
+            assert!(error.to_string().contains("busy"), "{error:#}");
+            assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), before);
+            assert!(canonical
+                .lifecycle_reservation
+                .as_ref()
+                .unwrap()
+                .resource_intent
+                .is_some());
+            assert_eq!(drain_creation_result(&mut env.view), Some(id.clone()));
+        } else {
+            insertion.expect("unreserved plain directory permits peer adoption");
+            assert!(canonical
+                .lifecycle_reservation
+                .as_ref()
+                .unwrap()
+                .resource_intent
+                .is_none());
+            assert_eq!(drain_creation_result(&mut env.view), None);
+            assert!(env.view.info_dialog.is_some());
+            assert_eq!(
+                env.view
+                    .get_instance(&owner_id)
+                    .map(|row| row.project_path.as_str()),
+                path.to_str()
+            );
+            assert!(env.view.get_instance(&id).is_none());
+        }
+        assert!(env.view.creating_provisional_group_paths.is_empty());
+        assert_eq!(std::fs::read(path.join("winner-marker")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(path.join("README.md")).unwrap(), b"test\n");
+        env.view.save().unwrap();
+        let (persisted, groups) = env.storage.load_with_groups().unwrap();
+        assert_eq!(persisted.len(), 1);
+        let expected_id = if managed { &id } else { &owner_id };
+        assert_eq!(&persisted[0].id, expected_id);
+        assert_ne!(persisted[0].status, Status::Creating);
+        assert_eq!(persisted[0].lifecycle_reservation, None);
+        assert!(groups.iter().any(|group| group.path == parent));
+        assert_eq!(groups.iter().any(|group| group.path == child), managed);
+        assert_eq!(
+            env.view
+                .group_trees
+                .get("default")
+                .unwrap()
+                .group_exists(child),
+            managed
+        );
+        if managed {
+            assert_eq!(persisted[0].created_at, canonical.created_at);
+            assert_eq!(
+                persisted[0].lifecycle_generation,
+                canonical.lifecycle_generation
+            );
+            let git = crate::git::GitWorktree::new(env.project_dir.clone()).unwrap();
+            assert!(git
+                .list_worktrees()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == path));
+            assert!(git.branch_exists("raced-worktree").unwrap());
+        }
+    }
 }
 
 #[test]
@@ -1526,11 +1390,11 @@ fn sandbox_pull_releases_root_and_revalidates_creation() {
         let escape = crate::session::environment::shell_escape;
         let script = format!(
             r#"#!/bin/sh
-case "$1" in
+case "" in
   context) printf '%s' '{{"Name":"default","Endpoints":{{"docker":{{"Host":"unix:///var/run/docker.sock"}}}}}}' ;;
   info|--version) exit 0 ;;
   container)
-    case "$2" in
+    case "" in
       inspect) printf '%s\n' 'Error response from daemon: No such container: fixture' >&2; exit 1 ;;
       rm|stop|start) exit 0 ;;
       *) printf 'unsupported container command: %s\n' "$*" >&2; exit 64 ;;
@@ -1549,7 +1413,7 @@ esac
 "#,
             attempt = escape(&root.join("pull-attempt").to_string_lossy()),
             ready = escape(&ready.to_string_lossy()),
-            release = escape(&release.to_string_lossy())
+            release = escape(&release.to_string_lossy()),
         );
         let _docker =
             crate::session::test_support::install_login_shell_path_command(root, "docker", &script);
@@ -1582,6 +1446,24 @@ esac
         } else {
             None
         };
+        let mut stub = Instance::new(&data.title, &data.path);
+        stub.source_profile = data.profile.clone();
+        stub.status = Status::Creating;
+        stub.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let provisional = std::sync::Arc::new(
+            crate::session::builder::ProvisionalCreation::capture(&env.storage, &stub).unwrap(),
+        );
+        env.storage
+            .update(|rows, _| {
+                rows.push(stub.clone());
+                Ok(())
+            })
+            .unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut poller = CreationPoller::new();
         poller
@@ -1590,12 +1472,12 @@ esac
                 existing_instances: vec![],
                 hooks,
                 cancel: cancel.clone(),
-                provisional_creation: None,
+                provisional_creation: Some(provisional),
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::yield_now();
         }
         let entered_pull = ready.exists();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1637,26 +1519,45 @@ esac
         peer.join().unwrap();
         assert!(
             entered_pull,
-            "{scenario}: the actual producer must reach the supervised pull: {:?}",
+            "{scenario}: producer must reach supervised pull: {:?}",
             outcome.result
         );
         assert!(
             available_during_pull,
-            "{scenario}: unrelated ownership mutations must progress while Docker is blocked"
+            "{scenario}: unrelated ownership mutations must progress during Docker wait"
         );
         match (scenario, outcome.result) {
             ("success" | "retry", CreationResult::Success(mut success)) => {
                 success.build_result.publish().unwrap();
+                let rows = env.storage.load().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, stub.id);
+                assert_eq!(rows[0].created_at, stub.created_at);
+                assert_eq!(rows[0].lifecycle_generation, stub.lifecycle_generation);
+                assert_ne!(rows[0].status, Status::Creating);
+                assert_eq!(rows[0].lifecycle_reservation, None);
             }
-            ("profile" | "checkout", CreationResult::Error(_)) => {
-                if let Some(bytes) = replacement_bytes {
-                    assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), bytes);
-                }
-                if scenario == "checkout" {
-                    assert!(root.join("moved-project").is_dir());
-                }
+            ("checkout", CreationResult::Success(mut success)) => {
+                assert!(success.build_result.publish().is_err());
+                success.build_result.rollback().unwrap();
+                assert!(env.storage.load().unwrap().is_empty());
+                assert_eq!(
+                    std::fs::read(root.join("moved-project/README.md")).unwrap(),
+                    b"test\n"
+                );
             }
-            ("cancel", CreationResult::Cancelled) => assert!(outcome.cancelled),
+            ("profile", CreationResult::Error(_)) => {
+                let bytes = replacement_bytes.expect("replacement profile persisted");
+                assert_eq!(std::fs::read(env.storage.sessions_path()).unwrap(), bytes);
+            }
+            ("cancel", CreationResult::Cancelled) => {
+                assert!(outcome.cancelled);
+                assert!(env.storage.load().unwrap().is_empty());
+                assert_eq!(
+                    std::fs::read(env.project_dir.join("README.md")).unwrap(),
+                    b"test\n"
+                );
+            }
             (_, result) => panic!("{scenario}: unexpected producer outcome: {result:?}"),
         }
     }

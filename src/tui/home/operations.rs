@@ -3,8 +3,8 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, GroupTree, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
+    duplicate_session_error, is_duplicate_session, list_profiles, GroupMovePlan, GroupTree,
+    Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -364,24 +364,29 @@ impl HomeView {
             }
         }
 
-        // Identity-changing edits follow the global lock order: app-wide identity, then
-        // session title and source lifecycle. Hold both through the profile transaction.
-        let profile_move_identity = if profile_move_target.is_some() {
-            Some(acquire_session_identity_lock()?)
-        } else {
-            None
-        };
-        let profile_move_guards = if profile_move_target.is_some() {
-            Some(self.lock_session_mutation_and_reload(&id)?)
-        } else {
-            None
-        };
+        let profile_move_ownership = profile_move_target
+            .as_ref()
+            .map(|_| crate::session::storage::acquire_ownership_lock())
+            .transpose()?;
+        let profile_move_identity = profile_move_ownership
+            .as_ref()
+            .map(crate::session::storage::acquire_session_identity_lock_with_ownership)
+            .transpose()?;
+        let profile_move_guards = profile_move_ownership
+            .as_ref()
+            .map(|ownership| self.lock_session_mutation_and_reload_with_ownership(ownership, &id))
+            .transpose()?;
         let restart_edit_authoritative = self
             .get_instance(&id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        if let Some(target_profile) = profile_move_target.as_deref() {
-            let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
+        if let (Some(target_profile), Some(ownership)) = (
+            profile_move_target.as_deref(),
+            profile_move_ownership.as_ref(),
+        ) {
+            let target_rows =
+                Storage::open_with_ownership(target_profile, self.file_watch.clone(), ownership)?
+                    .load_strict_for_worktree_ownership()?;
             if is_duplicate_session(
                 target_rows.iter(),
                 &restart_edit_authoritative.title,
@@ -410,11 +415,18 @@ impl HomeView {
 
         // A cross-profile restart stages on a detached candidate: do not persist a tool
         // swap into the source row before the target transaction accepts it.
-        if let Some(target_profile) = profile_move_target.as_deref() {
+        if let (Some(target_profile), Some(ownership)) = (
+            profile_move_target.as_deref(),
+            profile_move_ownership.as_ref(),
+        ) {
             if !self.storages.contains_key(target_profile) {
                 self.storages.insert(
                     target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
+                    Storage::open_with_ownership(
+                        target_profile,
+                        self.file_watch.clone(),
+                        ownership,
+                    )?,
                 );
             }
 
@@ -437,7 +449,9 @@ impl HomeView {
             if let Some(extra) = new_extra_args {
                 requested.extra_args = extra.to_string();
             }
-            self.move_to_profile(
+            requested.touch_last_accessed();
+            self.move_to_profile_with_ownership(
+                ownership,
                 &id,
                 target_profile,
                 requested,
@@ -452,7 +466,6 @@ impl HomeView {
                     carry.retarget(conversation_carry::conversation_ids(moved));
                 }
             }
-            self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
             // snooze flag so persisted state matches the visible restart.
@@ -489,16 +502,16 @@ impl HomeView {
             }
         }
         self.restart_cooldown_at.insert(id.clone(), now);
-        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
-
-        // Persist profile/tool/command and the access timestamp while the durable row
-        // still carries its prior lifecycle. The worker owns the Starting reservation;
-        // publishing that status here would make it reject its own request.
-        self.save()?;
-        // The canonical profile locks are already released; publish the final launch
-        // edit while identity, title and lifecycle are still guarded.
-        drop(profile_move_identity);
+        if profile_move_target.is_none() {
+            self.mutate_instance(&id, |inst| inst.touch_last_accessed());
+            self.save()?;
+        }
         drop(profile_move_guards);
+        drop(profile_move_identity);
+        drop(profile_move_ownership);
+        if profile_move_target.is_some() {
+            self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+        }
 
         // The cascade shells out to docker and runs the before_start hook, so it stays
         // off the event loop: show Starting locally, let the worker reserve and persist
@@ -1024,11 +1037,14 @@ impl HomeView {
                 );
             }
 
-            let identity_guard = acquire_session_identity_lock()?;
+            let ownership = crate::session::storage::acquire_ownership_lock()?;
+            let identity_guard =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
             affected_ids.sort();
             let mut mutation_guards = Vec::with_capacity(affected_ids.len());
             for id in &affected_ids {
-                mutation_guards.push(self.lock_session_mutation_and_reload(id)?);
+                mutation_guards
+                    .push(self.lock_session_mutation_and_reload_with_ownership(&ownership, id)?);
                 let authoritative = self
                     .get_instance(id)
                     .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
@@ -1084,7 +1100,11 @@ impl HomeView {
             if !self.storages.contains_key(target_profile) {
                 self.storages.insert(
                     target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
+                    Storage::open_with_ownership(
+                        target_profile,
+                        self.file_watch.clone(),
+                        &ownership,
+                    )?,
                 );
             }
             // Run the transaction for its durable effect only: the reload below
@@ -1099,7 +1119,8 @@ impl HomeView {
                     .get(target_profile)
                     .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
                 let group_move = GroupMovePlan::subtree(&ctx.old_path, new_path);
-                source.move_instances_to(
+                source.move_instances_to_with_ownership(
+                    &ownership,
                     target,
                     &changes,
                     &group_move,
@@ -1125,9 +1146,10 @@ impl HomeView {
                     },
                 )?;
             }
-            self.reload_preserving_profile_move_runtime(&affected_ids)?;
-            drop(identity_guard);
             drop(mutation_guards);
+            drop(identity_guard);
+            drop(ownership);
+            self.reload_preserving_profile_move_runtime(&affected_ids)?;
             return Ok(());
         }
 

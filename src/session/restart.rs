@@ -192,16 +192,15 @@ mod tests {
             let replacement = if replace {
                 crate::session::create_profile(profile).unwrap();
                 let replacement = crate::session::Storage::open_unwatched(profile).unwrap();
+                let mut replacement_row = instance.clone();
+                replacement_row.created_at += chrono::Duration::seconds(1);
                 replacement
                     .update(|rows, _| {
-                        rows.push(instance.clone());
+                        rows.push(replacement_row.clone());
                         Ok(())
                     })
                     .unwrap();
-                Some((
-                    replacement.sessions_path().to_path_buf(),
-                    std::fs::read(replacement.sessions_path()).unwrap(),
-                ))
+                Some((replacement, replacement_row))
             } else {
                 None
             };
@@ -222,8 +221,21 @@ mod tests {
                 result.outcome.is_err(),
                 "restart accepted a replacement profile"
             );
-            if let Some((path, bytes)) = replacement {
-                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            if let Some((replacement, expected)) = replacement {
+                let rows = replacement.load_strict_for_worktree_ownership().unwrap();
+                assert_eq!(rows.len(), 1);
+                let current = &rows[0];
+                assert_eq!(current.id, expected.id);
+                assert_eq!(current.created_at, expected.created_at);
+                assert_eq!(current.title, expected.title);
+                assert_eq!(current.project_path, expected.project_path);
+                assert_eq!(current.group_path, expected.group_path);
+                assert_eq!(current.lifecycle_generation, expected.lifecycle_generation);
+                assert_eq!(
+                    current.lifecycle_reservation,
+                    expected.lifecycle_reservation
+                );
+                assert_eq!(current.status, expected.status);
             } else {
                 assert!(
                     !crate::session::get_profile_dir_path(profile)

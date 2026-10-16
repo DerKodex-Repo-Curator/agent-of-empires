@@ -18,9 +18,6 @@ const PATH_VAR = /^[A-Z][A-Z0-9_]*_(HOME|DIR|DB|PATH|CREDENTIALS)$/;
 /** All of git's namespace is host state, mostly without a path suffix, so drop it by prefix. */
 const GIT_VAR = /^GIT_/;
 
-/** Native Git protocol and fixture controls belong to one subprocess invocation. */
-const NATIVE_GIT_VAR = /^AOE_(NATIVE_GIT_|TEST_NATIVE_)/;
-
 /** Host state read under names the rules above cannot see. */
 export const HOST_STATE_VARS = new Set([
   // Raises logging to debug when AOE_LOG_LEVEL is unset.
@@ -106,7 +103,7 @@ export function isolateEnv(parentEnv: NodeJS.ProcessEnv, paths: IsolatedPaths): 
       continue;
     }
     if (HOST_STATE_VARS.has(name)) continue;
-    if (PATH_VAR.test(name) || GIT_VAR.test(name) || NATIVE_GIT_VAR.test(name)) continue;
+    if (PATH_VAR.test(name) || GIT_VAR.test(name)) continue;
     env[name] = value;
   }
   return {

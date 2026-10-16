@@ -381,10 +381,6 @@ pub(crate) fn trash_transition(
         for index in 1..request.effect_count {
             run_transition_effect(&request.transaction, &request.instance, index)?;
         }
-        #[cfg(test)]
-        if let Some(hook) = BEFORE_TRASH_EXCLUSIVE.with(|slot| slot.borrow_mut().take()) {
-            hook();
-        }
         let root = acquire_ownership_lock()?;
         let _identity = acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle = request
@@ -408,11 +404,6 @@ pub(crate) fn trash_transition(
     } else {
         Ok(RelocateOutcome::Skipped)
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static BEFORE_TRASH_EXCLUSIVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug)]
@@ -1097,12 +1088,6 @@ mod tests {
             relocate_fixture(&mut instance),
             RelocateOutcome::Relocated { .. }
         ));
-        storage
-            .update(|rows, _| {
-                rows.push(instance.clone());
-                Ok(())
-            })
-            .unwrap();
         (tmp, storage, instance)
     }
 
@@ -1137,98 +1122,173 @@ mod tests {
         assert_eq!(restored.color.as_deref(), Some("blue"));
         assert!(Path::new(&restored.project_path).join(".git").exists());
         assert!(!Path::new(&baseline.project_path).exists());
-        assert!(!storage.load().unwrap()[0].is_trashed());
+        let durable = storage.load().unwrap().remove(0);
+        assert!(!durable.is_trashed());
+        assert_eq!(durable.project_path, restored.project_path);
+        assert_eq!(durable.status, crate::session::Status::Stopped);
+        assert_eq!(durable.color.as_deref(), Some("blue"));
+        assert_eq!(durable.created_at, restored.created_at);
+        assert_eq!(durable.lifecycle_generation, restored.lifecycle_generation);
+        assert!(durable.lifecycle_reservation.is_none());
     }
 
     #[test]
     #[serial_test::serial]
     fn restore_revalidates_incarnation_generation_profile_checkout_and_peer_claims() {
-        for change in [
-            "incarnation",
-            "generation",
-            "profile",
-            "checkout",
-            "destination-owner",
-        ] {
+        for change in ["incarnation", "generation"] {
             let _app = crate::session::test_support::isolate_app_dir();
-            let (tmp, storage, baseline) = stored_restore_fixture();
+            let (_tmp, storage, baseline) = stored_restore_fixture();
+            storage
+                .update(|rows, _| {
+                    if change == "incarnation" {
+                        rows[0].created_at += chrono::Duration::seconds(1);
+                    } else {
+                        rows[0].try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Trash,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now(),
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let current = storage.load().unwrap().remove(0);
+            assert!(matches!(
+                restore_transition(&storage, &baseline, None),
+                Err(RestoreError::Busy(_))
+            ));
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+            assert!(Path::new(&baseline.project_path).join(".git").exists());
+            assert!(!Path::new(baseline.pre_trash_project_path.as_ref().unwrap()).exists());
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(durable.created_at, current.created_at);
+            assert_eq!(durable.lifecycle_generation, current.lifecycle_generation);
+            assert_eq!(durable.lifecycle_reservation, current.lifecycle_reservation);
+            if change == "generation" {
+                assert!(durable.lifecycle_reservation_is_owned(
+                    LifecycleOperation::Trash,
+                    baseline.lifecycle_generation + 1,
+                ));
+            }
+        }
+
+        for change in ["incarnation", "generation", "profile", "destination-owner"] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let (_tmp, storage, baseline) = stored_restore_fixture();
             let peer = crate::session::Storage::new_unwatched("peer").unwrap();
             let edited = storage.clone();
-            let original = baseline.clone();
-            let retired = tmp.path().join("retired");
-            let result = with_restore_preflight_for_test(
-                move |reserved| match change {
-                    "incarnation" | "generation" => edited
-                        .update(|rows, _| {
+            let restored = with_restore_preflight_for_test(
+                move |reserved| {
+                    let before = std::fs::read(edited.sessions_path()).unwrap();
+                    let peer_before = std::fs::read(peer.sessions_path()).ok();
+                    let marker = reserved.lifecycle_reservation.as_ref().unwrap();
+                    assert!(marker.resource_intent.is_some());
+                    let error = match change {
+                        "incarnation" | "generation" => edited.update(|rows, _| {
                             if change == "incarnation" {
                                 rows[0].created_at += chrono::Duration::seconds(1);
                             } else {
                                 rows[0].release_lifecycle_reservation_if_owned(
-                                    crate::session::LifecycleOperation::Restore,
+                                    LifecycleOperation::Restore,
                                     reserved.lifecycle_generation,
                                 );
                                 rows[0].try_acquire_lifecycle_reservation(
-                                    crate::session::LifecycleOperation::Trash,
+                                    LifecycleOperation::Trash,
                                     Instance::LIFECYCLE_RESERVATION_TTL,
                                     Utc::now(),
                                 )?;
                             }
                             Ok(())
-                        })
-                        .unwrap(),
-                    "profile" => {
-                        let directory = edited.sessions_path().parent().unwrap();
-                        std::fs::rename(directory, &retired).unwrap();
-                        std::fs::create_dir(directory).unwrap();
-                        crate::session::Storage::new_unwatched("default").unwrap();
-                    }
-                    "checkout" => {
-                        std::fs::rename(&reserved.project_path, &retired).unwrap();
-                        std::fs::create_dir(&reserved.project_path).unwrap();
-                        std::fs::write(
-                            Path::new(&reserved.project_path).join("replacement"),
-                            "keep",
-                        )
-                        .unwrap();
-                    }
-                    "destination-owner" => peer
-                        .update(|rows, _| {
-                            let mut adopter = Instance::new(
+                        }),
+                        "profile" => crate::session::rename_profile("default", "renamed"),
+                        "destination-owner" => peer.update(|rows, _| {
+                            rows.push(Instance::new(
                                 "adopter",
-                                original.pre_trash_project_path.as_ref().unwrap(),
-                            );
-                            adopter.source_profile = "peer".into();
-                            rows.push(adopter);
+                                reserved.pre_trash_project_path.as_ref().unwrap(),
+                            ));
                             Ok(())
-                        })
-                        .unwrap(),
-                    _ => unreachable!(),
+                        }),
+                        _ => unreachable!(),
+                    }
+                    .unwrap_err();
+                    assert!(error.to_string().contains("busy"), "{change}: {error:#}");
+                    if change == "profile" {
+                        let error = crate::session::delete_profile("default").unwrap_err();
+                        assert!(error.to_string().contains("busy"));
+                        assert!(crate::session::get_profile_dir_path("default")
+                            .unwrap()
+                            .is_dir());
+                        assert!(!crate::session::get_profile_dir_path("renamed")
+                            .unwrap()
+                            .exists());
+                    }
+                    assert_eq!(std::fs::read(edited.sessions_path()).unwrap(), before);
+                    assert_eq!(std::fs::read(peer.sessions_path()).ok(), peer_before);
+                    let durable = edited.load().unwrap().remove(0);
+                    assert_eq!(durable.created_at, reserved.created_at);
+                    assert_eq!(durable.lifecycle_generation, reserved.lifecycle_generation);
+                    assert_eq!(
+                        durable.lifecycle_reservation,
+                        reserved.lifecycle_reservation
+                    );
+                    assert_eq!(durable.project_path, reserved.project_path);
+                    assert!(peer.load().unwrap().is_empty());
+                    assert!(Path::new(&reserved.project_path).join(".git").exists());
+                    assert!(!Path::new(reserved.pre_trash_project_path.as_ref().unwrap()).exists());
                 },
                 || restore_transition(&storage, &baseline, None),
+            )
+            .unwrap();
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(restored.created_at, baseline.created_at);
+            assert_eq!(
+                restored.lifecycle_generation,
+                baseline.lifecycle_generation + 1
             );
-            assert!(result.is_err(), "{change}");
-            assert!(
-                !Path::new(baseline.pre_trash_project_path.as_ref().unwrap()).exists(),
-                "{change}: no move"
+            assert_eq!(
+                restored.project_path,
+                *baseline.pre_trash_project_path.as_ref().unwrap()
             );
-            assert!(
-                Path::new(&baseline.project_path).exists(),
-                "{change}: source preserved"
-            );
-            if change == "generation" {
-                assert!(storage.load().unwrap()[0].lifecycle_reservation_is_owned(
-                    crate::session::LifecycleOperation::Trash,
-                    baseline.lifecycle_generation + 2,
-                ));
-            }
-            if change == "checkout" {
-                assert_eq!(
-                    std::fs::read_to_string(Path::new(&baseline.project_path).join("replacement"))
-                        .unwrap(),
-                    "keep"
-                );
-            }
+            assert!(!restored.is_trashed());
+            assert!(restored.lifecycle_reservation.is_none());
+            assert!(restored.pre_trash_project_path.is_none());
+            assert_eq!(durable.project_path, restored.project_path);
+            assert_eq!(durable.created_at, restored.created_at);
+            assert_eq!(durable.lifecycle_generation, restored.lifecycle_generation);
+            assert!(durable.lifecycle_reservation.is_none());
+            assert!(!durable.is_trashed());
+            assert!(Path::new(&restored.project_path).join(".git").exists());
+            assert!(!Path::new(&baseline.project_path).exists());
         }
+
+        let _app = crate::session::test_support::isolate_app_dir();
+        let (tmp, storage, baseline) = stored_restore_fixture();
+        let retired = tmp.path().join("retired");
+        let saved = retired.clone();
+        let result = with_restore_preflight_for_test(
+            move |reserved| {
+                std::fs::rename(&reserved.project_path, &saved).unwrap();
+                std::fs::create_dir(&reserved.project_path).unwrap();
+                std::fs::write(
+                    Path::new(&reserved.project_path).join("replacement"),
+                    "keep",
+                )
+                .unwrap();
+            },
+            || restore_transition(&storage, &baseline, None),
+        );
+        assert!(result.is_err());
+        assert!(!Path::new(baseline.pre_trash_project_path.as_ref().unwrap()).exists());
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&baseline.project_path).join("replacement")).unwrap(),
+            "keep",
+        );
+        assert!(retired.join(".git").exists());
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.project_path, baseline.project_path);
+        assert_eq!(durable.created_at, baseline.created_at);
+        assert!(durable.is_trashed());
     }
 
     fn default_branch_worktree_instance() -> (tempfile::TempDir, Instance) {
@@ -1801,88 +1861,156 @@ mod tests {
 
     #[test]
     fn trash_revalidates_recreated_owner_and_adoption_after_shared_phase() {
-        for change in ["identity", "generation", "adoption", "checkout", "profile"] {
-            let _app_guard = crate::session::test_support::isolate_app_dir();
+        for change in ["identity", "generation"] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            let (_tmp, instance) = real_worktree_instance();
+            let original = PathBuf::from(&instance.project_path);
+            let (baseline, generation) = unbound_trash_fixture(&storage, instance);
+            storage
+                .update(|rows, _| {
+                    if change == "identity" {
+                        rows[0].created_at += chrono::Duration::seconds(1);
+                    } else {
+                        rows[0].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                        rows[0].try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Restore,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            Utc::now(),
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let current = storage.load().unwrap().remove(0);
+            assert!(prepare_trash(&storage, &baseline, generation).is_err());
+            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+            assert!(original.join(".git").exists());
+            assert!(!trash_holding_path(&original, &baseline.id)
+                .unwrap()
+                .exists());
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(durable.created_at, current.created_at);
+            assert_eq!(durable.lifecycle_generation, current.lifecycle_generation);
+            assert_eq!(durable.lifecycle_reservation, current.lifecycle_reservation);
+            if change == "generation" {
+                assert!(durable
+                    .lifecycle_reservation_is_owned(LifecycleOperation::Restore, generation + 1));
+            }
+        }
+
+        for change in ["identity", "generation", "adoption", "profile"] {
+            let _app = crate::session::test_support::isolate_app_dir();
             let storage = crate::session::Storage::new_unwatched("default").unwrap();
             let peer = crate::session::Storage::new_unwatched("peer").unwrap();
-            let writer = peer.clone();
             let (_tmp, instance) = real_worktree_instance();
             let original = PathBuf::from(&instance.project_path);
             let request = reserved_request(&storage, instance);
-            let owner = storage.clone();
-            let id = request.session_id.clone();
-            let path = original.clone();
-            BEFORE_TRASH_EXCLUSIVE.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(move || match change {
-                    "identity" => {
-                        owner
-                            .update(|rows, _| {
-                                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
-                                row.created_at += chrono::Duration::seconds(1);
-                                Ok(())
-                            })
-                            .unwrap();
-                    }
-                    "generation" => {
-                        owner
-                            .update(|rows, _| {
-                                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
-                                let generation = row.lifecycle_generation;
-                                row.release_lifecycle_reservation_if_owned(
-                                    crate::session::LifecycleOperation::Trash,
-                                    generation,
-                                );
-                                row.try_acquire_lifecycle_reservation(
-                                    crate::session::LifecycleOperation::Restore,
-                                    Instance::LIFECYCLE_RESERVATION_TTL,
-                                    Utc::now(),
-                                )?;
-                                Ok(())
-                            })
-                            .unwrap();
-                    }
-                    "adoption" => {
-                        writer
-                            .update(|rows, _| {
-                                rows.push(Instance::new("adopter", path.to_str().unwrap()));
-                                Ok(())
-                            })
-                            .unwrap();
-                    }
-                    "checkout" => {
-                        std::fs::rename(&path, path.with_extension("original")).unwrap();
-                        std::fs::create_dir(&path).unwrap();
-                        std::fs::write(path.join("sentinel"), "replacement").unwrap();
-                    }
-                    "profile" => {
-                        crate::session::rename_profile("default", "renamed").unwrap();
-                    }
+            let holding = trash_holding_path(&original, &request.session_id).unwrap();
+            let result = trash_transition(&request, |reserved| {
+                assert!(original.join(".git").exists());
+                assert!(!holding.exists());
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                let peer_before = std::fs::read(peer.sessions_path()).ok();
+                assert!(reserved
+                    .lifecycle_reservation
+                    .as_ref()
+                    .unwrap()
+                    .resource_intent
+                    .is_some());
+                let error = match change {
+                    "identity" | "generation" => storage.update(|rows, _| {
+                        if change == "identity" {
+                            rows[0].created_at += chrono::Duration::seconds(1);
+                        } else {
+                            rows[0].release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Trash,
+                                request.generation,
+                            );
+                            rows[0].try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Restore,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                Utc::now(),
+                            )?;
+                        }
+                        Ok(())
+                    }),
+                    "adoption" => peer.update(|rows, _| {
+                        rows.push(Instance::new("adopter", original.to_str().unwrap()));
+                        Ok(())
+                    }),
+                    "profile" => crate::session::rename_profile("default", "renamed"),
                     _ => unreachable!(),
-                }))
-            });
-            let result = trash_transition(&request, |inst| {
-                assert!(Path::new(&inst.project_path).exists());
+                }
+                .unwrap_err();
+                assert!(error.to_string().contains("busy"), "{change}: {error:#}");
+                if change == "profile" {
+                    let error = crate::session::delete_profile("default").unwrap_err();
+                    assert!(error.to_string().contains("busy"));
+                    assert!(crate::session::get_profile_dir_path("default")
+                        .unwrap()
+                        .is_dir());
+                    assert!(!crate::session::get_profile_dir_path("renamed")
+                        .unwrap()
+                        .exists());
+                }
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                assert_eq!(std::fs::read(peer.sessions_path()).ok(), peer_before);
+                let durable = storage.load().unwrap().remove(0);
+                assert_eq!(durable.created_at, reserved.created_at);
+                assert_eq!(durable.lifecycle_generation, request.generation);
+                assert_eq!(
+                    durable.lifecycle_reservation,
+                    reserved.lifecycle_reservation
+                );
+                assert_eq!(durable.project_path, reserved.project_path);
                 peer.update(|rows, _| {
                     rows.push(Instance::new("metadata writer", "/unrelated"));
                     Ok(())
                 })
                 .unwrap();
             });
-            assert!(
-                !matches!(result, Ok(RelocateOutcome::Relocated { .. })),
-                "{change}: stale trash moved checkout"
-            );
-            assert!(original.exists());
-            assert!(!trash_holding_path(&original, &request.session_id)
-                .unwrap()
-                .exists());
-            if change == "generation" {
-                assert!(storage.load().unwrap()[0].lifecycle_reservation_is_owned(
-                    crate::session::LifecycleOperation::Restore,
-                    request.generation + 1,
-                ));
-            }
+            assert!(matches!(result, Ok(RelocateOutcome::Relocated { .. })));
+            assert!(!original.exists());
+            assert!(holding.join(".git").exists());
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(durable.created_at, request.instance.created_at);
+            assert_eq!(durable.lifecycle_generation, request.generation);
+            assert_eq!(durable.project_path, holding.to_string_lossy());
+            assert_eq!(durable.pre_trash_project_path.as_deref(), original.to_str());
+            assert!(durable.lifecycle_reservation.is_none());
+            let peers = peer.load().unwrap();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].project_path, "/unrelated");
         }
+
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let (_tmp, instance) = real_worktree_instance();
+        let original = PathBuf::from(&instance.project_path);
+        let retired = original.with_extension("retired");
+        let request = reserved_request(&storage, instance);
+        let holding = trash_holding_path(&original, &request.session_id).unwrap();
+        let result = trash_transition(&request, |_| {
+            std::fs::rename(&original, &retired).unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("sentinel"), "replacement").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(original.join("sentinel")).unwrap(),
+            "replacement"
+        );
+        assert!(retired.join(".git").exists());
+        assert!(!holding.exists());
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.project_path, request.instance.project_path);
+        assert_eq!(durable.created_at, request.instance.created_at);
+        assert_eq!(durable.lifecycle_generation, request.generation);
     }
 
     #[test]
@@ -1929,12 +2057,15 @@ mod tests {
         );
         assert!(matches!(outcome, Ok(RelocateOutcome::Relocated { .. })));
     }
-    fn reserved_request(storage: &crate::session::Storage, mut instance: Instance) -> TrashRequest {
+    fn unbound_trash_fixture(
+        storage: &crate::session::Storage,
+        mut instance: Instance,
+    ) -> (Instance, u64) {
         instance.source_profile = storage.profile().to_string();
         instance.trash();
         let generation = instance
             .try_acquire_lifecycle_reservation(
-                crate::session::LifecycleOperation::Trash,
+                LifecycleOperation::Trash,
                 Instance::LIFECYCLE_RESERVATION_TTL,
                 Utc::now(),
             )
@@ -1945,6 +2076,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        (instance, generation)
+    }
+
+    fn reserved_request(storage: &crate::session::Storage, instance: Instance) -> TrashRequest {
+        let (instance, generation) = unbound_trash_fixture(storage, instance);
         prepare_trash(storage, &instance, generation).unwrap()
     }
 
@@ -1988,60 +2124,77 @@ mod tests {
         let peer = crate::session::Storage::new_unwatched("peer").unwrap();
         let (_tmp, instance) = real_worktree_instance();
         let original = PathBuf::from(&instance.project_path);
-        // The same id in a different physical profile is still a peer owner.
         peer.update(|instances, _groups| {
             instances.push(instance.clone());
             Ok(())
         })
         .unwrap();
+        let peer_before = std::fs::read(peer.sessions_path()).unwrap();
         let request = reserved_request(&storage, instance);
         let result = perform_trash(&request);
         assert!(result.relocation.is_none());
-        assert!(result
-            .relocate_warning
-            .as_deref()
-            .unwrap()
-            .contains("shared or unknown"));
+        assert!(result.relocate_warning.is_some());
         assert!(original.join(".git").exists());
-        assert!(!trash_holding_path(&original, &request.session_id)
-            .unwrap()
-            .exists());
+        let holding = trash_holding_path(&original, &request.session_id).unwrap();
+        assert!(!holding.exists());
+        let before = std::fs::read(storage.sessions_path()).unwrap();
         assert!(reconcile_trashed_profile("default").unwrap().is_empty());
         let mut durable = storage.load().unwrap().remove(0);
-        assert!(!reconcile_trashed_transition(&storage, &mut durable).unwrap());
+        let generation = durable.lifecycle_generation;
+        let reservation = durable.lifecycle_reservation.clone();
+        assert!(reconcile_trashed_transition(&storage, &mut durable).is_err());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), peer_before);
+        assert_eq!(durable.lifecycle_generation, generation);
+        assert_eq!(durable.lifecycle_reservation, reservation);
+        assert!(durable.pre_trash_project_path.is_none());
         assert_eq!(durable.project_path, request.instance.project_path);
         assert_eq!(
             peer.load().unwrap()[0].project_path,
             request.instance.project_path
         );
         assert!(original.join(".git").exists());
+        assert!(!holding.exists());
     }
 
     #[test]
     fn trash_relocation_refuses_unknown_peer_inventory() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
-        let _peer = crate::session::Storage::new_unwatched("peer").unwrap();
+        let peer = crate::session::Storage::new_unwatched("peer").unwrap();
         let (_tmp, instance) = real_worktree_instance();
         let original = PathBuf::from(&instance.project_path);
         let request = reserved_request(&storage, instance);
-        std::fs::write(
-            crate::session::get_profile_dir_path("peer")
-                .unwrap()
-                .join("sessions.json"),
-            "[null]",
-        )
-        .unwrap();
-        let result = perform_trash(&request);
-        assert!(result.relocation.is_none());
-        assert!(result
-            .relocate_warning
-            .as_deref()
-            .unwrap()
-            .contains("shared or unknown"));
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        std::fs::write(peer.sessions_path(), "[null]").unwrap();
+        let result = trash_transition(&request, |_| {
+            panic!("unreadable peers must refuse teardown")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), b"[null]");
         assert!(original.join(".git").exists());
+        let holding = trash_holding_path(&original, &request.session_id).unwrap();
+        assert!(!holding.exists());
         assert!(reconcile_trashed_profile("default").unwrap().is_empty());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(std::fs::read(peer.sessions_path()).unwrap(), b"[null]");
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.lifecycle_generation, request.generation);
+        assert_eq!(
+            durable.lifecycle_reservation,
+            request.instance.lifecycle_reservation
+        );
+        assert!(crate::session::move_journal::resource_inventory()
+            .unwrap()
+            .iter()
+            .any(|(_, entry)| entry.ids.contains(&request.session_id)
+                && matches!(
+                    &entry.authority,
+                    crate::session::move_journal::MoveAuthority::Resource { .. }
+                )));
         assert!(original.join(".git").exists());
+        assert!(!holding.exists());
     }
 
     #[test]
@@ -2103,77 +2256,120 @@ mod tests {
     fn queued_trash_cannot_target_replacement_profile() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
-        let (tmp, instance) = real_worktree_instance();
+        let (_tmp, instance) = real_worktree_instance();
         let original = PathBuf::from(&instance.project_path);
         let request = reserved_request(&storage, instance);
+        let holding = trash_holding_path(&original, &request.session_id).unwrap();
         let profile_dir = crate::session::get_profile_dir_path("default").unwrap();
-        std::fs::rename(&profile_dir, tmp.path().join("retired-profile")).unwrap();
-        let replacement = crate::session::Storage::new_unwatched("default").unwrap();
-        replacement
-            .update(|instances, _groups| {
-                instances.push(request.instance.clone());
-                Ok(())
-            })
-            .unwrap();
-        let before = std::fs::read(profile_dir.join("sessions.json")).unwrap();
-        let result = perform_trash(&request);
-        assert!(result.relocation.is_none());
-        assert!(result
-            .relocate_warning
-            .as_deref()
-            .unwrap()
-            .contains("profile directory changed"));
-        assert!(reconcile_trashed_storage(&request.storage).is_err());
-        let mut snapshot = request.instance.clone();
-        assert!(reconcile_trashed_transition(&request.storage, &mut snapshot).is_err());
-        assert_eq!(
-            std::fs::read(profile_dir.join("sessions.json")).unwrap(),
-            before
-        );
-        assert!(original.join(".git").exists());
-        assert!(!trash_holding_path(&original, &request.session_id)
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        let unrelated = crate::session::Storage::new_unwatched("unrelated").unwrap();
+        assert!(unrelated.load().unwrap().is_empty());
+        let rename = crate::session::rename_profile("default", "renamed").unwrap_err();
+        assert!(rename.to_string().contains("busy"));
+        let delete = crate::session::delete_profile("default").unwrap_err();
+        assert!(delete.to_string().contains("busy"));
+        assert!(profile_dir.is_dir());
+        assert!(!crate::session::get_profile_dir_path("renamed")
             .unwrap()
             .exists());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.created_at, request.instance.created_at);
+        assert_eq!(durable.lifecycle_generation, request.generation);
+        assert_eq!(
+            durable.lifecycle_reservation,
+            request.instance.lifecycle_reservation
+        );
+        assert!(original.join(".git").exists());
+        assert!(!holding.exists());
+        let result = perform_trash(&request);
+        assert!(result.relocation.is_some());
+        assert!(result.relocate_warning.is_none());
+        assert!(!original.exists());
+        assert!(holding.join(".git").exists());
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.created_at, request.instance.created_at);
+        assert_eq!(durable.lifecycle_generation, request.generation);
+        assert_eq!(durable.project_path, holding.to_string_lossy());
+        assert_eq!(durable.pre_trash_project_path.as_deref(), original.to_str());
+        assert!(durable.lifecycle_reservation.is_none());
+        assert!(unrelated.load().unwrap().is_empty());
     }
 
     #[test]
     fn queued_trash_revalidates_path_even_when_generation_is_unchanged() {
+        {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            let (_tmp, instance) = real_worktree_instance();
+            let original = PathBuf::from(&instance.project_path);
+            let (_other, other) = real_worktree_instance();
+            let (baseline, generation) = unbound_trash_fixture(&storage, instance);
+            storage
+                .update(|rows, _| {
+                    rows[0].project_path.clone_from(&other.project_path);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(prepare_trash(&storage, &baseline, generation).is_err());
+            let durable = storage.load().unwrap().remove(0);
+            assert_eq!(durable.project_path, other.project_path);
+            assert_eq!(durable.created_at, baseline.created_at);
+            assert_eq!(durable.lifecycle_generation, generation);
+            assert!(durable.lifecycle_reservation.is_none());
+            assert!(original.join(".git").exists());
+            assert!(Path::new(&other.project_path).join(".git").exists());
+            assert!(!trash_holding_path(&original, &baseline.id)
+                .unwrap()
+                .exists());
+        }
+
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
         let (_tmp, instance) = real_worktree_instance();
         let original = PathBuf::from(&instance.project_path);
         let (_other, other) = real_worktree_instance();
         let request = reserved_request(&storage, instance);
-        storage
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        let error = storage
             .update(|instances, _groups| {
-                instances[0].project_path = other.project_path.clone();
+                instances[0].project_path.clone_from(&other.project_path);
                 Ok(())
             })
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("busy"));
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.project_path, request.instance.project_path);
+        assert_eq!(durable.lifecycle_generation, request.generation);
+        assert_eq!(
+            durable.lifecycle_reservation,
+            request.instance.lifecycle_reservation
+        );
         let result = perform_trash(&request);
-        assert!(result.relocation.is_none());
-        assert!(result
-            .relocate_warning
-            .as_deref()
-            .unwrap()
-            .contains("superseded"));
-        assert!(original.join(".git").exists());
+        assert!(result.relocation.is_some());
+        assert!(result.relocate_warning.is_none());
+        let holding = trash_holding_path(&original, &request.session_id).unwrap();
+        assert!(!original.exists());
+        assert!(holding.join(".git").exists());
         assert!(Path::new(&other.project_path).join(".git").exists());
-        assert_eq!(storage.load().unwrap()[0].project_path, other.project_path);
-        assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
-        assert!(!trash_holding_path(&original, &request.session_id)
-            .unwrap()
-            .exists());
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(durable.project_path, holding.to_string_lossy());
+        assert_eq!(durable.pre_trash_project_path.as_deref(), original.to_str());
+        assert_eq!(durable.created_at, request.instance.created_at);
+        assert_eq!(durable.lifecycle_generation, request.generation);
+        assert!(durable.lifecycle_reservation.is_none());
     }
 
     #[test]
     #[serial_test::serial]
-    fn pointer_repair_keeps_bare_directory_contract_but_rejects_replacement() {
+    fn pointer_repair_preserves_bare_directory_and_is_idempotent() {
         let _app = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
         let storage = crate::session::Storage::new_unwatched("owner").unwrap();
         let original = project.path().join("topic");
         let mut row = Instance::new("trashed", original.to_str().unwrap());
+        row.source_profile = storage.profile().to_owned();
         row.worktree_info = Some(crate::session::WorktreeInfo {
             branch: "topic".into(),
             main_repo_path: project.path().to_string_lossy().into_owned(),
@@ -2182,6 +2378,7 @@ mod tests {
             base_branch: None,
         });
         row.trash();
+        let baseline = row.clone();
         let holding = trash_holding_path(&original, &row.id).unwrap();
         std::fs::create_dir_all(&holding).unwrap();
         std::fs::write(holding.join("original"), b"keep").unwrap();
@@ -2191,23 +2388,29 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let replaced = holding.clone();
-        let retired = project.path().join("retired");
-        let saved = retired.clone();
-        let result = with_restore_preflight_for_test(
-            move |_| {
-                std::fs::rename(&replaced, &saved).unwrap();
-                std::fs::create_dir(&replaced).unwrap();
-                std::fs::write(replaced.join("foreign"), b"preserve").unwrap();
-            },
-            || reconcile_trashed_transition(&storage, &mut row),
+        assert!(reconcile_trashed_transition(&storage, &mut row).unwrap());
+        let durable = storage.load().unwrap().remove(0);
+        assert_eq!(row.project_path, holding.to_string_lossy());
+        assert_eq!(durable.project_path, row.project_path);
+        assert_eq!(row.pre_trash_project_path.as_deref(), original.to_str());
+        assert_eq!(durable.pre_trash_project_path, row.pre_trash_project_path);
+        assert_eq!(durable.id, baseline.id);
+        assert_eq!(durable.created_at, baseline.created_at);
+        assert_eq!(durable.trashed_at, baseline.trashed_at);
+        assert_eq!(durable.trash_lifecycle_id, baseline.trash_lifecycle_id);
+        assert_eq!(
+            durable.lifecycle_generation,
+            baseline.lifecycle_generation + 1
         );
-        assert!(result.is_err());
-        let durable = storage.load().unwrap();
-        assert_eq!(durable[0].project_path, original.to_string_lossy());
-        assert!(durable[0].pre_trash_project_path.is_none());
-        assert!(durable[0].lifecycle_reservation.is_none());
-        assert_eq!(std::fs::read(holding.join("foreign")).unwrap(), b"preserve");
-        assert_eq!(std::fs::read(retired.join("original")).unwrap(), b"keep");
+        assert_eq!(row.lifecycle_generation, durable.lifecycle_generation);
+        assert!(row.lifecycle_reservation.is_none());
+        assert!(durable.lifecycle_reservation.is_none());
+        assert!(!original.exists());
+        assert_eq!(std::fs::read(holding.join("original")).unwrap(), b"keep");
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(!reconcile_trashed_transition(&storage, &mut row).unwrap());
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(row.lifecycle_generation, baseline.lifecycle_generation + 1);
+        assert_eq!(std::fs::read(holding.join("original")).unwrap(), b"keep");
     }
 }

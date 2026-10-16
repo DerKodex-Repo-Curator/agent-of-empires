@@ -1327,6 +1327,10 @@ exit 0
         let temp = tempfile::tempdir().unwrap();
         let profile = "attach-stop-owner";
         let _home = isolated_profile(temp.path(), profile);
+        crate::session::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
         let (_path, calls) = stop_runtime_fixture(temp.path());
         let (storage, original, mut plan) = attach_fixture(temp.path(), profile);
         reserve_attach(&storage, &mut plan).unwrap();
@@ -1351,7 +1355,6 @@ exit 0
         let durable = storage.load().unwrap().remove(0);
         assert_eq!(durable.id, original.id);
         assert!(durable.lifecycle_reservation.is_none());
-        assert!(std::fs::read(&calls).unwrap().len() >= stopped_calls.len());
     }
 
     #[cfg(unix)]

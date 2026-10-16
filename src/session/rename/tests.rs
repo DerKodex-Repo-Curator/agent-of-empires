@@ -153,7 +153,7 @@ fn preflight_releases_all_flocks_and_preserves_unsubmitted_peer_fields() {
 
 #[test]
 #[serial_test::serial]
-fn superseded_generations_profiles_and_resource_claims_defeat_rename_before_git() {
+fn reserved_rename_refuses_competing_namespace_mutations_and_commits_owner() {
     for change in [
         "generation",
         "incarnation",
@@ -161,16 +161,14 @@ fn superseded_generations_profiles_and_resource_claims_defeat_rename_before_git(
         "target-profile",
         "destination",
         "source",
-        "branch",
-        "same-oid-ref",
     ] {
         let _app = crate::session::test_support::isolate_app_dir();
         let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
         let (root, storage, row) = fixture();
         let target = Storage::new_unwatched("target").unwrap();
         let peer = Storage::new_unwatched("peer").unwrap();
-        let result = perform(request(&row, "profile"), |reserved, _| {
-            match change {
+        let committed = perform(request(&row, "profile"), |reserved, _| {
+            let refused = match change {
                 "generation" | "incarnation" => storage.update(|rows, _| {
                     let current = rows
                         .iter_mut()
@@ -189,17 +187,15 @@ fn superseded_generations_profiles_and_resource_claims_defeat_rename_before_git(
                         current.created_at += chrono::Duration::seconds(1);
                     }
                     Ok(())
-                })?,
+                }),
                 "source-profile" | "target-profile" => {
-                    let replaced = if change == "source-profile" {
-                        &storage
+                    let profile = if change == "source-profile" {
+                        storage.profile()
                     } else {
-                        &target
+                        target.profile()
                     };
-                    let path = replaced.sessions_path().parent().unwrap();
-                    std::fs::rename(path, root.path().join("retired-profile"))?;
-                    std::fs::create_dir(path)?;
-                    Storage::new_unwatched(replaced.profile())?;
+                    assert!(crate::session::delete_profile(profile).is_err());
+                    crate::session::rename_profile(profile, "retired-profile")
                 }
                 "destination" | "source" => peer.update(|rows, _| {
                     let path = if change == "source" {
@@ -209,36 +205,95 @@ fn superseded_generations_profiles_and_resource_claims_defeat_rename_before_git(
                     };
                     rows.push(Instance::new("adopter", &path.to_string_lossy()));
                     Ok(())
-                })?,
-                "branch" => {
-                    let repo = git2::Repository::open(root.path().join("repo"))?;
-                    repo.branch("new", &repo.head()?.peel_to_commit()?, false)?;
-                }
-                "same-oid-ref" => {
-                    let path = root.path().join("repo/.git/refs/heads/topic");
-                    let bytes = std::fs::read(&path)?;
-                    std::fs::rename(&path, path.with_extension("retired"))?;
-                    std::fs::write(path, bytes)?;
-                }
+                }),
                 _ => unreachable!(),
-            }
-            Ok(())
-        });
-        assert!(
-            result.is_err(),
-            "{change} must defeat stale rename authority"
-        );
-        assert!(root.path().join("old/tracked").exists(), "{change}");
-        assert!(!root.path().join("new").exists(), "{change}");
-        if change == "generation" {
-            let current = storage.load().unwrap().remove(0);
+            };
+            assert!(refused.is_err(), "{change} bypassed the rename reservation");
+            let current = storage.load_strict_for_worktree_ownership()?.remove(0);
+            assert_eq!(current.id, reserved.id, "{change}");
+            assert_eq!(current.created_at, reserved.created_at, "{change}");
+            assert_eq!(current.project_path, reserved.project_path, "{change}");
             assert_eq!(
-                current.lifecycle_reservation.unwrap().op,
-                LifecycleOperation::Launch
+                current.lifecycle_generation, reserved.lifecycle_generation,
+                "{change}"
             );
-            assert!(current.lifecycle_generation > row.lifecycle_generation + 1);
-        }
+            assert_eq!(
+                current.lifecycle_reservation, reserved.lifecycle_reservation,
+                "{change}"
+            );
+            assert!(current.lifecycle_reservation_is_owned(
+                LifecycleOperation::Rename,
+                reserved.lifecycle_generation
+            ));
+            assert!(current
+                .lifecycle_reservation
+                .as_ref()
+                .unwrap()
+                .resource_intent
+                .is_some());
+            assert!(target.load_strict_for_worktree_ownership()?.is_empty());
+            assert!(peer.load_strict_for_worktree_ownership()?.is_empty());
+            assert!(root.path().join("old/tracked").exists(), "{change}");
+            assert!(!root.path().join("new").exists(), "{change}");
+            Ok(())
+        })
+        .unwrap();
+        assert!(storage.load().unwrap().is_empty(), "{change}");
+        let durable = target.load().unwrap();
+        assert_eq!(durable.len(), 1, "{change}");
+        let current = &durable[0];
+        assert_eq!(current.id, row.id, "{change}");
+        assert_eq!(current.created_at, row.created_at, "{change}");
+        assert_eq!(
+            current.lifecycle_generation,
+            row.lifecycle_generation + 1,
+            "{change}"
+        );
+        assert!(current.lifecycle_reservation.is_none(), "{change}");
+        assert_eq!(current.source_profile, "target");
+        assert_eq!(
+            current.project_path,
+            root.path().join("new").to_string_lossy()
+        );
+        assert_eq!(current.worktree_info.as_ref().unwrap().branch, "new");
+        assert_eq!(committed.instance.id, current.id);
+        assert_eq!(committed.instance.project_path, current.project_path);
+        assert!(peer.load().unwrap().is_empty(), "{change}");
+        assert!(root.path().join("new/tracked").exists(), "{change}");
+        assert!(!root.path().join("old").exists(), "{change}");
+        let repo = git2::Repository::open(&current.project_path).unwrap();
+        assert_eq!(repo.head().unwrap().shorthand().unwrap(), "new");
+        assert!(repo.find_reference("refs/heads/topic").is_err());
+        assert!(move_journal::scan().entries.is_empty());
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn competing_git_branch_defeats_rename_without_moving_checkout() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let (root, storage, row) = fixture();
+    let target = Storage::new_unwatched("target").unwrap();
+    let result = perform(request(&row, "profile"), |_, _| {
+        let repo = git2::Repository::open(root.path().join("repo"))?;
+        repo.branch("new", &repo.head()?.peel_to_commit()?, false)?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(root.path().join("old/tracked").exists());
+    assert!(!root.path().join("new").exists());
+    let durable = storage.load().unwrap();
+    assert_eq!(durable.len(), 1);
+    assert_eq!(durable[0].id, row.id);
+    assert_eq!(durable[0].created_at, row.created_at);
+    assert_eq!(durable[0].project_path, row.project_path);
+    assert_eq!(durable[0].worktree_info, row.worktree_info);
+    assert!(target.load().unwrap().is_empty());
+    let repo = git2::Repository::open(&row.project_path).unwrap();
+    assert_eq!(repo.head().unwrap().shorthand().unwrap(), "topic");
+    assert!(repo.find_reference("refs/heads/topic").is_ok());
+    assert!(repo.find_reference("refs/heads/new").is_ok());
 }
 
 #[test]
@@ -406,30 +461,82 @@ fn real_git_effects_recover_after_same_and_cross_profile_publication_failure() {
                     .is_empty()
             );
             assert!(move_journal::scan().entries.is_empty());
-            let durable = source.load().unwrap();
+            let (winner, loser) = if cross_profile {
+                (&target, &source)
+            } else {
+                (&source, &target)
+            };
+            let durable = winner.load().unwrap();
             assert_eq!(durable.len(), 1);
-            assert_eq!(durable[0].id, before.id);
-            assert_eq!(durable[0].created_at, before.created_at);
-            assert_eq!(durable[0].project_path, before.project_path);
-            assert_eq!(durable[0].worktree_info, before.worktree_info);
-            assert!(durable[0].lifecycle_reservation.is_none());
-            assert!(target.load().unwrap().is_empty());
-            let repo = git2::Repository::open(&before.project_path).unwrap();
-            assert_eq!(repo.head().unwrap().shorthand().unwrap(), "topic");
+            let current = &durable[0];
+            let expected_path = if kind == "branch" {
+                root.path().join("old")
+            } else {
+                root.path().join("new")
+            };
+            let expected_branch = match kind {
+                "branch" => "exact/Requested-Branch",
+                "move" => "topic",
+                "both" => "new",
+                _ => unreachable!(),
+            };
+            assert_eq!(current.id, before.id);
+            assert_eq!(current.created_at, before.created_at);
+            assert_eq!(
+                current.lifecycle_generation,
+                before.lifecycle_generation + 1
+            );
+            assert!(current.lifecycle_reservation.is_none());
+            assert_eq!(current.source_profile, winner.profile());
+            assert_eq!(current.title, if kind == "branch" { "old" } else { "new" });
+            assert_eq!(current.project_path, expected_path.to_string_lossy());
+            let mut expected_info = before.worktree_info.clone();
+            expected_info.as_mut().unwrap().branch = expected_branch.into();
+            assert_eq!(current.worktree_info, expected_info);
+            assert!(loser.load().unwrap().is_empty());
+            assert_eq!(
+                std::fs::read(expected_path.join("tracked")).unwrap(),
+                b"base"
+            );
+            let repo = git2::Repository::open(&expected_path).unwrap();
+            assert_eq!(repo.head().unwrap().shorthand().unwrap(), expected_branch);
             let common =
                 git2::Repository::open(&before.worktree_info.as_ref().unwrap().main_repo_path)
                     .unwrap();
-            assert!(common.find_reference("refs/heads/topic").is_ok());
-            assert!(common.find_reference("refs/heads/new").is_err());
-            assert!(common
-                .find_reference("refs/heads/exact/Requested-Branch")
-                .is_err());
-            assert!(!root.path().join("new").exists());
+            assert_eq!(
+                common.find_reference("refs/heads/topic").is_ok(),
+                kind == "move"
+            );
+            assert_eq!(
+                common.find_reference("refs/heads/new").is_ok(),
+                kind == "both"
+            );
+            assert_eq!(
+                common
+                    .find_reference("refs/heads/exact/Requested-Branch")
+                    .is_ok(),
+                kind == "branch"
+            );
+            assert_eq!(root.path().join("old").exists(), kind == "branch");
+            assert_eq!(root.path().join("new").exists(), kind != "branch");
             assert!(
                 Storage::recover_pending_moves(crate::file_watch::FileWatchService::noop())
                     .unwrap()
                     .is_empty()
             );
+            let recovered_again = winner.load().unwrap();
+            assert_eq!(recovered_again.len(), 1);
+            assert_eq!(recovered_again[0].id, current.id);
+            assert_eq!(recovered_again[0].created_at, current.created_at);
+            assert_eq!(recovered_again[0].project_path, current.project_path);
+            assert_eq!(recovered_again[0].worktree_info, current.worktree_info);
+            assert_eq!(
+                recovered_again[0].lifecycle_generation,
+                current.lifecycle_generation
+            );
+            assert!(recovered_again[0].lifecycle_reservation.is_none());
+            assert!(loser.load().unwrap().is_empty());
+            assert!(move_journal::scan().entries.is_empty());
         }
     }
 }

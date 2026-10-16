@@ -3,14 +3,9 @@
 
 use super::*;
 
-/// Cross-process guards for a single-session title mutation or profile move. The source
-/// profile's lifecycle flock nests inside the per-session title flock; callers retain this
-/// through durable persistence and any tmux rekey, so a terminal launch cannot observe the
-/// transition halfway through.
 pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _session_title: crate::session::StorageFlock,
     pub(super) _lifecycle: crate::session::StorageFlock,
-    pub(super) _ownership: Option<crate::session::storage::OwnershipGuard>,
 }
 
 fn retire_provisional_stub(

@@ -333,7 +333,7 @@ pub(crate) fn perform(
             branch,
         )?;
     }
-    if let Some(name) = &name {
+    if let Some(name) = name.as_ref().filter(|_| edits_git) {
         let info = original
             .worktree_info
             .as_ref()

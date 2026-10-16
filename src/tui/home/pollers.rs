@@ -175,19 +175,25 @@ impl HomeView {
                 {
                     return false;
                 }
-                if let Some(relocation) = result.relocation {
-                    let durable = self.load_durable_instance(&result.session_id);
-                    if let Some(durable) = durable.filter(|instance| {
-                        matches_owner(instance)
-                            && instance.is_trashed()
-                            && instance.project_path == relocation.new_project_path
-                    }) {
-                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                let durable = self.load_durable_instance(&result.session_id);
+                if let Some(durable) =
+                    durable.filter(|instance| matches_owner(instance) && instance.is_trashed())
+                {
+                    if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                        let same_path = instance.project_path == durable.project_path
+                            && instance.pre_trash_project_path == durable.pre_trash_project_path;
+                        let relocated = result.relocation.as_ref().is_some_and(|relocation| {
+                            durable.project_path == relocation.new_project_path
+                        });
+                        if same_path || relocated {
+                            changed = instance.project_path != durable.project_path
+                                || instance.pre_trash_project_path
+                                    != durable.pre_trash_project_path
+                                || instance.lifecycle_reservation != durable.lifecycle_reservation;
                             instance.project_path = durable.project_path;
                             instance.pre_trash_project_path = durable.pre_trash_project_path;
                             instance.lifecycle_generation = durable.lifecycle_generation;
                             instance.lifecycle_reservation = durable.lifecycle_reservation;
-                            changed = true;
                         }
                     }
                 }
