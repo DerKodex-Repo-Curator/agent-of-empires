@@ -1,7 +1,6 @@
 //! Session storage with a stable app-root fence before identity, title, lifecycle and storage locks.
-//! Shared ownership covers ordinary claims and profile creation. Exclusive ownership covers
-//! destructive Git effects and profile rename/delete, through authoritative reload and commit.
-//! Prompts, hooks and container/SDK waits release ownership; reacquisition revalidates the original profile and claims.
+//! Ownership covers authoritative reload, admission and publication.
+//! Git subprocesses, hooks and container waits run unlocked under durable reservations.
 //! Multi-store operations order save mutexes by identity and flocks by physical file identity.
 
 use anyhow::{anyhow, Context, Result};
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 
+use super::environment::shell_escape_script_word;
 use super::{
     get_app_dir, get_profile_dir, get_profile_dir_path, resolve_existing_profile, Group, Instance,
 };
@@ -367,6 +367,7 @@ pub(crate) struct StorageFlock {
 pub(crate) struct OwnershipGuard {
     _held: HeldFlock,
     exclusive: bool,
+    nonblocking: bool,
 }
 
 impl OwnershipGuard {
@@ -379,7 +380,7 @@ impl OwnershipGuard {
 
     fn verify(&self) -> Result<()> {
         anyhow::ensure!(
-            fs::canonicalize(self.app_dir())? == fs::canonicalize(get_app_dir()?)?,
+            fs::canonicalize(self.app_dir())? == fs::canonicalize(super::get_app_dir_path()?)?,
             "ownership guard belongs to a different application directory"
         );
         Ok(())
@@ -405,9 +406,12 @@ fn ownership_lock(shared: bool) -> Result<OwnershipGuard> {
     Ok(OwnershipGuard {
         _held: lock.held,
         exclusive: !shared,
+        nonblocking: false,
     })
 }
 
+/// Never reacquire ownership for the same app directory while holding it.
+/// Flocks belong to open file descriptions; use the `*_with_ownership` APIs.
 pub(crate) fn acquire_ownership_read() -> Result<OwnershipGuard> {
     ownership_lock(true)
 }
@@ -418,6 +422,7 @@ pub(crate) fn try_acquire_ownership_read() -> Result<Option<OwnershipGuard>> {
         Ok(()) => Ok(Some(OwnershipGuard {
             _held: HeldFlock { file, path },
             exclusive: false,
+            nonblocking: true,
         })),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error.into()),
@@ -434,6 +439,7 @@ pub(crate) fn try_acquire_ownership_lock() -> Result<Option<OwnershipGuard>> {
             OwnershipGuard {
                 _held: lock.held,
                 exclusive: true,
+                nonblocking: true,
             }
         }),
     )
@@ -447,7 +453,10 @@ fn app_dir_for_profile_dir(profile_dir: &Path) -> &Path {
         .unwrap_or(profile_dir)
 }
 
-fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<Vec<StorageFlock>> {
+fn acquire_transition_flocks_for_profile_dirs(
+    profile_dirs: &[&Path],
+    nonblocking: bool,
+) -> Result<Vec<StorageFlock>> {
     let mut app_dirs: Vec<PathBuf> = profile_dirs
         .iter()
         .map(|dir| app_dir_for_profile_dir(dir).to_path_buf())
@@ -457,7 +466,19 @@ fn acquire_transition_flocks_for_profile_dirs(profile_dirs: &[&Path]) -> Result<
     app_dirs
         .iter()
         .map(|dir| {
-            acquire_storage_shared_flock(dir, crate::migrations::v027_isolate_sandbox_stores::LOCK)
+            let (file, path) = open_existing_storage_lock_file(
+                dir,
+                crate::migrations::v027_isolate_sandbox_stores::LOCK,
+            )?;
+            if nonblocking {
+                FileExt::try_lock_shared(&file).context("Session operation in progress")?;
+                Ok(StorageFlock {
+                    held: HeldFlock { file, path },
+                    ownership: None,
+                })
+            } else {
+                acquire_open_storage_shared_flock(file, &path)
+            }
         })
         .collect()
 }
@@ -493,45 +514,81 @@ impl OpenStorageLock {
         })
     }
 
-    fn acquire(self) -> Result<StorageFlock> {
-        acquire_open_storage_flock(self.file, &self.path)
+    fn acquire(self, nonblocking: bool) -> Result<StorageFlock> {
+        if nonblocking {
+            self.file
+                .try_lock_exclusive()
+                .context("Session operation in progress")?;
+            Ok(StorageFlock {
+                held: HeldFlock {
+                    file: self.file,
+                    path: self.path,
+                },
+                ownership: None,
+            })
+        } else {
+            acquire_open_storage_flock(self.file, &self.path)
+        }
     }
 }
 
-fn acquire_open_storage_flocks(mut files: Vec<OpenStorageLock>) -> Result<Vec<StorageFlock>> {
+fn acquire_open_storage_flocks(
+    mut files: Vec<OpenStorageLock>,
+    nonblocking: bool,
+) -> Result<Vec<StorageFlock>> {
     files.sort_unstable_by_key(|file| file.key);
     files.dedup_by_key(|file| file.key);
-    files.into_iter().map(OpenStorageLock::acquire).collect()
+    files
+        .into_iter()
+        .map(|file| file.acquire(nonblocking))
+        .collect()
 }
 
 fn acquire_two_open_storage_flocks(
     first: OpenStorageLock,
     second: OpenStorageLock,
+    nonblocking: bool,
 ) -> Result<(StorageFlock, StorageFlock)> {
     let (first, second) = if first.key < second.key {
         (first, second)
     } else {
         (second, first)
     };
-    Ok((first.acquire()?, second.acquire()?))
+    Ok((first.acquire(nonblocking)?, second.acquire(nonblocking)?))
 }
 
 fn lock_two_save_mutexes<'a>(
     source: &'a Storage,
     target: &'a Storage,
-) -> (
+    nonblocking: bool,
+) -> Result<(
     std::sync::MutexGuard<'a, ()>,
     Option<std::sync::MutexGuard<'a, ()>>,
-) {
+)> {
     let (first, second) = if Arc::as_ptr(&source.save_lock) < Arc::as_ptr(&target.save_lock) {
         (&source.save_lock, &target.save_lock)
     } else {
         (&target.save_lock, &source.save_lock)
     };
-    let first_guard = first.lock().unwrap_or_else(|error| error.into_inner());
+    let first_guard = lock_save_mutex(first, nonblocking)?;
     let second_guard = (!Arc::ptr_eq(first, second))
-        .then(|| second.lock().unwrap_or_else(|error| error.into_inner()));
-    (first_guard, second_guard)
+        .then(|| lock_save_mutex(second, nonblocking))
+        .transpose()?;
+    Ok((first_guard, second_guard))
+}
+
+fn lock_save_mutex(lock: &Mutex<()>, nonblocking: bool) -> Result<std::sync::MutexGuard<'_, ()>> {
+    if nonblocking {
+        match lock.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                anyhow::bail!("Session operation in progress")
+            }
+        }
+    } else {
+        Ok(lock.lock().unwrap_or_else(|error| error.into_inner()))
+    }
 }
 
 fn paths_share_filesystem_identity(left: &Path, right: &Path) -> Result<bool> {
@@ -817,6 +874,18 @@ pub(crate) fn acquire_session_title_lock_with_ownership(
     super::validate_instance_id(instance_id)
         .context("refusing session title lock for invalid instance id")?;
     acquire_storage_flock(
+        ownership.app_dir(),
+        &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
+    )
+}
+
+pub(crate) fn try_acquire_session_title_lock_with_ownership(
+    ownership: &OwnershipGuard,
+    instance_id: &str,
+) -> Result<Option<StorageFlock>> {
+    ownership.verify()?;
+    super::validate_instance_id(instance_id)?;
+    try_acquire_storage_flock(
         ownership.app_dir(),
         &format!("{SESSION_TITLE_LOCK_PREFIX}{instance_id}.lock"),
     )
@@ -1109,6 +1178,35 @@ fn apply_group_move(
 }
 
 impl Storage {
+    fn acquire_ownership_bound(&self, shared: bool) -> Result<OwnershipGuard> {
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .context("sessions path has no parent")?;
+        let (file, path) = open_existing_storage_lock_file(
+            app_dir_for_profile_dir(profile_dir),
+            ".workspace-claim.lock",
+        )?;
+        let lock = if shared {
+            acquire_open_storage_shared_flock(file, &path)?
+        } else {
+            acquire_open_storage_flock(file, &path)?
+        };
+        Ok(OwnershipGuard {
+            _held: lock.held,
+            exclusive: !shared,
+            nonblocking: false,
+        })
+    }
+
+    pub(crate) fn acquire_ownership_lock_bound(&self) -> Result<OwnershipGuard> {
+        self.acquire_ownership_bound(false)
+    }
+
+    pub(crate) fn acquire_ownership_read_bound(&self) -> Result<OwnershipGuard> {
+        self.acquire_ownership_bound(true)
+    }
+
     pub fn new(profile: &str, file_watch: Arc<FileWatchService>) -> Result<Self> {
         let profile_name = if profile.is_empty() {
             super::config::resolve_default_profile()
@@ -1133,6 +1231,15 @@ impl Storage {
     /// Construct a `Storage` wired to a noop `FileWatchService`.
     pub fn new_unwatched(profile: &str) -> Result<Self> {
         Self::new(profile, FileWatchService::noop())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test_profile(profile: &str) -> Self {
+        let directory = super::get_app_dir_path()
+            .expect("resolve fixture application namespace")
+            .join("profiles")
+            .join(profile);
+        Self::new_for_test_path(profile, directory.join("sessions.json"))
     }
 
     #[cfg(test)]
@@ -1194,7 +1301,7 @@ impl Storage {
         let mut notices = Vec::new();
         for (path, reason) in pending.unreadable_dirs {
             notices.push(format!(
-                "Move intent directory {} is unreadable: {reason}",
+                "Move intent directory {} is unreadable: {reason}; inspect with `aoe intents list` before resolving its entries",
                 path.display()
             ));
         }
@@ -1227,18 +1334,19 @@ impl Storage {
                             sync_parent_directory,
                         )
                     }
+                    MoveAuthority::Cleanup { .. } => recover_cleanup_journal(&journal, entry),
                     MoveAuthority::LegacyConflict { reason, .. } => anyhow::bail!("{reason}"),
                 }
             })();
             match result {
                 Ok(true) => {}
                 Ok(false) => notices.push(format!(
-                    "Move intent conflict at {} requires manual resolution",
-                    path.display()
+                    "Move intent conflict at {} requires resolution; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                    path.display(), shell_escape_script_word(&path.to_string_lossy())
                 )),
                 Err(error) => notices.push(format!(
-                    "Move intent conflict at {}: {error:#}",
-                    path.display()
+                    "Move intent conflict at {}: {error:#}; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                    path.display(), shell_escape_script_word(&path.to_string_lossy())
                 )),
             }
         }
@@ -1256,7 +1364,7 @@ impl Storage {
         &self,
         instance_id: &str,
     ) -> Result<StorageFlock> {
-        let ownership = acquire_ownership_read()?;
+        let ownership = self.acquire_ownership_read_bound()?;
         let mut lock =
             self.acquire_instance_lifecycle_lock_with_ownership(&ownership, instance_id)?;
         lock.ownership = Some(ownership);
@@ -1517,7 +1625,7 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let ownership = acquire_ownership_read()?;
+        let ownership = self.acquire_ownership_read_bound()?;
         self.update_with_ownership(&ownership, f)
     }
 
@@ -1525,13 +1633,25 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        self.update_scoped(ownership, None, f)
+        self.update_scoped(ownership, None, None, f)
     }
 
     /// `None` means contention: the mutation closure has not run.
     pub(crate) fn try_update_with_ownership<F, R>(
         &self,
         ownership: &OwnershipGuard,
+        f: F,
+    ) -> Result<Option<R>>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.try_update_scoped(ownership, None, f)
+    }
+
+    fn try_update_scoped<F, R>(
+        &self,
+        ownership: &OwnershipGuard,
+        intent: Option<&super::move_journal::JournalTransaction>,
         f: F,
     ) -> Result<Option<R>>
     where
@@ -1572,7 +1692,9 @@ impl Storage {
             ownership: None,
         };
         self.verify_profile_available()?;
-        self.update_under_lock(None, f).map(Some)
+        #[cfg(test)]
+        report_update_for_test(self);
+        self.update_under_lock(intent, None, f).map(Some)
     }
 
     pub(crate) fn update_with_intent<F, R>(
@@ -1584,18 +1706,28 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        self.update_scoped(ownership, Some(intent), f)
+        self.update_scoped(ownership, Some(intent), None, f)
     }
 
     fn update_scoped<F, R>(
         &self,
         ownership: &OwnershipGuard,
         intent: Option<&super::move_journal::JournalTransaction>,
+        attested: Option<&Instance>,
         f: F,
     ) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        if ownership.nonblocking {
+            anyhow::ensure!(
+                attested.is_none(),
+                "attested recovery requires blocking ownership"
+            );
+            return self
+                .try_update_scoped(ownership, intent, f)?
+                .context("Session operation in progress");
+        }
         ownership.verify()?;
         self.verify_profile_available()?;
         #[cfg(test)]
@@ -1624,7 +1756,7 @@ impl Storage {
         let (file, path) = open_existing_storage_lock_file(profile_dir, STORAGE_LOCK_FILENAME)?;
         let _flock = acquire_open_storage_flock(file, &path)?;
         self.verify_profile_available()?;
-        self.update_under_lock(intent, f)
+        self.update_under_lock(intent, attested, f)
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
@@ -1632,13 +1764,19 @@ impl Storage {
     fn update_under_lock<F, R>(
         &self,
         intent: Option<&super::move_journal::JournalTransaction>,
+        attested: Option<&Instance>,
         f: F,
     ) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         let (mut instances, mut groups) = self.load_with_groups()?;
-        let admission = super::move_journal::ResourceAdmission::capture(self, &instances, intent);
+        let admission = match attested {
+            Some(expected) => {
+                super::move_journal::ResourceAdmission::capture_attested(self, &instances, expected)
+            }
+            None => super::move_journal::ResourceAdmission::capture(self, &instances, intent),
+        };
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
         admission.validate(&instances)?;
@@ -1664,7 +1802,7 @@ impl Storage {
             anyhow::bail!("injected sessions write failure");
         }
 
-        if intent.is_some() {
+        if intent.is_some() || attested.is_some() {
             atomic_write_verified(&self.sessions_path, &instances_buf)?;
             sync_parent_directory(&self.sessions_path)?;
         } else {
@@ -1672,6 +1810,41 @@ impl Storage {
         }
         self.file_watch.notify_local_change(&self.sessions_path);
         Ok(result)
+    }
+
+    pub(crate) fn release_attested_binding_with_ownership(
+        &self,
+        ownership: &OwnershipGuard,
+        expected: &Instance,
+    ) -> Result<()> {
+        use super::move_journal::{binding_path, lease_state, LeaseState};
+        ownership.require_exclusive()?;
+        let _identity = acquire_session_identity_lock_with_ownership(ownership)?;
+        let _lifecycle =
+            self.acquire_instance_lifecycle_lock_with_ownership(ownership, &expected.id)?;
+        self.update_scoped(ownership, None, Some(expected), |rows, _| {
+            let current = rows.iter_mut().find(|row| row.id == expected.id)
+                .context("orphan-binding session disappeared")?;
+            anyhow::ensure!(
+                current.created_at == expected.created_at
+                    && current.lifecycle_generation == expected.lifecycle_generation
+                    && current.lifecycle_reservation == expected.lifecycle_reservation
+                    && super::move_journal::same_namespace(current, expected),
+                "orphan-binding authority changed"
+            );
+            let reservation = current.lifecycle_reservation.as_ref().context("session has no lifecycle reservation")?;
+            let binding = reservation.resource_intent.as_deref().context("session has no resource intent binding")?;
+            let path = binding_path(binding)?;
+            anyhow::ensure!(
+                matches!(fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                "referenced journal exists; use aoe intents clear {} --actors-stopped", shell_escape_script_word(&path.to_string_lossy())
+            );
+            anyhow::ensure!(lease_state(&path)? != LeaseState::Live, "intent producer is still live");
+            anyhow::ensure!(reservation.generation == current.lifecycle_generation, "orphan-binding generation changed");
+            let (operation, generation) = (reservation.op, reservation.generation);
+            current.release_lifecycle_reservation_if_owned(operation, generation);
+            Ok(())
+        })
     }
 
     /// Publish one row through the dual-profile commit, optionally under its resource intent.
@@ -1810,7 +1983,7 @@ impl Storage {
             ));
         }
 
-        let _mutexes = lock_two_save_mutexes(self, target);
+        let _mutexes = lock_two_save_mutexes(self, target, ownership.nonblocking)?;
         let (first, second) = (self, target);
         let first_dir = first
             .sessions_path
@@ -1820,8 +1993,10 @@ impl Storage {
             .sessions_path
             .parent()
             .ok_or_else(|| anyhow!("sessions path has no parent"))?;
-        let _transition_flocks =
-            acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
+        let _transition_flocks = acquire_transition_flocks_for_profile_dirs(
+            &[first_dir, second_dir],
+            ownership.nonblocking,
+        )?;
         let (first_lock_file, first_lock_path) =
             open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
         let (second_lock_file, second_lock_path) =
@@ -1834,6 +2009,7 @@ impl Storage {
         let _flocks = acquire_two_open_storage_flocks(
             OpenStorageLock::new(first_lock_file, first_lock_path)?,
             OpenStorageLock::new(second_lock_file, second_lock_path)?,
+            ownership.nonblocking,
         )?;
         self.verify_profile_available()?;
         target.verify_profile_available()?;
@@ -2559,7 +2735,7 @@ pub(crate) fn reconcile_profile_duplicates(
     let mut opaque_failure = !scan.unreadable_dirs.is_empty();
     for (dir, error) in scan.unreadable_dirs {
         outcome.conflicts.push(format!(
-            "Move intent directory {} is unreadable: {error}",
+            "Move intent directory {} is unreadable: {error}; inspect with `aoe intents list` before resolving its entries",
             dir.display()
         ));
         tracing::warn!(
@@ -2575,8 +2751,8 @@ pub(crate) fn reconcile_profile_duplicates(
             Ok(entry) => valid_entries.push((path, entry)),
             Err(reason) => {
                 outcome.conflicts.push(format!(
-                    "Move intent conflict at {}: {reason}",
-                    path.display()
+                    "Move intent conflict at {}: {reason}; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                    path.display(), shell_escape_script_word(&path.to_string_lossy())
                 ));
                 opaque_failure = true;
                 let already_reported = UNUSABLE_JOURNAL_ENTRIES
@@ -2622,8 +2798,8 @@ pub(crate) fn reconcile_profile_duplicates(
                 &entry.authority
             {
                 outcome.conflicts.push(format!(
-                    "Move intent conflict at {}: {reason}. Concurrent resources were preserved.",
-                    path.display()
+                    "Move intent conflict at {}: {reason}; resources were preserved. Inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                    path.display(), shell_escape_script_word(&path.to_string_lossy())
                 ));
                 blocked_ids.extend(entry.ids.iter().cloned());
                 continue;
@@ -2637,15 +2813,10 @@ pub(crate) fn reconcile_profile_duplicates(
                 blocked_ids.extend(entry.ids.iter().cloned());
                 continue;
             }
-            if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE
-                && !matches!(
-                    &entry.authority,
-                    super::move_journal::MoveAuthority::Resource { .. }
-                )
-            {
+            if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE && entry.is_arbitration_evidence() {
                 mark_unusable_journal_entry(&path);
                 blocked_ids.extend(entry.ids.iter().cloned());
-                outcome.conflicts.push(format!("Move intent conflict at {}: expired arbitration evidence requires manual resolution.", path.display()));
+                outcome.conflicts.push(format!("Move intent conflict at {}: expired arbitration evidence; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`", path.display(), shell_escape_script_word(&path.to_string_lossy())));
                 tracing::error!(
                     target: "session.store",
                     path = %path.display(),
@@ -2671,10 +2842,13 @@ pub(crate) fn reconcile_profile_duplicates(
                         super::move_journal::MoveAuthority::Resource { intent } => {
                             intent.conflict.as_deref()
                         }
+                        super::move_journal::MoveAuthority::Cleanup { conflict, .. } => {
+                            conflict.as_deref()
+                        }
                         _ => None,
                     };
                     if let Some(reason) = reason {
-                        outcome.conflicts.push(format!("Move intent conflict at {}: {reason}. Concurrent resources were preserved.", path.display()));
+                        outcome.conflicts.push(format!("Move intent conflict at {}: {reason}; resources were preserved. Inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`", path.display(), shell_escape_script_word(&path.to_string_lossy())));
                     }
                     blocked_ids.extend(entry.ids.iter().cloned());
                     tracing::debug!(
@@ -2685,8 +2859,8 @@ pub(crate) fn reconcile_profile_duplicates(
                 }
                 Err(error) => {
                     outcome.conflicts.push(format!(
-                        "Move intent conflict at {}: {error:#}",
-                        path.display()
+                        "Move intent conflict at {}: {error:#}; inspect with `aoe intents list`; clear with `aoe intents clear {} --actors-stopped`",
+                        path.display(), shell_escape_script_word(&path.to_string_lossy())
                     ));
                     blocked_ids.extend(entry.ids.iter().cloned());
                     if mark_repair_failure_logged(&path) {
@@ -2857,18 +3031,14 @@ pub(crate) fn with_storages_locked_with_ownership<R>(
             previous = Some(key);
             distinct
         })
-        .map(|storage| {
-            storage
-                .save_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        })
-        .collect();
+        .map(|storage| lock_save_mutex(&storage.save_lock, ownership.nonblocking))
+        .collect::<Result<_>>()?;
     let dirs: Vec<&Path> = sorted
         .iter()
         .map(|(_, storage)| storage.sessions_path.parent().unwrap())
         .collect();
-    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
+    let _transition_flocks =
+        acquire_transition_flocks_for_profile_dirs(&dirs, ownership.nonblocking)?;
     let files = dirs
         .into_iter()
         .map(|dir| {
@@ -2876,7 +3046,7 @@ pub(crate) fn with_storages_locked_with_ownership<R>(
             OpenStorageLock::new(file, path)
         })
         .collect::<Result<Vec<_>>>()?;
-    let _flocks = acquire_open_storage_flocks(files)?;
+    let _flocks = acquire_open_storage_flocks(files, ownership.nonblocking)?;
     for storage in storages {
         storage.verify_profile_available()?;
     }
@@ -2908,11 +3078,14 @@ where
     if source_dir == target_dir || paths_share_filesystem_identity(&source_dir, &target_dir)? {
         anyhow::bail!("source and target resolve to the same physical profile directory");
     }
-    let _mutexes = lock_two_save_mutexes(source, target);
+    let _mutexes = lock_two_save_mutexes(source, target, ownership.nonblocking)?;
     let (first, second) = (source, target);
     let first_dir = first.sessions_path.parent().unwrap();
     let second_dir = second.sessions_path.parent().unwrap();
-    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&[first_dir, second_dir])?;
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(
+        &[first_dir, second_dir],
+        ownership.nonblocking,
+    )?;
     let (first_file, first_path) =
         open_existing_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
     let (second_file, second_path) =
@@ -2923,10 +3096,155 @@ where
     let _flocks = acquire_two_open_storage_flocks(
         OpenStorageLock::new(first_file, first_path)?,
         OpenStorageLock::new(second_file, second_path)?,
+        ownership.nonblocking,
     )?;
     source.verify_profile_available()?;
     target.verify_profile_available()?;
     f()
+}
+
+pub(crate) fn abandon_resource_journal_with_ownership(
+    root: &OwnershipGuard,
+    journal: &super::move_journal::JournalTransaction,
+    mut entry: super::move_journal::MoveJournalEntry,
+    source: Result<Storage>,
+) -> Result<bool> {
+    use super::move_journal::{MoveAuthority, ProfileAuthority};
+    root.require_exclusive()?;
+    let MoveAuthority::Resource { intent } = &entry.authority else {
+        anyhow::bail!("journal has no resource authority");
+    };
+    let storage = match source {
+        Ok(storage) => Some(storage),
+        Err(error) => {
+            let directory = intent
+                .owner
+                .profile
+                .sessions_path
+                .parent()
+                .context("resource profile path has no parent")?;
+            anyhow::ensure!(
+                matches!(fs::symlink_metadata(directory), Err(missing) if missing.kind() == std::io::ErrorKind::NotFound),
+                "original resource profile is unavailable: {error:#}"
+            );
+            None
+        }
+    };
+    let _identity = acquire_session_identity_lock_with_ownership(root)?;
+    let _lifecycle = storage
+        .as_ref()
+        .map(|storage| {
+            storage.acquire_instance_lifecycle_lock_with_ownership(root, &intent.owner.id)
+        })
+        .transpose()?;
+    let mut release = false;
+    if let Some(storage) = &storage {
+        let profile = ProfileAuthority::capture(storage)?;
+        anyhow::ensure!(
+            intent.owner.profile == profile,
+            "resource profile authority changed"
+        );
+        let rows = storage.load_strict_for_worktree_ownership()?;
+        match rows.iter().find(|row| row.id == intent.owner.id) {
+            Some(row) => {
+                anyhow::ensure!(
+                    intent.owner.matches(&profile, row),
+                    "resource owner authority changed"
+                );
+                if row.lifecycle_reservation.is_some() {
+                    anyhow::ensure!(
+                        intent.row_is_reserved(&profile, row, journal.id()),
+                        "resource reservation authority changed"
+                    );
+                    release = true;
+                }
+            }
+            None => anyhow::ensure!(
+                intent.operation == super::LifecycleOperation::Purge,
+                "resource owner disappeared"
+            ),
+        }
+    }
+    let MoveAuthority::Resource { intent } = &mut entry.authority else {
+        unreachable!()
+    };
+    if !intent.abandoned {
+        intent.abandoned = true;
+        intent.conflict = None;
+        journal.rewrite(&entry)?;
+    }
+    if release {
+        let storage = storage.as_ref().expect("validated resource profile");
+        let MoveAuthority::Resource { intent } = &entry.authority else {
+            unreachable!()
+        };
+        storage.update_with_intent(root, journal, |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == intent.owner.id)
+                .context("resource owner disappeared")?;
+            anyhow::ensure!(
+                intent.row_is_reserved(&ProfileAuthority::capture(storage)?, row, journal.id()),
+                "resource reservation authority changed"
+            );
+            row.release_lifecycle_reservation_if_owned(intent.operation, intent.owner.generation);
+            Ok(())
+        })?;
+    }
+    journal.consume()?;
+    Ok(true)
+}
+
+pub(crate) fn recover_cleanup_journal(
+    journal: &super::move_journal::JournalTransaction,
+    mut entry: super::move_journal::MoveJournalEntry,
+) -> Result<bool> {
+    use super::move_journal::{EffectPhase, MoveAuthority};
+    let root = acquire_ownership_lock()?;
+    root.require_exclusive()?;
+    let MoveAuthority::Cleanup {
+        effects,
+        abandoned,
+        conflict,
+        ..
+    } = &mut entry.authority
+    else {
+        anyhow::bail!("journal has no cleanup authority");
+    };
+    if *abandoned {
+        journal.consume()?;
+        return Ok(true);
+    }
+    let complete = effects.iter().all(|record| match record.phase {
+        EffectPhase::Prepared => record.before.is_none() && record.after.is_none(),
+        EffectPhase::Applied => record
+            .after
+            .as_ref()
+            .is_some_and(|after| record.effect.goal_reached(after).unwrap_or(false)),
+        _ => false,
+    });
+    if complete {
+        journal.consume()?;
+        return Ok(true);
+    }
+    for record in effects {
+        if matches!(record.phase, EffectPhase::Prepared | EffectPhase::Applied) {
+            let verified = match record.phase {
+                EffectPhase::Prepared => record.before.is_none() && record.after.is_none(),
+                EffectPhase::Applied => record
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| record.effect.goal_reached(after).unwrap_or(false)),
+                _ => unreachable!(),
+            };
+            if !verified {
+                record.phase = EffectPhase::Conflict;
+            }
+        }
+    }
+    *conflict = Some("cleanup has an unfinished or unverified external effect; stop all actors before clearing it".into());
+    journal.rewrite(&entry)?;
+    Ok(false)
 }
 
 fn recover_resource_journal(
@@ -2938,6 +3256,10 @@ fn recover_resource_journal(
     let MoveAuthority::Resource { intent } = &mut entry.authority else {
         anyhow::bail!("journal has no resource authority")
     };
+    if intent.abandoned {
+        let root = acquire_ownership_lock()?;
+        return abandon_resource_journal_with_ownership(&root, &journal, entry, source);
+    }
     if intent.phase == EffectPhase::Committed {
         anyhow::ensure!(
             intent
@@ -2999,6 +3321,12 @@ where
     let Some((journal, fresh)) = super::move_journal::try_recovery_lease(journal_path)? else {
         return Ok(false);
     };
+    if matches!(
+        fresh.authority,
+        super::move_journal::MoveAuthority::Cleanup { .. }
+    ) {
+        return Ok(false);
+    }
     if let super::move_journal::MoveAuthority::Resource { intent } = &fresh.authority {
         let source = (|| {
             for (_, storage) in storages {
@@ -3177,7 +3505,7 @@ where
             return Ok(true);
         }
 
-        source_storage.update_under_lock(Some(journal), |instances, groups| {
+        source_storage.update_under_lock(Some(journal), None, |instances, groups| {
             if !target_still_holds(target_storage.sessions_path(), &source_losers)? {
                 anyhow::bail!(
                     "target copies vanished while the repair was starting; leaving the journal for a retry"
@@ -3258,7 +3586,7 @@ const MIGRATION_BACKUP_MARKER: &str = ".pre-migration-";
 /// durable copy landed, and the caller is mid-repair, so it must stop. A `path`
 /// holding nothing to copy is not a failure: the repair backs up a
 /// `groups.json` that many profiles never had.
-fn backup_before_repair(path: &Path) -> Result<()> {
+pub(crate) fn backup_before_repair(path: &Path) -> Result<()> {
     let Some(backup) = backup_beside(path, REPAIR_BACKUP_MARKER)? else {
         return Ok(());
     };
@@ -3471,6 +3799,42 @@ mod tests {
     use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
     use crate::session::GroupTree;
     use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn captured_storage_rejects_work_after_private_namespace_restoration() {
+        let outer = tempdir().unwrap();
+        let _outer = isolate_app_dir_at(outer.path());
+        let outer_app = super::super::get_app_dir().unwrap();
+        let inner = tempdir().unwrap();
+        let inner_guard = isolate_app_dir_at(inner.path());
+        let storage = Storage::new_unwatched("inner").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(Instance::new("kept", "/kept"));
+                Ok(())
+            })
+            .unwrap();
+        let original = std::fs::read(storage.sessions_path()).unwrap();
+        let path = storage.sessions_path().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            storage.update(|rows, _| {
+                rows.clear();
+                Ok(())
+            })
+        });
+        ready_rx.recv().unwrap();
+        drop(inner_guard);
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert!(!outer_app.join(".workspace-claim.lock").exists());
+        assert!(!outer_app.join("profiles").exists());
+    }
     use tempfile::tempdir;
 
     fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
@@ -4310,12 +4674,8 @@ mod tests {
     fn profile_batch_move_rejects_collision_and_merges_fresh_source() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-        let source_dir = temp.path().join("source");
-        let target_dir = temp.path().join("target");
-        std::fs::create_dir_all(&source_dir)?;
-        std::fs::create_dir_all(&target_dir)?;
-        let source = Storage::new_for_test_path("move-source", source_dir.join("sessions.json"));
-        let target = Storage::new_for_test_path("move-target", target_dir.join("sessions.json"));
+        let source = Storage::new_for_test_profile("move-source");
+        let target = Storage::new_for_test_profile("move-target");
         let mut first = Instance::new("first", "/repo/first");
         first.source_profile = "move-source".to_string();
         let mut second = Instance::new("second", "/repo/second");
@@ -4397,12 +4757,8 @@ mod tests {
     fn profile_move_rejects_target_collision_without_changing_rows() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-        let source_dir = temp.path().join("source-effect");
-        let target_dir = temp.path().join("target-effect");
-        fs::create_dir_all(&source_dir)?;
-        fs::create_dir_all(&target_dir)?;
-        let source = Storage::new_for_test_path("effect-source", source_dir.join("sessions.json"));
-        let target = Storage::new_for_test_path("effect-target", target_dir.join("sessions.json"));
+        let source = Storage::new_for_test_profile("effect-source");
+        let target = Storage::new_for_test_profile("effect-target");
         let before = Instance::new("collision", "/repo/collision");
         source.update(|instances, _groups| {
             instances.push(before.clone());
@@ -4445,12 +4801,8 @@ mod tests {
     fn profile_move_transfers_explicit_empty_group_metadata() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-        let source_dir = temp.path().join("source-empty-group");
-        let target_dir = temp.path().join("target-empty-group");
-        fs::create_dir_all(&source_dir)?;
-        fs::create_dir_all(&target_dir)?;
-        let source = Storage::new_for_test_path("empty-source", source_dir.join("sessions.json"));
-        let target = Storage::new_for_test_path("empty-target", target_dir.join("sessions.json"));
+        let source = Storage::new_for_test_profile("empty-source");
+        let target = Storage::new_for_test_profile("empty-target");
         source.update(|_instances, groups| {
             let mut group = Group::new("empty", "empty");
             group.collapsed = true;
@@ -4493,12 +4845,8 @@ mod tests {
     fn profile_group_move_rejects_fresh_unplanned_member() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-        let source_dir = temp.path().join("source-members");
-        let target_dir = temp.path().join("target-members");
-        fs::create_dir_all(&source_dir)?;
-        fs::create_dir_all(&target_dir)?;
-        let source = Storage::new_for_test_path("member-source", source_dir.join("sessions.json"));
-        let target = Storage::new_for_test_path("member-target", target_dir.join("sessions.json"));
+        let source = Storage::new_for_test_profile("member-source");
+        let target = Storage::new_for_test_profile("member-target");
         let mut before = Instance::new("snapshot", "/repo/snapshot");
         before.group_path = "team".to_string();
         let mut after = before.clone();
@@ -4542,24 +4890,21 @@ mod tests {
 
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
-        let source_dir = temp.path().join("source-symlink");
-        let target_dir = temp.path().join("target-symlink");
+        let source = Storage::new_for_test_profile("symlink-source");
+        let target = Storage::new_for_test_profile("symlink-target");
         let resolved_sessions_dir = temp.path().join("resolved-sessions");
         let resolved_groups_dir = temp.path().join("resolved-groups");
-        fs::create_dir_all(&source_dir)?;
-        fs::create_dir_all(&target_dir)?;
+        let target_dir = target.sessions_path().parent().unwrap();
         fs::create_dir_all(&resolved_sessions_dir)?;
         fs::create_dir_all(&resolved_groups_dir)?;
-        let source = Storage::new_for_test_path("symlink-source", source_dir.join("sessions.json"));
-        let target_link = target_dir.join("sessions.json");
+        let target_link = target.sessions_path();
         let target_groups_link = target_dir.join("groups.json");
         let resolved_sessions = resolved_sessions_dir.join("sessions.json");
         let resolved_groups = resolved_groups_dir.join("groups.json");
         fs::write(&resolved_sessions, b"[]")?;
         fs::write(&resolved_groups, b"[]")?;
-        symlink(&resolved_sessions, &target_link)?;
+        symlink(&resolved_sessions, target_link)?;
         symlink(&resolved_groups, &target_groups_link)?;
-        let target = Storage::new_for_test_path("symlink-target", target_link);
         let mut before = Instance::new("session", "/repo/session");
         before.source_profile = "symlink-source".to_string();
         before.group_path = "work".to_string();
@@ -4675,9 +5020,9 @@ mod tests {
     #[test]
     #[serial]
     fn profile_move_rejects_shared_storage_lock_inode() -> Result<()> {
-        let (temp, _guard, source, target, before, _after) = setup_recovery_env("inode")?;
-        let source_dir = temp.path().join("inode-source");
-        let target_dir = temp.path().join("inode-target");
+        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("inode")?;
+        let source_dir = source.sessions_path().parent().unwrap();
+        let target_dir = target.sessions_path().parent().unwrap();
         target.update(|_instances, groups| {
             groups.push(Group::new("target", "target"));
             Ok(())
@@ -4784,14 +5129,8 @@ mod tests {
     )> {
         let temp = tempfile::TempDir::new()?;
         let guard = isolate_app_dir_at(temp.path());
-        let source_dir = temp.path().join(format!("{tag}-source"));
-        let target_dir = temp.path().join(format!("{tag}-target"));
-        fs::create_dir_all(&source_dir)?;
-        fs::create_dir_all(&target_dir)?;
-        let source =
-            Storage::new_for_test_path(&format!("{tag}-source"), source_dir.join("sessions.json"));
-        let target =
-            Storage::new_for_test_path(&format!("{tag}-target"), target_dir.join("sessions.json"));
+        let source = Storage::new_for_test_profile(&format!("{tag}-source"));
+        let target = Storage::new_for_test_profile(&format!("{tag}-target"));
         let mut before = Instance::new("session", "/repo/session");
         before.source_profile = format!("{tag}-source");
         before.group_path = "work".to_string();
@@ -5331,13 +5670,12 @@ mod tests {
 
     #[test]
     fn post_repair_load_error_prevents_home_reload_and_keeps_report() -> Result<()> {
-        let (temp, _guard, source, target, before, _after) = setup_recovery_env("reload-fallback")?;
+        let (_temp, _guard, source, target, before, _after) =
+            setup_recovery_env("reload-fallback")?;
         push_copy(&target, &before)?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
         move_journal::record(&entry)?;
-        let bad_dir = temp.path().join("bad");
-        fs::create_dir_all(&bad_dir)?;
-        let bad = Storage::new_for_test_path("bad", bad_dir.join("sessions.json"));
+        let bad = Storage::new_for_test_profile("bad");
         fs::write(bad.sessions_path(), b"not-json")?;
         let outcome = reconcile_loaded(&[&source, &target, &bad]);
 
@@ -5455,11 +5793,8 @@ mod tests {
 
     #[test]
     fn unresolved_move_refuses_a_competing_move_and_remains_recoverable() -> Result<()> {
-        let (temp, _guard, a, b, before, _after) = setup_recovery_env("chain")?;
-        let c = Storage::new_for_test_path(
-            "chain-third",
-            temp.path().join("chain-third/sessions.json"),
-        );
+        let (_temp, _guard, a, b, before, _after) = setup_recovery_env("chain")?;
+        let c = Storage::new_for_test_profile("chain-third");
         c.update(|_, _| Ok(()))?;
         run_crashing_move(&a, &b, "profile-move-target");
         assert_eq!(journal_entry_count(&a), 1);

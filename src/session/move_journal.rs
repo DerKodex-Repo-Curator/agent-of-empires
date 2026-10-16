@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::environment::shell_escape_script_word;
 use super::storage::{atomic_write_verified, sync_parent_directory};
 
 /// Historical journal layouts are converted by the migration registry.
@@ -1074,6 +1075,8 @@ pub(crate) struct EffectRecord {
     pub(crate) retained: bool,
 }
 
+/// Pending effects remain reserved until an operator attests that all actors stopped.
+/// Snapshot equality or a free parent lease never proves a child has exited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ResourceIntent {
     pub(crate) owner: IntentOwner,
@@ -1087,6 +1090,8 @@ pub(crate) struct ResourceIntent {
     pub(crate) phase: EffectPhase,
     pub(crate) quiesced: bool,
     pub(crate) rollback: bool,
+    #[serde(default)]
+    pub(crate) abandoned: bool,
     pub(crate) conflict: Option<String>,
 }
 
@@ -1166,6 +1171,7 @@ impl ResourceIntent {
             phase: EffectPhase::Prepared,
             quiesced: false,
             rollback: false,
+            abandoned: false,
             conflict: None,
         })
     }
@@ -1545,7 +1551,7 @@ impl ResourceIntent {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct LegacyScope {
+pub(crate) struct JournalScope {
     pub(crate) profiles: Vec<ProfileAuthority>,
     pub(crate) resources: Vec<ResourceKey>,
 }
@@ -1564,7 +1570,14 @@ pub(crate) enum MoveAuthority {
     LegacyConflict {
         legacy: serde_json::Value,
         reason: String,
-        scope: LegacyScope,
+        scope: JournalScope,
+    },
+    Cleanup {
+        scope: JournalScope,
+        effects: Vec<EffectRecord>,
+        #[serde(default)]
+        abandoned: bool,
+        conflict: Option<String>,
     },
 }
 
@@ -1597,14 +1610,17 @@ pub(crate) fn resource_inventory() -> Result<Vec<(PathBuf, MoveJournalEntry)>> {
     let scanned = scan();
     anyhow::ensure!(
         scanned.unreadable_dirs.is_empty(),
-        "resource intent inventory is incomplete: {:?}",
+        "resource intent inventory is incomplete: {:?}; inspect with `aoe intents list`; use `aoe intents clear '<path>' --actors-stopped` after resolving the named directory",
         scanned.unreadable_dirs
     );
     scanned
         .entries
         .into_iter()
         .map(|(path, entry)| {
-            let entry = entry.map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+            let entry = entry.map_err(|error| anyhow::anyhow!(
+                "{}: {error}; inspect with `aoe intents list`; resolve with `aoe intents clear {} --actors-stopped`",
+                path.display(), shell_escape_script_word(&path.to_string_lossy())
+            ))?;
             Ok((path, entry))
         })
         .collect()
@@ -1625,7 +1641,8 @@ impl MoveJournalEntry {
                     source.sessions_path == profile.sessions_path
                         || target.sessions_path == profile.sessions_path
                 }
-                MoveAuthority::LegacyConflict { scope, .. } => scope.profiles.iter().any(|known| {
+                MoveAuthority::LegacyConflict { scope, .. }
+                | MoveAuthority::Cleanup { scope, .. } => scope.profiles.iter().any(|known| {
                     known.sessions_path == profile.sessions_path || known.profile == profile.profile
                 }),
             }
@@ -1634,14 +1651,27 @@ impl MoveJournalEntry {
     pub(crate) fn reserved_resources(&self) -> &[ResourceKey] {
         match &self.authority {
             MoveAuthority::Resource { intent } => &intent.resources,
-            MoveAuthority::LegacyConflict { scope, .. } => &scope.resources,
+            MoveAuthority::LegacyConflict { scope, .. } | MoveAuthority::Cleanup { scope, .. } => {
+                &scope.resources
+            }
             MoveAuthority::Metadata { .. } => &[],
         }
+    }
+
+    pub(crate) fn is_arbitration_evidence(&self) -> bool {
+        matches!(
+            self.authority,
+            MoveAuthority::Metadata { .. } | MoveAuthority::LegacyConflict { .. }
+        )
     }
 }
 
 fn has_recorded_intents() -> Result<bool> {
     let directory = journal_dir()?;
+    anyhow::ensure!(
+        !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "journal directory is an alias"
+    );
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1670,6 +1700,7 @@ pub(crate) struct ResourceAdmission<'a> {
     before: Option<Vec<RowClaims>>,
     storage: &'a super::Storage,
     owner: Option<&'a JournalTransaction>,
+    attested: Option<&'a super::Instance>,
 }
 
 impl<'a> ResourceAdmission<'a> {
@@ -1690,7 +1721,44 @@ impl<'a> ResourceAdmission<'a> {
             before: needed.then(|| rows.iter().map(RowClaims::capture).collect()),
             storage,
             owner,
+            attested: None,
         }
+    }
+
+    pub(crate) fn capture_attested(
+        storage: &'a super::Storage,
+        rows: &[super::Instance],
+        expected: &'a super::Instance,
+    ) -> Self {
+        Self {
+            before: Some(rows.iter().map(RowClaims::capture).collect()),
+            storage,
+            owner: None,
+            attested: Some(expected),
+        }
+    }
+
+    fn clears_attested_binding(
+        &self,
+        old: Option<&RowClaims>,
+        row: Option<&super::Instance>,
+    ) -> bool {
+        let (Some(expected), Some(old), Some(row)) = (self.attested, old, row) else {
+            return false;
+        };
+        old.matches(expected)
+            && expected
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    reservation.resource_intent.is_some()
+                        && reservation.generation == expected.lifecycle_generation
+                })
+            && row.id == old.id
+            && row.created_at == old.created_at
+            && row.lifecycle_generation == old.generation
+            && row.lifecycle_reservation.is_none()
+            && old.namespace_matches(row)
     }
 
     pub(crate) fn validate(&self, rows: &[super::Instance]) -> Result<()> {
@@ -1742,7 +1810,8 @@ impl<'a> ResourceAdmission<'a> {
                 .and_then(|row| row.lifecycle_reservation.as_ref())
                 .and_then(|reservation| reservation.resource_intent.as_deref());
             anyhow::ensure!(
-                owns || (old_intent.is_none() && new_intent.is_none()),
+                owns || self.clears_attested_binding(old, row)
+                    || (old_intent.is_none() && new_intent.is_none()),
                 "resource reservation is busy; only its owning transaction can change it"
             );
             // A ticket cannot bypass its own record for a different row or generation.
@@ -1824,7 +1893,7 @@ fn owns_row_change(
         id == owner.id && created_at == owner.created_at && generation == owner.generation
     };
     match &entry.authority {
-        MoveAuthority::LegacyConflict { .. } => false,
+        MoveAuthority::LegacyConflict { .. } | MoveAuthority::Cleanup { .. } => false,
         MoveAuthority::Metadata {
             source,
             target,
@@ -1851,7 +1920,8 @@ fn owns_row_change(
             })
         }
         MoveAuthority::Resource { intent } => {
-            if matches!(intent.phase, EffectPhase::Pending | EffectPhase::Conflict)
+            if (!intent.abandoned
+                && matches!(intent.phase, EffectPhase::Pending | EffectPhase::Conflict))
                 || (profile.sessions_path != intent.owner.profile.sessions_path
                     && profile.sessions_path != intent.target.sessions_path)
             {
@@ -1904,7 +1974,8 @@ fn owns_row_change(
                     return true;
                 }
                 marker.is_none()
-                    && (matches!(intent.phase, EffectPhase::Applied | EffectPhase::Committed)
+                    && (intent.abandoned
+                        || matches!(intent.phase, EffectPhase::Applied | EffectPhase::Committed)
                         || (prepared
                             && (intent.effects.is_empty()
                                 || intent
@@ -2011,6 +2082,163 @@ fn open_lease(path: &Path, create: bool) -> Result<fs::File> {
         "journal lease is not a regular file"
     );
     Ok(file)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeaseState {
+    Free,
+    Live,
+    Missing,
+}
+
+/// Probing never creates a sidecar and never proves that Git children stopped.
+pub(crate) fn lease_state(path: &Path) -> Result<LeaseState> {
+    use fs2::FileExt;
+    let file = match open_lease(path, false) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(LeaseState::Missing)
+        }
+        Err(error) => return Err(error),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(LeaseState::Free),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(LeaseState::Live),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn journal_directories() -> Result<Vec<PathBuf>> {
+    let app = super::get_app_dir()?;
+    let mut directories = vec![app.join(JOURNAL_DIR_NAME)];
+    for profile in super::list_profiles_for_worktree_inventory()? {
+        directories.push(app.join("profiles").join(profile).join(JOURNAL_DIR_NAME));
+    }
+    Ok(directories)
+}
+
+pub(crate) fn operator_inventory() -> Result<ScanResult> {
+    let mut result = ScanResult {
+        entries: Vec::new(),
+        unreadable_dirs: Vec::new(),
+    };
+    for directory in journal_directories()? {
+        let scanned = scan_in(&directory);
+        result.entries.extend(scanned.entries);
+        result.unreadable_dirs.extend(scanned.unreadable_dirs);
+    }
+    Ok(result)
+}
+
+/// Only an attested operator may create a missing lease for old or damaged evidence.
+pub(crate) fn resolution_lease(
+    root: &super::storage::OwnershipGuard,
+    path: &Path,
+) -> Result<(JournalTransaction, Vec<u8>)> {
+    use fs2::FileExt;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    root.require_exclusive()?;
+    anyhow::ensure!(
+        path.extension()
+            .is_some_and(|extension| extension == "json"),
+        "expected a journal JSON path"
+    );
+    let parent = fs::canonicalize(
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?;
+    let app = fs::canonicalize(root.app_dir())?;
+    let allowed = journal_directories()?.iter().any(|directory| {
+        fs::symlink_metadata(directory)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            && fs::canonicalize(directory)
+                .is_ok_and(|directory| directory == parent && directory.starts_with(&app))
+    });
+    anyhow::ensure!(
+        allowed,
+        "target is outside this application's journal directories"
+    );
+    let path = parent.join(path.file_name().context("journal path has no filename")?);
+    let metadata = fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "journal is not a regular nofollow file"
+    );
+    let mut original = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)?;
+    anyhow::ensure!(
+        original.metadata()?.is_file(),
+        "journal is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    original.read_to_end(&mut bytes)?;
+    let lease = match open_lease(&path, true) {
+        Ok(file) => {
+            file.sync_all()?;
+            sync_parent_directory(&path)?;
+            file
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            open_lease(&path, false)?
+        }
+        Err(error) => return Err(error),
+    };
+    lease
+        .try_lock_exclusive()
+        .context("intent producer is still live; refusing resolution")?;
+    anyhow::ensure!(
+        super::storage::filesystem_identity(&original.metadata()?)
+            == super::storage::filesystem_identity(&fs::symlink_metadata(&path)?)
+            && fs::read(&path)? == bytes,
+        "journal changed during resolution"
+    );
+    Ok((
+        JournalTransaction {
+            path,
+            _lease: lease,
+        },
+        bytes,
+    ))
+}
+
+pub(crate) fn create_migration_lease(path: &Path) -> Result<()> {
+    let file = match open_lease(path, true) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            open_lease(path, false)?
+        }
+        Err(error) => return Err(error),
+    };
+    file.sync_all()?;
+    sync_parent_directory(path)
+}
+
+pub(crate) fn binding_path(binding: &str) -> Result<PathBuf> {
+    let name = Path::new(binding);
+    anyhow::ensure!(
+        name.file_name().and_then(|name| name.to_str()) == Some(binding)
+            && name
+                .extension()
+                .is_some_and(|extension| extension == "json"),
+        "invalid resource intent binding"
+    );
+    Ok(journal_dir()?.join(name))
 }
 
 pub(crate) fn try_recovery_lease(
@@ -2162,6 +2390,13 @@ fn scan_in(dir: &Path) -> ScanResult {
         entries: Vec::new(),
         unreadable_dirs: Vec::new(),
     };
+    if fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        result.unreadable_dirs.push((
+            dir.to_path_buf(),
+            "journal directory is an alias, not an original directory".into(),
+        ));
+        return result;
+    }
     {
         let read_dir = match fs::read_dir(dir) {
             Ok(read_dir) => read_dir,

@@ -54,6 +54,10 @@ impl TrashPoller {
     pub(crate) fn is_pending(&self, id: &str) -> bool {
         self.worker.is_pending(id)
     }
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> std::thread::Result<()> {
+        self.worker.finish_for_test()
+    }
 }
 
 impl Default for TrashPoller {
@@ -72,7 +76,7 @@ mod tests {
 
     impl Drop for TestPoller {
         fn drop(&mut self) {
-            if let Some(poller) = self.0.take() {
+            if let Some(mut poller) = self.0.take() {
                 let _ = poller.worker.finish_for_test();
             }
         }

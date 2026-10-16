@@ -1956,9 +1956,10 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Session already exists with same title and path"));
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Duplicate(_))
+        ));
 
         rename_session(
             "rename-duplicate",
@@ -1998,9 +1999,10 @@ mod rename_tests {
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Session already exists with same title and path"));
+        assert!(matches!(
+            error.downcast_ref::<crate::session::rename::RenameRejected>(),
+            Some(crate::session::rename::RenameRejected::Duplicate(_))
+        ));
         let tied = storage
             .load()
             .unwrap()
@@ -2041,6 +2043,51 @@ mod rename_tests {
             .unwrap();
         assert_eq!(active.title, "Main Branch");
         assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_only_rename_allows_unavailable_managed_checkout() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(false);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_unwatched("metadata-only").unwrap();
+        let mut row = Instance::new(
+            "before",
+            dir.path().join("missing-checkout").to_str().unwrap(),
+        );
+        row.status = Status::Running;
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "before".into(),
+            main_repo_path: dir
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        rename_session(
+            "metadata-only",
+            args(&row.id, Some("after"), Some("work"), None),
+        )
+        .await
+        .unwrap();
+        let renamed = storage.load().unwrap().remove(0);
+        assert_eq!(renamed.title, "after");
+        assert_eq!(renamed.group_path, "work");
+        assert_eq!(renamed.project_path, row.project_path);
+        assert_eq!(renamed.worktree_info, row.worktree_info);
+        assert!(renamed.lifecycle_reservation.is_none());
+        assert!(!dir.path().join("missing-checkout").exists());
+        assert!(!dir.path().join("missing-repo").exists());
     }
 
     #[tokio::test]

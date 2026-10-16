@@ -59,6 +59,23 @@ pub(crate) async fn attach_project(
     else {
         return Err(AttachError::NotFound);
     };
+    let state = Arc::clone(state);
+    let id = id.to_owned();
+    let repo_path = repo_path.to_owned();
+    tokio::spawn(
+        async move { complete_attach(&state, &id, &repo_path, on_existing, _submission).await },
+    )
+    .await
+    .map_err(|error| AttachError::Rejected(format!("attach task panicked: {error}")))?
+}
+
+async fn complete_attach(
+    state: &Arc<AppState>,
+    id: &str,
+    repo_path: &Path,
+    on_existing: ExistingBranch,
+    _submission: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(AttachOutcome, WorkerOutcome), AttachError> {
     let inst_lock = state.instance_lock(id).await;
     // Release these gates before Git hooks can reenter this daemon.
     let _guard = inst_lock.lock().await;
@@ -530,6 +547,104 @@ fn complete_worker_restart(
 mod tests {
     use super::*;
     use crate::server::test_support as support;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn cancelled_http_awaiter_keeps_initial_attach_admission_owned() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let directories = tempfile::tempdir().unwrap();
+        let initialize = |path: &Path| {
+            let repo = git2::Repository::init(path).unwrap();
+            let signature = git2::Signature::now("fixture", "fixture@example.invalid").unwrap();
+            let tree = repo.index().unwrap().write_tree().unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base",
+                &repo.find_tree(tree).unwrap(),
+                &[],
+            )
+            .unwrap();
+            let branch = repo.head().unwrap().shorthand().unwrap().to_owned();
+            branch
+        };
+        let primary = directories.path().join("primary");
+        let additional = directories.path().join("additional");
+        let base = initialize(&primary);
+        initialize(&additional);
+        let workspace = directories.path().join("workspace");
+        let checkout = workspace.join("primary");
+        crate::git::GitWorktree::new(primary.clone())
+            .unwrap()
+            .with_init_submodules(false)
+            .create_worktree("topic", &checkout, true, Some(&base))
+            .unwrap();
+        let mut instance =
+            crate::session::Instance::new("attach cancellation", workspace.to_str().unwrap());
+        instance.source_profile = "default".into();
+        instance.view = crate::session::View::Structured;
+        instance.status = crate::session::Status::Stopped;
+        instance.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "topic".into(),
+            workspace_dir: workspace.to_string_lossy().into_owned(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "primary".into(),
+                source_path: primary.to_string_lossy().into_owned(),
+                branch: "topic".into(),
+                worktree_path: checkout.to_string_lossy().into_owned(),
+                main_repo_path: primary.to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: Some(base),
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        support::seed_instances_on_disk_for_test("default", vec![instance.clone()]);
+        let storage = Storage::open_unwatched("default").unwrap();
+        let state = support::build_test_app_state(vec![instance.clone()]);
+        let root = crate::session::storage::acquire_ownership_lock().unwrap();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let observer = crate::session::storage::observe_root_contention_for_test(contended_tx);
+        let (mirroring_tx, mirroring_rx) = tokio::sync::oneshot::channel();
+        *BEFORE_MIRROR_ROOT.lock() = Some(mirroring_tx);
+        let awaiter = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = instance.id.clone();
+            async move { attach_project(&state, &id, &additional, ExistingBranch::Refuse).await }
+        });
+        tokio::task::spawn_blocking(move || {
+            contended_rx.recv_timeout(std::time::Duration::from_secs(3))
+        })
+        .await
+        .unwrap()
+        .expect("attach must reach its initial blocking admission");
+        awaiter.abort();
+        assert!(awaiter.await.unwrap_err().is_cancelled());
+        drop(root);
+        drop(observer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), mirroring_rx)
+            .await
+            .unwrap()
+            .expect("owned attach must reach publication after HTTP cancellation");
+        let instance_lock = state.instance_lock(&instance.id).await;
+        let _terminal = instance_lock.lock().await;
+        let rows = storage.load().unwrap();
+        assert!(rows[0].lifecycle_reservation.is_none());
+        assert_eq!(rows[0].workspace_info.as_ref().unwrap().repos.len(), 2);
+        assert!(crate::session::move_journal::scan().entries.is_empty());
+        assert_eq!(
+            state.instances.read().await[0]
+                .workspace_info
+                .as_ref()
+                .unwrap()
+                .repos
+                .len(),
+            2
+        );
+    }
 
     /// #4116: an archive committed while the restarted worker's `before_session` hook runs
     /// refuses the respawn instead of launching the archived row.

@@ -105,9 +105,8 @@ mod tests {
         use std::time::Duration;
 
         let _app = crate::session::test_support::isolate_app_dir();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        let storage = Storage::new_for_test_path("v028-in-flight", path.clone());
+        let storage = Storage::new_for_test_profile("v028-in-flight");
+        let path = storage.sessions_path().to_path_buf();
         storage
             .update(|instances, _| {
                 let mut frozen = Instance::new("frozen", "/tmp/frozen");

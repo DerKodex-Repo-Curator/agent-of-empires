@@ -236,7 +236,7 @@ async fn run_rename(
             return api_error(
                 StatusCode::CONFLICT,
                 "session_changed",
-                "Could not rename this session; refresh its state and retry",
+                "Could not complete the rename. Completed Git effects may still roll forward during recovery; inspect and reload the session before retrying",
             );
         }
         Err(error) => {

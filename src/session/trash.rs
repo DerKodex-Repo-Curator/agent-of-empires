@@ -13,9 +13,9 @@ use super::LifecycleOperation;
 use chrono::{DateTime, Utc};
 
 use crate::git::GitWorktree;
-use crate::session::storage::{
-    acquire_ownership_lock, acquire_session_identity_lock_with_ownership, OwnershipGuard,
-};
+#[cfg(test)]
+use crate::session::storage::acquire_ownership_lock;
+use crate::session::storage::{acquire_session_identity_lock_with_ownership, OwnershipGuard};
 use crate::session::worktree_edit::ensure_sandbox_container_released;
 use crate::session::Instance;
 
@@ -186,9 +186,20 @@ pub fn prepare_trash(
         LifecycleOperation::Trash,
         generation,
     );
-    let root = acquire_ownership_lock()?;
+    let root = storage.acquire_ownership_lock_bound()?;
     let _identity = acquire_session_identity_lock_with_ownership(&root)?;
     let _lifecycle = storage.acquire_instance_lifecycle_lock_with_ownership(&root, &baseline.id)?;
+    let request = prepare_trash_with_ownership(storage, baseline, generation, &root)?;
+    cleanup.disarm();
+    Ok(request)
+}
+
+fn prepare_trash_with_ownership(
+    storage: &crate::session::Storage,
+    baseline: &Instance,
+    generation: u64,
+    root: &OwnershipGuard,
+) -> anyhow::Result<TrashRequest> {
     let before = storage
         .load_strict_for_worktree_ownership()?
         .into_iter()
@@ -224,7 +235,7 @@ pub fn prepare_trash(
                 "trash holding path {} already exists",
                 target.display()
             );
-            ensure_move_unclaimed(&before, &root, &source, &target)?;
+            ensure_move_unclaimed(&before, root, &source, &target)?;
             let info = before.worktree_info.as_ref().expect("managed worktree");
             let effect = ResourceEffect::MoveWorktree {
                 repository: PathBuf::from(&info.main_repo_path),
@@ -258,8 +269,7 @@ pub fn prepare_trash(
         effects,
         Vec::new(),
     )?;
-    let admitted = ResourceReservation::admit_with_ownership(storage, &root, intent, before)?;
-    cleanup.disarm();
+    let admitted = ResourceReservation::admit_with_ownership(storage, root, intent, before)?;
     Ok(TrashRequest {
         storage: storage.clone(),
         session_id: admitted.instance.id.clone(),
@@ -270,6 +280,66 @@ pub fn prepare_trash(
         relocate_warning,
         started: AtomicBool::new(false),
     })
+}
+
+pub(crate) fn try_prepare_trash(
+    storage: &crate::session::Storage,
+    baseline: &Instance,
+) -> anyhow::Result<Option<TrashRequest>> {
+    let Some(root) = super::storage::try_acquire_ownership_lock()? else {
+        return Ok(None);
+    };
+    let Some(_identity) = super::storage::try_acquire_session_identity_lock_with_ownership(&root)?
+    else {
+        return Ok(None);
+    };
+    let Some(_lifecycle) =
+        storage.try_acquire_instance_lifecycle_lock_with_ownership(&root, &baseline.id)?
+    else {
+        return Ok(None);
+    };
+    let Some(reserved) = storage.try_update_with_ownership(&root, |rows, _| {
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == baseline.id && row.created_at == baseline.created_at)
+            .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
+        row.try_acquire_lifecycle_reservation(
+            LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )?;
+        row.trash();
+        Ok(row.clone())
+    })?
+    else {
+        return Ok(None);
+    };
+    let result =
+        prepare_trash_with_ownership(storage, &reserved, reserved.lifecycle_generation, &root);
+    if result.is_err() {
+        let cleanup = storage.update_with_ownership(&root, |rows, _| {
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == reserved.id && row.created_at == reserved.created_at)
+            {
+                if row
+                    .lifecycle_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| reservation.resource_intent.is_none())
+                {
+                    row.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Trash,
+                        reserved.lifecycle_generation,
+                    );
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = cleanup {
+            tracing::warn!(target: "session.trash", session = %reserved.id, "trash admission cleanup could not persist: {error:#}");
+        }
+    }
+    result.map(Some)
 }
 
 fn run_transition_effect(
@@ -381,7 +451,7 @@ pub(crate) fn trash_transition(
         for index in 1..request.effect_count {
             run_transition_effect(&request.transaction, &request.instance, index)?;
         }
-        let root = acquire_ownership_lock()?;
+        let root = request.storage.acquire_ownership_lock_bound()?;
         let _identity = acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle = request
             .storage
@@ -444,7 +514,9 @@ pub(crate) fn restore_transition(
 ) -> Result<Instance, RestoreError> {
     use crate::session::claim::RestoreClaimDecision;
     let (transaction, reserved, effect_count) = {
-        let root = acquire_ownership_lock().map_err(RestoreError::Persist)?;
+        let root = storage
+            .acquire_ownership_lock_bound()
+            .map_err(RestoreError::Persist)?;
         let _identity =
             acquire_session_identity_lock_with_ownership(&root).map_err(RestoreError::Persist)?;
         let _lifecycle = storage
@@ -560,7 +632,7 @@ pub(crate) fn restore_transition(
         }
     }
     let publish = (|| -> anyhow::Result<_> {
-        let root = acquire_ownership_lock()?;
+        let root = storage.acquire_ownership_lock_bound()?;
         let _identity = acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle =
             storage.acquire_instance_lifecycle_lock_with_ownership(&root, &reserved.id)?;
@@ -698,7 +770,7 @@ pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>>
 pub(crate) fn reconcile_trashed_storage(
     storage: &crate::session::Storage,
 ) -> anyhow::Result<Vec<Instance>> {
-    let ownership = crate::session::storage::acquire_ownership_read()?;
+    let ownership = storage.acquire_ownership_read_bound()?;
     storage.verify_profile_available()?;
     let mut cache = ProtectedBranchCache::default();
     let mut candidates: Vec<Instance> = storage
@@ -756,7 +828,7 @@ pub fn reconcile_trashed_transition(
         return Ok(false);
     }
     let (transaction, reserved, effect_count) = {
-        let root = acquire_ownership_lock()?;
+        let root = storage.acquire_ownership_lock_bound()?;
         let _identity = acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle = storage.acquire_instance_lifecycle_lock_with_ownership(&root, &inst.id)?;
         let before = storage
@@ -858,7 +930,7 @@ pub fn reconcile_trashed_transition(
         for index in 0..effect_count {
             run_transition_effect(&transaction, &reserved, index)?;
         }
-        let root = acquire_ownership_lock()?;
+        let root = storage.acquire_ownership_lock_bound()?;
         let _identity = acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle =
             storage.acquire_instance_lifecycle_lock_with_ownership(&root, &reserved.id)?;

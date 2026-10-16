@@ -290,15 +290,163 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn read_only_mutators_reject_before_json_errors() {
+        use axum::body::{to_bytes, Body};
+        use axum::extract::ConnectInfo;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let mut state = crate::server::test_support::build_test_app_state(Vec::new());
+        std::sync::Arc::get_mut(&mut state).unwrap().read_only = true;
+        let router = crate::server::test_support::build_router_for_test(state);
+        for (method, uri) in [
+            ("POST", "/api/sessions"),
+            ("DELETE", "/api/sessions/missing"),
+            ("DELETE", "/api/workspaces"),
+            ("PATCH", "/api/sessions/missing"),
+            ("PATCH", "/api/sessions/missing/worktree-name"),
+            ("POST", "/api/sessions/missing/projects"),
+            ("POST", "/api/sessions/missing/send"),
+            ("POST", "/api/sessions/missing/ensure"),
+            ("POST", "/api/sessions/missing/terminal"),
+            ("DELETE", "/api/sessions/missing/terminal"),
+            ("POST", "/api/sessions/missing/container-terminal"),
+            ("PATCH", "/api/sessions/missing/group"),
+            ("PATCH", "/api/sessions/missing/notifications"),
+            ("PATCH", "/api/sessions/missing/diff-base"),
+            ("PATCH", "/api/sessions/missing/pin"),
+            ("PATCH", "/api/sessions/missing/color"),
+            ("PATCH", "/api/sessions/missing/archive"),
+            ("PATCH", "/api/sessions/missing/snooze"),
+            ("POST", "/api/sessions/missing/trash"),
+            ("POST", "/api/sessions/missing/restore"),
+            ("PATCH", "/api/sessions/missing/unread"),
+            ("POST", "/api/sessions/missing/stop"),
+            ("POST", "/api/sessions/missing/smart-rename"),
+            ("POST", "/api/sessions/missing/start"),
+            ("PUT", "/api/workspace-ordering"),
+            ("POST", "/api/git/clone"),
+            ("POST", "/api/mcp/servers/missing/resolve"),
+            ("POST", "/api/mcp/servers/missing/keep"),
+            ("POST", "/api/mcp/servers/missing/drop"),
+            ("PATCH", "/api/log-level"),
+            ("POST", "/api/projects"),
+            ("DELETE", "/api/projects/missing"),
+            ("PATCH", "/api/projects/missing"),
+            ("PATCH", "/api/settings"),
+            ("POST", "/api/app-state/dismiss-update"),
+            ("PATCH", "/api/app-state/web-ui-state"),
+            ("POST", "/api/app-state/web-tour-seen"),
+            ("POST", "/api/app-state/tip-seen"),
+            ("POST", "/api/tips/show"),
+            ("POST", "/api/app-state/volume-ignores-globs-acknowledged"),
+            ("POST", "/api/profiles"),
+            ("DELETE", "/api/profiles/missing"),
+            ("PATCH", "/api/profiles/missing/rename"),
+            ("PATCH", "/api/default-profile"),
+            ("PATCH", "/api/profiles/missing/settings"),
+            ("POST", "/api/sessions/missing/acp/spawn"),
+            ("DELETE", "/api/sessions/missing/acp"),
+            ("POST", "/api/sessions/missing/acp/switch-agent"),
+            ("POST", "/api/sessions/missing/acp/switch-provider"),
+            ("POST", "/api/sessions/missing/acp/prompt"),
+            ("POST", "/api/sessions/missing/acp/prompt/diff-comments"),
+            ("POST", "/api/sessions/missing/acp/cancel"),
+            ("POST", "/api/sessions/missing/acp/force_end_turn"),
+            ("POST", "/api/sessions/missing/acp/approvals/1"),
+            ("POST", "/api/sessions/missing/acp/elicitations/1"),
+            ("POST", "/api/sessions/missing/acp/enable"),
+            ("POST", "/api/sessions/missing/acp/disable"),
+            ("POST", "/api/sessions/missing/acp/mode"),
+            ("POST", "/api/sessions/missing/acp/config-option"),
+            ("POST", "/api/push/subscribe"),
+            ("POST", "/api/push/unsubscribe"),
+            ("POST", "/api/push/test"),
+            ("POST", "/api/telemetry/consent"),
+            ("POST", "/api/telemetry/seen"),
+            ("POST", "/api/telemetry/structured-interaction"),
+            ("POST", "/api/plugins/missing/action"),
+        ] {
+            for (content_type, body) in [
+                ("application/json", "{"),
+                ("application/json", r#"{"target":12}"#),
+                ("text/plain", "{}"),
+            ] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", "127.0.0.1")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap();
+                request.extensions_mut().insert(ConnectInfo(
+                    "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+                let response = router.clone().oneshot(request).await.unwrap();
+                let conditional_observer = uri == "/api/sessions/missing/ensure";
+                assert_eq!(
+                    response.status(),
+                    if conditional_observer {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::FORBIDDEN
+                    },
+                    "{method} {uri}: {content_type} {body}"
+                );
+                if !conditional_observer
+                    && uri != "/api/log-level"
+                    && !uri.starts_with("/api/push/")
+                {
+                    let actual: serde_json::Value = serde_json::from_slice(
+                        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual,
+                        serde_json::json!({
+                            "error": "read_only", "message": "Server is in read-only mode"
+                        }),
+                        "{method} {uri}"
+                    );
+                }
+            }
+        }
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let router = crate::server::test_support::build_router_for_test(state);
+        for (content_type, body, status) in [
+            ("application/json", "{", StatusCode::BAD_REQUEST),
+            (
+                "application/json",
+                r#"{"target":12}"#,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("text/plain", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/sessions/missing/acp/switch-agent")
+                .header("host", "127.0.0.1")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:5557".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                status
+            );
+        }
+    }
+
     #[test]
     fn input_validators_reject_shell_control_and_path_characters() {
-        // Removing a character here is a security change, not a tidy-up.
-        let expected: &[char] = &[
+        for c in [
             ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'',
             '!', '#', '*', '?', '[', ']', '~', '\t', '\0',
-        ];
-        assert_eq!(SHELL_METACHARACTERS, expected);
-        for &c in SHELL_METACHARACTERS {
+        ] {
             assert!(validate_no_shell_injection(&format!("prefix{c}suffix"), "field").is_err());
         }
 

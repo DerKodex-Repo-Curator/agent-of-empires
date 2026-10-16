@@ -2,7 +2,10 @@ use super::*;
 use crate::session::Status;
 use chrono::Utc;
 
-fn boot_view_with_one_session(title: &str, path: &str) -> (TempDir, AppDirGuard, HomeView, String) {
+fn boot_view_with_one_session(
+    title: &str,
+    path: &str,
+) -> (TempDir, AppDirGuard, lifecycle::TestHomeView, String) {
     let temp = TempDir::new().unwrap();
     let guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
@@ -497,7 +500,7 @@ fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
 
     let ownership = crate::session::storage::acquire_ownership_lock().unwrap();
     let guards = view
-        .lock_session_mutation_and_reload_with_ownership(&ownership, &id)
+        .try_lock_session_mutation_and_reload_with_ownership(&ownership, &id)
         .unwrap();
     let authoritative = view.get_instance(&id).cloned().unwrap();
     assert_eq!(authoritative.title, "peer-new-title");
@@ -555,7 +558,7 @@ fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
         .unwrap();
 
     assert!(
-        view.lock_session_mutation_and_reload_with_ownership(
+        view.try_lock_session_mutation_and_reload_with_ownership(
             &crate::session::storage::acquire_ownership_lock().unwrap(),
             &id
         )

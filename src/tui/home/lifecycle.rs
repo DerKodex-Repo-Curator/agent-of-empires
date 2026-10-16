@@ -3,7 +3,52 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(crate) struct TestHomeView(pub(super) HomeView);
+
+#[cfg(test)]
+impl std::ops::Deref for TestHomeView {
+    type Target = HomeView;
+    fn deref(&self) -> &HomeView {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestHomeView {
+    fn deref_mut(&mut self) -> &mut HomeView {
+        &mut self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHomeView {
+    fn drop(&mut self) {
+        self.0.join_background_workers_for_test();
+    }
+}
+
 impl HomeView {
+    #[cfg(test)]
+    fn join_background_workers_for_test(&mut self) {
+        let _ = self.status_poller.finish_for_test();
+        let _ = self.metrics_poller.finish_for_test();
+        let _ = self.session_feed.join_for_test();
+        let _ = self.structured_approval_poller.finish_for_test();
+        let _ = self.deletion_poller.finish_for_test();
+        let _ = self.stop_poller.finish_for_test();
+        let _ = self.trash_poller.finish_for_test();
+        let _ = self.restore_worker.finish_for_test();
+        let _ = self.drop_poller.finish_for_test();
+        let _ = self.reconcile_poller.finish_for_test();
+        let _ = self.restart_poller.finish_for_test();
+        let _ = self.store_move_poller.finish_for_test();
+        let _ = self.attach_project_poller.finish_for_test();
+        let _ = self.rename_worker.finish_for_test();
+        let _ = self.creation_poller.finish_for_test();
+        let _ = self.serve_probe.finish_for_test();
+    }
+
     pub fn new(
         active_profile: Option<String>,
         available_tools: AvailableTools,
@@ -22,14 +67,14 @@ impl HomeView {
         active_profile: Option<String>,
         available_tools: AvailableTools,
         file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<TestHomeView> {
         let mut view =
             Self::new_with_reconcile(active_profile, available_tools, file_watch, || {
                 crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false)
             })?;
         // Unit fixtures do not own background disk healing or agent recovery.
         view.startup_recovery_gate = None;
-        Ok(view)
+        Ok(TestHomeView(view))
     }
 
     /// Load visible profiles and global UI state with an injectable reconciliation worker.

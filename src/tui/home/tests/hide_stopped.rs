@@ -469,9 +469,8 @@ fn a_session_menu_closes_when_its_session_is_hidden() {
     let id = select_session(&mut env, "util-live");
     env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 20);
     env.view.list_area = ratatui::layout::Rect::new(0, 0, 30, 22);
-    assert!(env
-        .view
-        .handle_right_click(5, env.view.list_inner_area.y + env.view.cursor as u16));
+    let row = env.view.list_inner_area.y + env.view.cursor as u16;
+    assert!(env.view.handle_right_click(5, row));
     assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
     assert!(env.view.context_menu.is_some());
 

@@ -47,9 +47,7 @@ mod v037_trash_lifecycle_id;
 mod v038_prime_native_runtime;
 mod v039_prime_control_path;
 mod v040_worker_ownership;
-mod v041_move_journal_authority;
-mod v042_logical_resource_intents;
-mod v043_durable_purge_cleanup;
+mod v043_move_journal_authority;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -235,16 +233,10 @@ const MIGRATIONS: &[Migration] = &[
     (39, "prime_control_path", v039_prime_control_path::run),
     (40, "worker_ownership", v040_worker_ownership::run),
     (
-        41,
+        43,
         "move_journal_authority",
-        v041_move_journal_authority::run,
+        v043_move_journal_authority::run,
     ),
-    (
-        42,
-        "logical_resource_intents",
-        v042_logical_resource_intents::run,
-    ),
-    (43, "durable_purge_cleanup", v043_durable_purge_cleanup::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

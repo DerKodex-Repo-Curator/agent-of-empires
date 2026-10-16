@@ -60,7 +60,7 @@ pub struct CreationPoller {
     result_rx: mpsc::Receiver<(CreationOutcome, CancellationToken)>,
     progress_rx: mpsc::Receiver<HookProgress>,
     progress_tx: mpsc::Sender<HookProgress>,
-    _handle: thread::JoinHandle<()>,
+    _handle: Option<thread::JoinHandle<()>>,
     /// Requests sent and not yet received, including cancelled ones still winding down.
     in_flight: usize,
     #[cfg(test)]
@@ -149,10 +149,20 @@ impl CreationPoller {
             result_rx,
             progress_rx,
             progress_tx,
-            _handle: handle,
+            _handle: Some(handle),
             in_flight: 0,
             #[cfg(test)]
             result_queued_observer,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&mut self) -> thread::Result<()> {
+        let (closed, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.request_tx, closed));
+        match self._handle.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
         }
     }
 

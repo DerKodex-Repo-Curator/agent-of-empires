@@ -261,7 +261,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         tracing::warn!(target: "session.rename", %conflict, "startup move intent requires attention");
     }
 
-    let instances = load_all_instances(&file_watch)?;
+    let load_watch = Arc::clone(&file_watch);
+    let instances = tokio::task::spawn_blocking(move || load_all_instances(&load_watch)).await??;
 
     // Only `--auth=token` issues a URL token.
     let auth_token = match auth_mode {

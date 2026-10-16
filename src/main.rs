@@ -304,6 +304,9 @@ async fn run(
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
         Some(Commands::Migrate) => return cli::migrate::run(),
+        Some(Commands::Intents { command }) => {
+            return cli::intents::run(cli.profile.as_deref().unwrap_or_default(), command);
+        }
 
         Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
         _ => {}

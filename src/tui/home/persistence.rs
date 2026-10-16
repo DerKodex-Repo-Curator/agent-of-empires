@@ -248,22 +248,22 @@ impl HomeView {
     }
 
     /// The caller retains namespace ownership until these guards are released.
-    pub(in crate::tui) fn lock_session_mutation_and_reload_with_ownership(
+    pub(in crate::tui) fn try_lock_session_mutation_and_reload_with_ownership(
         &mut self,
         ownership: &crate::session::storage::OwnershipGuard,
         id: &str,
-    ) -> anyhow::Result<SessionMutationGuards> {
+    ) -> anyhow::Result<Option<SessionMutationGuards>> {
         let snapshot = self
             .instances
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let source_profile = snapshot.source_profile.clone();
-        let session_title =
-            crate::session::storage::acquire_session_title_lock_with_ownership(ownership, id)
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to acquire session title lock: {error}")
-                })?;
+        let Some(session_title) =
+            crate::session::storage::try_acquire_session_title_lock_with_ownership(ownership, id)?
+        else {
+            return Ok(None);
+        };
         if !self.storages.contains_key(&source_profile) {
             self.storages.insert(
                 source_profile.clone(),
@@ -274,11 +274,11 @@ impl HomeView {
             .storages
             .get(&source_profile)
             .expect("source storage was registered above");
-        let lifecycle = storage
-            .acquire_instance_lifecycle_lock_with_ownership(ownership, id)
-            .map_err(|error| {
-                anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
-            })?;
+        let Some(lifecycle) =
+            storage.try_acquire_instance_lifecycle_lock_with_ownership(ownership, id)?
+        else {
+            return Ok(None);
+        };
         // Read-only: both flocks are already held, so a plain `load()` gives the
         // authoritative row without `update()`, which would rewrite sessions.json and fire
         // `notify_local_change` even when nothing changed. `move_group_to_profile` acquires
@@ -305,10 +305,10 @@ impl HomeView {
         authoritative.last_accessed_at =
             authoritative_last_accessed_at.max(snapshot.last_accessed_at);
         self.instances.insert(id.to_string(), authoritative);
-        Ok(SessionMutationGuards {
+        Ok(Some(SessionMutationGuards {
             _session_title: session_title,
             _lifecycle: lifecycle,
-        })
+        }))
     }
 
     /// Move a row between profiles as one dual-locked storage transaction,

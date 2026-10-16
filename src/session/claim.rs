@@ -52,7 +52,7 @@ impl<'a> ReservationCleanup<'a> {
     }
 
     pub(crate) fn release(&self) -> anyhow::Result<()> {
-        let ownership = super::storage::acquire_ownership_read()?;
+        let ownership = self.storage.acquire_ownership_read_bound()?;
         let _lifecycle = self
             .storage
             .acquire_instance_lifecycle_lock_with_ownership(&ownership, self.id)?;
@@ -605,7 +605,7 @@ impl ResourceReservation {
         perform: impl FnOnce() -> anyhow::Result<(T, Option<EffectObservation>)>,
     ) -> anyhow::Result<anyhow::Result<T>> {
         {
-            let root = super::storage::acquire_ownership_lock()?;
+            let root = self.storage.acquire_ownership_lock_bound()?;
             let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
             let _lifecycle = self
                 .storage
@@ -616,7 +616,7 @@ impl ResourceReservation {
             Ok((value, observed)) => (Ok(value), observed),
             Err(error) => (Err(error), None),
         };
-        let root = super::storage::acquire_ownership_lock()?;
+        let root = self.storage.acquire_ownership_lock_bound()?;
         let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
         // A profile I/O error must not erase a known Git return from the central journal.
         let lifecycle = self
@@ -1101,7 +1101,7 @@ impl ResourceReservation {
 
     pub(crate) fn rollback(&self) -> anyhow::Result<()> {
         {
-            let root = super::storage::acquire_ownership_lock()?;
+            let root = self.storage.acquire_ownership_lock_bound()?;
             let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
             let _lifecycle = self
                 .storage
@@ -1119,7 +1119,7 @@ impl ResourceReservation {
         }
         loop {
             let (index, effect) = {
-                let root = super::storage::acquire_ownership_lock()?;
+                let root = self.storage.acquire_ownership_lock_bound()?;
                 let _identity =
                     super::storage::acquire_session_identity_lock_with_ownership(&root)?;
                 let _lifecycle = self
@@ -1200,7 +1200,7 @@ impl ResourceReservation {
 
     pub(crate) fn recover(&self) -> anyhow::Result<bool> {
         let (rollback, purge, count) = {
-            let root = super::storage::acquire_ownership_lock()?;
+            let root = self.storage.acquire_ownership_lock_bound()?;
             let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
             let _lifecycle = self
                 .storage
@@ -1328,7 +1328,7 @@ impl ResourceReservation {
                 };
                 let effect = self.effect(index)?;
                 if failed && !retained {
-                    let root = super::storage::acquire_ownership_lock()?;
+                    let root = self.storage.acquire_ownership_lock_bound()?;
                     let _identity =
                         super::storage::acquire_session_identity_lock_with_ownership(&root)?;
                     let _lifecycle = self
@@ -1357,7 +1357,7 @@ impl ResourceReservation {
                             effect,
                             super::move_journal::ResourceEffect::DeleteBranch { .. }
                         ) {
-                            let root = super::storage::acquire_ownership_lock()?;
+                            let root = self.storage.acquire_ownership_lock_bound()?;
                             self.retain_unchanged_optional_with_ownership(&root, index)
                                 .with_context(|| format!("purge cleanup failed: {error:#}"))?;
                         } else {
@@ -1367,7 +1367,7 @@ impl ResourceReservation {
                 }
             }
         }
-        let root = super::storage::acquire_ownership_lock()?;
+        let root = self.storage.acquire_ownership_lock_bound()?;
         let _identity = super::storage::acquire_session_identity_lock_with_ownership(&root)?;
         let _lifecycle = self
             .storage

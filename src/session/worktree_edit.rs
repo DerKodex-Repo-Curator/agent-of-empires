@@ -194,6 +194,20 @@ pub(crate) fn prepare_worktree_branch_rename(
     path: &Path,
     branch: &str,
 ) -> anyhow::Result<Option<GitWorktree>> {
+    let git = revalidate_worktree_branch_rename(info, path, branch)?;
+    if let Some(git) = &git {
+        if git.branch_exists(branch)? {
+            return Err(WorktreeEditError::BranchExists(branch.to_owned()).into());
+        }
+    }
+    Ok(git)
+}
+
+pub(crate) fn revalidate_worktree_branch_rename(
+    info: &WorktreeInfo,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<Option<GitWorktree>> {
     anyhow::ensure!(
         info.managed_by_aoe,
         "Branch-only rename requires a managed worktree"
@@ -239,7 +253,7 @@ pub(crate) fn prepare_worktree_branch_rename(
         }),
         "Source branch is shared by another Git worktree"
     );
-    if git.branch_exists(branch)? {
+    if git.branch_ref_exists(branch)? {
         return Err(WorktreeEditError::BranchExists(branch.to_owned()).into());
     }
     Ok(Some(git))

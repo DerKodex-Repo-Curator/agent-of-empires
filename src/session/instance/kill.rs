@@ -227,6 +227,10 @@ impl Instance {
                     return;
                 }
             };
+        self.kill_all_tmux_sessions_with(&storage);
+    }
+
+    pub(crate) fn kill_all_tmux_sessions_with(&self, storage: &crate::session::Storage) {
         let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
             Ok(lock) => lock,
             Err(error) => {
@@ -239,7 +243,7 @@ impl Instance {
                 return;
             }
         };
-        self.stop_all_tmux_sessions_locked(&storage);
+        self.stop_all_tmux_sessions_locked(storage);
     }
 
     /// [`Self::kill_all_tmux_sessions`] for a caller already holding this instance's lifecycle

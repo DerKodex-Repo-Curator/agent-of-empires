@@ -149,7 +149,7 @@ fn rename_failure(
         .and_then(|root| transaction.note_conflict_with_ownership(&root, reason));
     match recorded {
         Ok(()) => error.context(format!(
-            "Rename intent retained for recovery at {}",
+            "Rename intent retained at {}. Completed Git effects can still roll forward during recovery; inspect and reload the session before retrying",
             path.display()
         )),
         Err(recording) => error.context(format!(
@@ -199,7 +199,6 @@ pub(crate) fn perform(
         &request.baseline.source_profile,
         Arc::clone(&request.file_watch),
     )?;
-    let guards = lock(&storage, &request.baseline.id)?;
     let rows = storage.load_strict_for_worktree_ownership()?;
     let mut original = rows
         .iter()
@@ -221,14 +220,8 @@ pub(crate) fn perform(
         .baseline
         .source_profile
         .clone_from(&original.source_profile);
-    if let Err(error) = super::worktree_reconcile::reconcile_and_persist_with_ownership(
-        &storage,
-        &guards.root,
-        &mut original,
-        &mut Default::default(),
-    ) {
-        tracing::warn!(target: "session.rename", session = %original.id, "worktree path reconciliation skipped: {error}");
-    }
+    let discovered_baseline = original.clone();
+    let mut reconcile_cache = super::worktree_reconcile::ReconcileCache::default();
     let mut candidate = original.clone();
     let mut name = None;
     let mut branch_only = None;
@@ -287,9 +280,7 @@ pub(crate) fn perform(
     }
     let target = target_profile
         .as_ref()
-        .map(|profile| {
-            Storage::open_with_ownership(profile, Arc::clone(&request.file_watch), &guards.root)
-        })
+        .map(|profile| Storage::open(profile, Arc::clone(&request.file_watch)))
         .transpose()?;
     if let Some(name) = &name {
         candidate.project_path =
@@ -315,11 +306,10 @@ pub(crate) fn perform(
             .branch
             .clone_from(branch);
     }
-    let moves = original.project_path != candidate.project_path;
+    let mut moves = original.project_path != candidate.project_path;
     let changes_branch = original.worktree_info.as_ref().map(|info| &info.branch)
         != candidate.worktree_info.as_ref().map(|info| &info.branch);
-    let edits_git = moves || changes_branch;
-    let requires_quiescence = edits_git && branch_only.is_none();
+    let mut edits_git = moves || changes_branch;
     if standalone && !edits_git {
         return Err(super::worktree_edit::WorktreeEditError::Unchanged.into());
     }
@@ -333,31 +323,43 @@ pub(crate) fn perform(
     } else {
         duplicate(&rows, &candidate, Some(&original.id))?;
     }
-    drop(rows);
+    if edits_git
+        && branch_only.is_none()
+        && (matches!(
+            original.status,
+            super::Status::Creating | super::Status::Deleting
+        ) || (original.is_structured()
+            && (original.status.blocks_worktree_edit()
+                || request.baseline.status.blocks_worktree_edit())))
+    {
+        return Err(RenameRejected::Active.into());
+    }
     if edits_git {
-        if requires_quiescence
-            && (matches!(
-                original.status,
-                super::Status::Creating | super::Status::Deleting
-            ) || (original.is_structured()
-                && (original.status.blocks_worktree_edit()
-                    || request.baseline.status.blocks_worktree_edit())))
-        {
-            return Err(RenameRejected::Active.into());
+        super::worktree_reconcile::observe_without_lease(&mut original, &mut reconcile_cache)?;
+        if let Some(name) = &name {
+            candidate.project_path =
+                super::worktree_edit::target_worktree_path(Path::new(&original.project_path), name)
+                    .ok_or_else(|| {
+                        super::worktree_edit::WorktreeEditError::NoParent(
+                            original.project_path.clone().into(),
+                        )
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+        } else {
+            candidate.project_path.clone_from(&original.project_path);
         }
-        let info = original
-            .worktree_info
-            .as_ref()
-            .context("Session does not use a worktree")?;
-        super::worktree_edit::ensure_worktree_unshared(
-            &guards.root,
-            &original.source_profile,
-            &original.id,
-            Path::new(&original.project_path),
-            info,
-            moves.then_some(Path::new(&candidate.project_path)),
-            changes_branch,
-        )?;
+        moves = original.project_path != candidate.project_path;
+        edits_git = moves || changes_branch;
+        if standalone && !edits_git {
+            return Err(super::worktree_edit::WorktreeEditError::Unchanged.into());
+        }
+    }
+    let requires_quiescence = edits_git && branch_only.is_none();
+    if edits_git {
+        if let Some(info) = &original.worktree_info {
+            reconcile_cache.entries(&info.main_repo_path)?;
+        }
     }
     if let Some(branch) = &branch_only {
         let _ = super::worktree_edit::prepare_worktree_branch_rename(
@@ -398,12 +400,127 @@ pub(crate) fn perform(
                 .as_ref()
                 .ok_or(RenameRejected::NotWorktree)?
                 .branch;
-            if crate::git::GitWorktree::new(info.main_repo_path.clone().into())?
-                .branch_exists(branch)?
-            {
-                return Err(
-                    super::worktree_edit::WorktreeEditError::BranchExists(branch.clone()).into(),
-                );
+            super::worktree_edit::prepare_worktree_branch_rename(
+                info,
+                Path::new(&original.project_path),
+                branch,
+            )?;
+        }
+    }
+    let source_checkouts = if changes_branch {
+        let info = original
+            .worktree_info
+            .as_ref()
+            .ok_or(RenameRejected::NotWorktree)?;
+        crate::git::GitWorktree::new(info.main_repo_path.clone().into())?
+            .list_worktrees()?
+            .into_iter()
+            .filter(|checkout| checkout.branch.as_deref() == Some(info.branch.as_str()))
+            .map(|checkout| checkout.path)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    drop(rows);
+    let guards = lock(&storage, &request.baseline.id)?;
+    let fresh_rows = storage.load_strict_for_worktree_ownership()?;
+    let mut fresh = fresh_rows
+        .iter()
+        .find(|row| row.id == original.id)
+        .cloned()
+        .ok_or(RenameRejected::Missing)?;
+    anyhow::ensure!(
+        super::move_journal::row_resources_match(&fresh, &discovered_baseline)
+            && fresh.lifecycle_reservation == discovered_baseline.lifecycle_reservation,
+        "Session checkout changed during rename discovery"
+    );
+    anyhow::ensure!(
+        !fresh.has_fresh_lifecycle_reservation(Utc::now()),
+        "Session has a lifecycle operation in progress"
+    );
+    if edits_git {
+        super::worktree_reconcile::reconcile_and_persist_with_ownership(
+            &storage,
+            &guards.root,
+            &mut fresh,
+            &mut reconcile_cache,
+        )?;
+    }
+    anyhow::ensure!(
+        super::attach_project::same_checkout(&original, &fresh),
+        "Session checkout reconciliation changed during rename discovery"
+    );
+    let planned = candidate;
+    candidate = fresh.clone();
+    if planned.title != original.title {
+        candidate.title = planned.title;
+    }
+    if planned.group_path != original.group_path {
+        candidate.group_path = planned.group_path;
+    }
+    candidate.project_path = planned.project_path;
+    candidate.worktree_info = planned.worktree_info;
+    original = fresh;
+    if let Some(target) = &target {
+        let target_rows = target.load_strict_for_worktree_ownership()?;
+        anyhow::ensure!(
+            !target_rows.iter().any(|row| row.id == original.id),
+            "Session already exists in target profile"
+        );
+        duplicate(&target_rows, &candidate, None)?;
+    } else {
+        duplicate(&fresh_rows, &candidate, Some(&original.id))?;
+    }
+    if edits_git {
+        let info = original
+            .worktree_info
+            .as_ref()
+            .ok_or(RenameRejected::NotWorktree)?;
+        super::worktree_edit::ensure_worktree_unshared(
+            &guards.root,
+            &original.source_profile,
+            &original.id,
+            Path::new(&original.project_path),
+            info,
+            moves.then_some(Path::new(&candidate.project_path)),
+            changes_branch,
+        )?;
+        let git = crate::git::GitWorktree::new(info.main_repo_path.clone().into())?;
+        if changes_branch {
+            let branch = &candidate
+                .worktree_info
+                .as_ref()
+                .ok_or(RenameRejected::NotWorktree)?
+                .branch;
+            super::worktree_edit::revalidate_worktree_branch_rename(
+                info,
+                Path::new(&original.project_path),
+                branch,
+            )?;
+            let live = git.list_worktrees()?;
+            anyhow::ensure!(
+                source_checkouts
+                    .iter()
+                    .all(|path| live.iter().any(|checkout| checkout.path == *path
+                        && checkout.branch.as_deref() == Some(info.branch.as_str())))
+                    && live
+                        .iter()
+                        .filter(|checkout| checkout.branch.as_deref() == Some(info.branch.as_str()))
+                        .count()
+                        == source_checkouts.len(),
+                "Source branch checkouts changed during rename discovery"
+            );
+        }
+        if moves {
+            anyhow::ensure!(
+                Path::new(&original.project_path).try_exists()?,
+                "Worktree source disappeared during rename discovery"
+            );
+            if Path::new(&candidate.project_path).try_exists()? {
+                return Err(super::worktree_edit::WorktreeEditError::TargetExists(
+                    candidate.project_path.clone().into(),
+                )
+                .into());
             }
         }
     }
@@ -437,7 +554,6 @@ pub(crate) fn perform(
             .worktree_info
             .as_ref()
             .ok_or(RenameRejected::NotWorktree)?;
-        let git = crate::git::GitWorktree::new(info.main_repo_path.clone().into())?;
         effects.push(ResourceEffect::RenameBranch {
             repository: info.main_repo_path.clone().into(),
             old: info.branch.clone(),
@@ -447,12 +563,7 @@ pub(crate) fn perform(
                 .context("requested branch metadata missing")?
                 .branch
                 .clone(),
-            checkouts: git
-                .list_worktrees()?
-                .into_iter()
-                .filter(|checkout| checkout.branch.as_deref() == Some(info.branch.as_str()))
-                .map(|checkout| checkout.path)
-                .collect(),
+            checkouts: source_checkouts,
         });
     }
     if moves {

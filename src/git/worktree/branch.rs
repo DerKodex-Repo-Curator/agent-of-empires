@@ -334,6 +334,17 @@ impl GitWorktree {
         let _ = self.prune_worktrees();
     }
 
+    /// Metadata-only revalidation under ownership. Discovery still uses `branch_exists`.
+    pub(crate) fn branch_ref_exists(&self, branch: &str) -> Result<bool> {
+        let repo = crate::git::open_repo_at(&self.repo_path)?;
+        let reference = repo.find_reference(&format!("refs/heads/{branch}"));
+        match reference {
+            Ok(_) => Ok(true),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Whether `refs/heads/<branch>` exists. `Err` means the check itself
     /// failed or timed out; callers must fail closed on it (#2653).
     pub fn branch_exists(&self, branch: &str) -> Result<bool> {

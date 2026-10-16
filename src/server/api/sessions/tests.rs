@@ -516,6 +516,62 @@ mod artifact_route {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn readonly_ensure_observes_live_sessions_but_never_restarts_stopped_sessions() {
+    use crate::tmux::test_helpers::{
+        only_pane_id, require_tmux, wait_for_pane_command, TmuxTestSession,
+    };
+    let _home = crate::session::test_support::isolate_app_dir();
+    require_tmux!();
+    let mut instance = make_test_instance();
+    instance.command = "sleep 300".into();
+    let id = instance.id.clone();
+    let name = crate::tmux::Session::generate_name(&id, &instance.title);
+    let session = TmuxTestSession::from_name(name);
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", session.name(), "sleep 300"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let pane = only_pane_id(session.name());
+    wait_for_pane_command(&pane, "sleep");
+    let mut state = crate::server::test_support::build_test_app_state(vec![instance]);
+    std::sync::Arc::get_mut(&mut state).unwrap().read_only = true;
+    assert_eq!(
+        ensure_session(State(state.clone()), Path("missing".into()))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::NOT_FOUND,
+    );
+    let alive = ensure_session(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(alive.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(alive.into_body(), 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["status"], "alive");
+    let killed = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", session.name()])
+        .output()
+        .unwrap();
+    assert!(killed.status.success());
+    assert_eq!(
+        ensure_session(State(state), Path(id.clone()))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::FORBIDDEN,
+    );
+    assert!(!crate::tmux::Session::from_name(session.name()).exists());
+}
+
 fn make_test_instance() -> Instance {
     let mut inst = Instance::new("test-session", "/tmp/test-project");
     inst.tool = "claude".to_string();
@@ -2559,7 +2615,7 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
             delete_session(
                 State(state),
                 Path("sess-3650-direct".to_string()),
-                Some(Json(DeleteSessionBody::default())),
+                Ok(Some(Json(DeleteSessionBody::default()))),
             )
             .await
             .into_response()
@@ -2726,7 +2782,7 @@ async fn worker_stopping_handlers_wait_for_an_in_flight_submission() {
     ) -> axum::response::Response {
         match which {
             "stop" => stop_session(State(state), Path(id)).await.into_response(),
-            "trash" => trash_session(State(state), Path(id), None)
+            "trash" => trash_session(State(state), Path(id), Ok(None))
                 .await
                 .into_response(),
             "archive" => update_session_archive(
@@ -2924,7 +2980,7 @@ async fn delete_session_notifies_plugins_that_the_session_is_deleting() {
     delete_session(
         State(std::sync::Arc::clone(&state)),
         Path("sess-delete-notify".to_string()),
-        Some(Json(DeleteSessionBody::default())),
+        Ok(Some(Json(DeleteSessionBody::default()))),
     )
     .await;
 
@@ -4638,12 +4694,12 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         let resp = if workspace_endpoint {
             delete_workspace(
                 State(state.clone()),
-                Some(Json(DeleteWorkspaceBody {
+                Ok(Some(Json(DeleteWorkspaceBody {
                     session_ids,
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()
@@ -4651,11 +4707,11 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             delete_session(
                 State(state.clone()),
                 Path(owner.id.clone()),
-                Some(Json(DeleteSessionBody {
+                Ok(Some(Json(DeleteSessionBody {
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
-                })),
+                }))),
             )
             .await
             .into_response()

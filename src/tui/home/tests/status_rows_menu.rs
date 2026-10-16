@@ -1639,8 +1639,9 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
         env.view.trash_session_by_id(&a);
+        finish_trash(&mut env.view, &[&a]);
         env.view.trash_session_by_id(&b);
-        finish_trash(&mut env.view, &[&a, &b]);
+        finish_trash(&mut env.view, &[&b]);
 
         env.view.prompt_empty_trash();
         let dialog = env
@@ -1679,8 +1680,9 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         let a = env.view.instance_at(0).id.clone();
         let b = env.view.instance_at(1).id.clone();
         env.view.trash_session_by_id(&a);
+        finish_trash(&mut env.view, &[&a]);
         env.view.trash_session_by_id(&b);
-        finish_trash(&mut env.view, &[&a, &b]);
+        finish_trash(&mut env.view, &[&b]);
         assert_eq!(
             env.view
                 .instances

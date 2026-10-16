@@ -56,7 +56,10 @@ pub struct ReconcileCache(HashMap<String, Vec<WorktreeEntry>>);
 
 impl ReconcileCache {
     /// The listing for `main_repo`, fetched once per pass.
-    fn entries(&mut self, main_repo: &str) -> crate::git::error::Result<&[WorktreeEntry]> {
+    pub(crate) fn entries(
+        &mut self,
+        main_repo: &str,
+    ) -> crate::git::error::Result<&[WorktreeEntry]> {
         if !self.0.contains_key(main_repo) {
             let git = GitWorktree::new(PathBuf::from(main_repo))?;
             self.0.insert(main_repo.to_string(), git.list_worktrees()?);
@@ -83,6 +86,27 @@ fn already_current(inst: &Instance) -> bool {
     })
 }
 
+/// Observe an externally moved checkout before a fenced rename, without writing storage.
+pub(crate) fn observe_without_lease(
+    inst: &mut Instance,
+    cache: &mut ReconcileCache,
+) -> anyhow::Result<()> {
+    if already_current(inst) {
+        return Ok(());
+    }
+    if let Some(info) = &inst.worktree_info {
+        let entries = cache.entries(&info.main_repo_path)?;
+        if !already_current(inst) {
+            if let WorktreePathResolution::Moved(path) =
+                resolve_worktree_path(entries, Path::new(&inst.project_path), info)
+            {
+                inst.project_path = path.to_string_lossy().into_owned();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite `inst.project_path` and
 /// persist it, so every later path-derived decision (the rename pre-flight gates, attach, status,
 /// diff) sees the live location.
@@ -94,7 +118,7 @@ pub fn reconcile_and_persist(
     if already_current(inst) {
         return Ok(WorktreePathResolution::Current);
     }
-    let ownership = super::storage::acquire_ownership_lock()?;
+    let ownership = storage.acquire_ownership_lock_bound()?;
     let _identity = super::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
     let _lifecycle =
         storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, &inst.id)?;

@@ -1,6 +1,51 @@
 use super::*;
 use crate::session::move_journal;
 
+#[test]
+#[serial_test::serial]
+fn git_discovery_releases_root_and_revalidates_late_branch_conflicts() {
+    for late_ref in [false, true] {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let _tie = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let (directory, storage, row) = fixture();
+        let gate = crate::session::test_support::GitCommandGate::new(
+            directory.path(),
+            "[ \"$1\" = show-ref ]",
+            true,
+        );
+        let request = edit_request(&row, "both", false);
+        let worker = std::thread::spawn(move || perform(request, |_, _| Ok(())));
+        let entered = gate.wait_entered();
+        let root_free = storage::try_acquire_ownership_lock().unwrap().is_some();
+        if entered && root_free && late_ref {
+            let repo = git2::Repository::open(&row.worktree_info.as_ref().unwrap().main_repo_path)
+                .unwrap();
+            repo.branch(
+                "new",
+                &repo.head().unwrap().peel_to_commit().unwrap(),
+                false,
+            )
+            .unwrap();
+        }
+        gate.release();
+        let result = worker.join().unwrap();
+        assert!(entered, "rename did not reach show-ref discovery");
+        assert!(root_free, "discovery retained Root");
+        if late_ref {
+            let error = result.err().expect("late branch must reject admission");
+            assert!(matches!(
+                error.downcast_ref::<super::super::worktree_edit::WorktreeEditError>(),
+                Some(super::super::worktree_edit::WorktreeEditError::BranchExists(_))
+            ));
+            assert_eq!(storage.load().unwrap()[0].project_path, row.project_path);
+        } else {
+            let committed = result.unwrap();
+            assert!(Path::new(&committed.instance.project_path).exists());
+        }
+        assert!(move_journal::scan().entries.is_empty());
+    }
+}
+
 fn fixture() -> (tempfile::TempDir, Storage, Instance) {
     let root = tempfile::tempdir().unwrap();
     let repo_path = root.path().join("repo");

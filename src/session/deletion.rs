@@ -248,7 +248,7 @@ impl PurgeTransaction {
                 Ok(((), observation))
             })??;
             let paths = {
-                let root = acquire_ownership_lock()?;
+                let root = crate::session::storage::acquire_ownership_read()?;
                 let paths = paths_in_use_except_with_ownership(
                     &root,
                     self.storage.profile(),
@@ -603,7 +603,7 @@ fn plan_purge(
                 == resolve_claim_path(path)
                 && registered.is_some();
             let shared = {
-                let root = acquire_ownership_lock()?;
+                let root = crate::session::storage::acquire_ownership_read()?;
                 branch_in_use_with_ownership(
                     &root,
                     &request.instance.source_profile,

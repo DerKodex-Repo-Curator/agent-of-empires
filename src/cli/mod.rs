@@ -10,6 +10,7 @@ pub mod graft;
 pub mod group;
 pub mod hooks;
 pub mod init;
+pub mod intents;
 pub mod killall;
 pub mod list;
 pub mod log_level;

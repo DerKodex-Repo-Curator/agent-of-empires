@@ -26,7 +26,7 @@ If another session operation owns the registry or its migration/storage locks, T
 
 A worktree session's title and its directory stay tied by default (`session.tie_workdir_to_name`), which applies only to aoe-managed worktree sessions:
 
-- Renaming a session (TUI, web, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged.
+- Renaming a session (TUI, web, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the directory to the title's path-safe slug before committing the title. If publication fails after Git succeeds, recovery may still finish the rename. Inspect and reload the session before retrying.
 - The git branch is never renamed by default, since it may carry an upstream or an open PR. Opt in with the TUI rename dialog's "Also rename git branch", `--rename-branch`, or `rename_branch: true`. The TUI warns when the branch tracks a remote, because the remote branch and any open PR do not follow.
 - A rename that would relocate the checkout or re-point its branch needs a stopped session and is refused while it runs. A title-only rename whose slug leaves the directory unchanged is allowed on a running session from the CLI and REST (the TUI still asks for a stopped session), and leaves a live structured-view worker alone.
 
@@ -49,7 +49,7 @@ Turn the setting off to relabel sessions freely while they run and to edit the d
 
 Renaming moves the checkout with `git worktree move`, keeping its parent directory and swapping only the final component. It works only on aoe-managed worktrees of a stopped session. Source and destination claims in other profiles prevent the move, including absent paths reserved for restoring trashed sessions.
 
-Terminal workdir edits make a fresh, reserved observation before changing Git, rather than treating an old saved Running status as proof that the session still runs. Creating/deleting sessions, fresh launches, active terminal observations and structured-worker lifecycle gates still prevent unsafe moves. A newer active status published during the edit also prevents publication.
+Terminal workdir edits check whether the session is actually running instead of relying on its saved status. Active sessions cannot be moved.
 
 ### When the directory moves outside aoe
 
@@ -81,15 +81,15 @@ Bare repos are auto-detected and use `bare_repo_path_template` instead, so workt
 
 AoE initializes submodules recursively after creating a worktree. Set `init_submodules = false` (or pass `--no-submodules`) to skip this for repositories with large submodule trees. Submodule initialization failures abort creation.
 
+If Git refuses to remove a checkout containing submodules, AoE can remove its per-worktree submodule metadata at `<main>/.git/worktrees/<name>/modules/`, remove the checkout and prune its registration. This does not remove the main repository's submodules.
+
 ## Cleanup
 
 Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-worktree`); a manual worktree or a non-worktree session is left alone.
 
 **Trashing relocates the worktree** into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`, so trashed sessions stop cluttering the active checkouts while staying previewable. Restoring moves it back, and is refused if that path is now occupied. Purging removes it.
 
-TUI restores, including Restore All, run in the background and leave restored sessions stopped. Restore reserves the exact session before checking or discarding its old sandbox container, without holding application or session locks during Docker. It revalidates the logical profile, session generation and other sessions' path claims before moving the checkout back.
-
-Background trash pointer repair only corrects stored metadata. It checks the session generation and other profiles' path claims, but does not require Git metadata or move the checkout.
+TUI restores, including Restore All, run in the background and leave restored sessions stopped. A restore is refused while another operation owns the session or another session uses its destination. Background repair can also correct a stale trash path without moving the checkout.
 
 **The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
@@ -101,15 +101,21 @@ Branch cleanup requires the session's exclusive registered checkout ownership. I
 
 Git hooks may call AoE. Commands that touch a checkout or branch reserved by the outer operation fail with a busy error instead of waiting for that operation. Commands on unreserved resources remain allowed, including adopting an existing checkout after its reservation has been released.
 
-Ownership admission and profile creation, rename and deletion share one application namespace fence. Git, Docker and user callbacks run outside the namespace, identity, lifecycle and storage locks. A durable, generation-bound reservation protects the operation's affected paths and refs until publication or verified rollback. Unreadable profile inventories refuse destructive operations.
+AoE runs Git with the repository's configured hooks. Its busy checks coordinate AoE commands, not independent Git commands or filesystem edits.
 
-Cancelling creation hides its pending row in the current TUI while the active hook finishes. The resource reservation remains until verified rollback; cleanup failures remain visible as conflicts.
+Cancelling creation hides its pending row while the hook stops and cleanup finishes. A purge can remove a session before all cleanup succeeds; recovery retries completed, observed failures without bringing the session back.
 
-The application directory's `.move-journal` records logical profiles, session incarnations and generations, and the planned before/after Git resources. CLI session commands, daemon startup and TUI loads recover completed effects before using session snapshots. A live operation holds its own parent-only journal lease; Git and hooks do not inherit it. If a process disappears before an external effect's completion is recorded, recovery retains an explicit conflict rather than assuming that its child stopped or that its reservation expired.
+## Interrupted operations
 
-Permanent purge records transcript and sidecar cleanup before retiring the session row. If cleanup then fails, the session remains removed and its durable intent retains the exact cleanup request for recovery; it is not kept in trash or resurrected. Recovery retries a cleanup that returned an observed error, but never treats an interrupted `Pending` effect as safe to rerun. Historical unfinished or failed sandbox-store cleanup without the original removal receipt remains an explicit conflict rather than selecting roots from today's configuration; completed cleanup keeps its recorded evidence.
+If an operation is interrupted, AoE may keep its affected session, checkout or branch busy rather than risk another operation using it. A matching checkout snapshot does not prove that a surviving Git or hook child has stopped.
 
-AoE runs plain Git with the repository's configured hooks. It does not inject a hook proxy, `core.hooksPath` or `GIT_EXEC_PATH`. These reservations coordinate AoE commands, not independent Git commands or filesystem edits, and do not make Git and JSON one atomic transaction.
+1. Run `aoe intents list` to inspect current and legacy entries, malformed evidence and orphaned session bindings. This command also works when an entry prevents startup migrations.
+2. Stop the AoE processes producing the operation and any surviving Git or hook children. Inspect and reconcile the affected checkout, branch and session state.
+3. Clear only the named entry: `aoe intents clear '<path>' --actors-stopped --reason "what was inspected"`.
+
+Clearing archives the original evidence and releases the operation's matching reservation. It never deletes checkouts, branches, containers or agent stores. A live producer lease or changed session owner makes it refuse the clear. The `--actors-stopped` flag attests to the inspection and shutdown above; obtaining a free lease is not a substitute.
+
+After clearing malformed evidence, a session can still hold an orphaned binding. `aoe intents list` prints the exact command for each one: `aoe --profile='<profile>' intents clear --orphan-binding=<session-id> --actors-stopped`. This releases only that session's reservation and refuses if its journal still exists. Reload the session and inspect its state before retrying the original operation.
 
 ## Warnings during create
 

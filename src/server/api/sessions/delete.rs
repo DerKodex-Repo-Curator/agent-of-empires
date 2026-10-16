@@ -476,7 +476,7 @@ pub(crate) fn trash_sweep_interval() -> std::time::Duration {
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<DeleteSessionBody>>,
+    body: Result<Option<Json<DeleteSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -485,7 +485,10 @@ pub async fn delete_session(
         return crate::server::api::read_only_response();
     }
 
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
 
     // Serialize concurrent mutations, prompt submission first: a queue drain
     // snapshots an idle turn under that guard and never takes `instance_lock`,
@@ -666,6 +669,7 @@ async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -
             &instance.source_profile,
             &ids,
         );
+        drop(ownership);
         workspace_dirty_message_blocking(&instance, &kept)
     })
     .await
@@ -813,13 +817,16 @@ pub(super) async fn purge_workspace_artifacts(
 /// cannot leave it half-removed (#2536).
 pub async fn delete_workspace(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<DeleteWorkspaceBody>>,
+    body: Result<Option<Json<DeleteWorkspaceBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
     }
 
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
     // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
     let mut session_ids = dedupe_session_ids(&body.session_ids);

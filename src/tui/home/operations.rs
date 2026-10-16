@@ -364,17 +364,34 @@ impl HomeView {
             }
         }
 
-        let profile_move_ownership = profile_move_target
-            .as_ref()
-            .map(|_| crate::session::storage::acquire_ownership_lock())
-            .transpose()?;
+        let profile_move_ownership = if profile_move_target.is_some() {
+            Some(
+                crate::session::storage::try_acquire_ownership_lock()?.ok_or_else(|| {
+                    anyhow::anyhow!("Session operation in progress; no changes were saved")
+                })?,
+            )
+        } else {
+            None
+        };
         let profile_move_identity = profile_move_ownership
             .as_ref()
-            .map(crate::session::storage::acquire_session_identity_lock_with_ownership)
+            .map(|ownership| {
+                crate::session::storage::try_acquire_session_identity_lock_with_ownership(
+                    ownership,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Session operation in progress; no changes were saved")
+                })
+            })
             .transpose()?;
         let profile_move_guards = profile_move_ownership
             .as_ref()
-            .map(|ownership| self.lock_session_mutation_and_reload_with_ownership(ownership, &id))
+            .map(|ownership| {
+                self.try_lock_session_mutation_and_reload_with_ownership(ownership, &id)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Session operation in progress; no changes were saved")
+                    })
+            })
             .transpose()?;
         let restart_edit_authoritative = self
             .get_instance(&id)
@@ -1037,14 +1054,26 @@ impl HomeView {
                 );
             }
 
-            let ownership = crate::session::storage::acquire_ownership_lock()?;
+            let ownership =
+                crate::session::storage::try_acquire_ownership_lock()?.ok_or_else(|| {
+                    anyhow::anyhow!("Session operation in progress; no changes were saved")
+                })?;
             let identity_guard =
-                crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+                crate::session::storage::try_acquire_session_identity_lock_with_ownership(
+                    &ownership,
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Session operation in progress; no changes were saved")
+                })?;
             affected_ids.sort();
             let mut mutation_guards = Vec::with_capacity(affected_ids.len());
             for id in &affected_ids {
-                mutation_guards
-                    .push(self.lock_session_mutation_and_reload_with_ownership(&ownership, id)?);
+                mutation_guards.push(
+                    self.try_lock_session_mutation_and_reload_with_ownership(&ownership, id)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Session operation in progress; no changes were saved")
+                        })?,
+                );
                 let authoritative = self
                     .get_instance(id)
                     .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
@@ -1686,7 +1715,7 @@ impl HomeView {
     /// structured-view worker is reaped by the daemon reconciler once the row reads
     /// trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        let Some((profile, mut request_instance)) = self
+        let Some((profile, request_instance)) = self
             .instances
             .get(id)
             .map(|instance| (instance.source_profile.clone(), instance.clone()))
@@ -1701,62 +1730,24 @@ impl HomeView {
             );
             return;
         };
-        let acquisition = (|| -> anyhow::Result<_> {
-            let root = crate::session::storage::acquire_ownership_lock()?;
-            let _identity =
-                crate::session::storage::acquire_session_identity_lock_with_ownership(&root)?;
-            let _lifecycle_lock =
-                storage.acquire_instance_lifecycle_lock_with_ownership(&root, id)?;
-            storage.update_with_ownership(&root, |instances, _groups| {
-                let stored = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
-                let generation = stored
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                stored.trash();
-                Ok((
-                    generation,
-                    stored.lifecycle_reservation.clone(),
-                    stored.trashed_at,
-                    stored.trash_lifecycle_id.clone(),
-                ))
-            })
-        })();
-        let (generation, reservation, trashed_at, trash_lifecycle_id) = match acquisition {
-            Ok(acquired) => acquired,
+        let request = match crate::session::trash::try_prepare_trash(storage, &request_instance) {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Session operation in progress",
+                    "Another session operation is in progress. No changes were saved. Try again when it finishes.",
+                ));
+                return;
+            }
             Err(error) => {
-                tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
+                self.info_dialog = Some(InfoDialog::new("Trash Failed", &format!("{error:#}")));
                 return;
             }
         };
-
-        // Copy the durable stamp so later lifecycle checks match the stored row.
-        request_instance.trashed_at = trashed_at;
-        request_instance.trash_lifecycle_id = trash_lifecycle_id.clone();
-        request_instance.lifecycle_generation = generation;
-        request_instance.lifecycle_reservation = reservation.clone();
-        let request =
-            match crate::session::trash::prepare_trash(storage, &request_instance, generation) {
-                Ok(request) => request,
-                Err(error) => {
-                    let message = format!("Could not prepare trash: {error:#}");
-                    if let Err(reload) = self.reload() {
-                        tracing::warn!(target: "tui.session", "trash reload failed: {reload:#}");
-                    }
-                    self.info_dialog = Some(InfoDialog::new("Trash Failed", &message));
-                    return;
-                }
-            };
         if let Some(instance) = self.instances.get_mut(id) {
-            instance.trashed_at = trashed_at;
-            instance.trash_lifecycle_id = trash_lifecycle_id;
-            instance.lifecycle_generation = generation;
+            instance.trashed_at = request.instance.trashed_at;
+            instance.trash_lifecycle_id = request.instance.trash_lifecycle_id.clone();
+            instance.lifecycle_generation = request.instance.lifecycle_generation;
             instance.lifecycle_reservation = request.instance.lifecycle_reservation.clone();
         }
         self.trash_poller.request_trash(request);
@@ -2049,16 +2040,19 @@ impl HomeView {
         let kill_targets: Vec<_> = ids
             .iter()
             .filter_map(|id| self.instances.get(id).cloned())
-            .collect();
+            .map(|instance| {
+                let storage = Storage::new(&instance.effective_profile(), self.file_watch.clone())?;
+                Ok((instance, storage))
+            })
+            .collect::<anyhow::Result<_>>()?;
         // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
         // into one mid-archive, and tear down only after: a send that won the lock finishes
         // first and its pane is then killed. Locks go in sorted id order, like every other
         // multi-lock holder (startup reservation cleanup), so two holders cannot close a cycle.
         let mut lock_order: Vec<_> = kill_targets.iter().collect();
-        lock_order.sort_by(|a, b| a.id.cmp(&b.id));
+        lock_order.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         let mut lifecycle_locks = Vec::with_capacity(lock_order.len());
-        for inst in lock_order {
-            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+        for (inst, storage) in lock_order {
             lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
         }
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
@@ -2066,9 +2060,9 @@ impl HomeView {
         // Off-thread tmux teardown so N x 4 shellouts don't block the input
         // thread. Mirrors `force_remove_session`.
         std::thread::spawn(move || {
-            for inst in kill_targets {
+            for (inst, storage) in kill_targets {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
+                    inst.kill_all_tmux_sessions_with(&storage)
                 })) {
                     tracing::error!(
                         target: "session.tmux_cleanup",
@@ -2221,6 +2215,256 @@ fn spawn_force_teardown(inst: Instance) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::restart_poller::RestartPoller;
+
+    #[test]
+    #[serial_test::serial]
+    fn input_mutations_return_before_ownership_and_nested_locks_are_released() {
+        for action in ["restart-move", "group-move", "trash"] {
+            for layer in [
+                "root-exclusive",
+                "root-shared",
+                "identity",
+                "title",
+                "lifecycle",
+                "transition",
+                "storage",
+                "target-storage",
+            ] {
+                let app = crate::session::test_support::isolate_app_dir();
+                let source = Storage::new_unwatched("owner").unwrap();
+                let target = Storage::new_unwatched("target").unwrap();
+                let mut instance = Instance::new("input admission", "/unmanaged-input");
+                instance.source_profile = "owner".into();
+                instance.status = Status::Stopped;
+                instance.group_path = "work".into();
+                source
+                    .update(|rows, groups| {
+                        rows.push(instance.clone());
+                        *groups = GroupTree::new_with_groups(rows, &[]).get_all_groups();
+                        Ok(())
+                    })
+                    .unwrap();
+                let mut view = HomeView::new_for_test(
+                    None,
+                    crate::tmux::AvailableTools::with_tools(&["claude"]),
+                    crate::file_watch::FileWatchService::noop(),
+                )
+                .unwrap();
+                view.group_by = crate::session::config::GroupByMode::Manual;
+                view.selected_session = Some(instance.id.clone());
+                view.restart_poller =
+                    RestartPoller::with_result_for_test(crate::session::restart::RestartResult {
+                        session_id: instance.id.clone(),
+                        before: Box::new(instance.clone()),
+                        instance: Box::new(instance.clone()),
+                        outcome: Err("fixture result".into()),
+                    });
+                view.trash_poller =
+                    crate::tui::trash_poller::TrashPoller::with_handler_for_test(|request| {
+                        request.cancel().unwrap();
+                        crate::session::trash::TrashResult {
+                            session_id: request.session_id.clone(),
+                            source_profile: request.instance.source_profile.clone(),
+                            created_at: request.instance.created_at,
+                            generation: request.generation,
+                            trash_lifecycle_id: request.instance.trash_lifecycle_id.clone(),
+                            relocation: None,
+                            relocate_warning: None,
+                        }
+                    });
+                let namespace = crate::session::get_app_dir().unwrap();
+                let source_dir = source.sessions_path().parent().unwrap().to_path_buf();
+                let target_dir = target.sessions_path().parent().unwrap().to_path_buf();
+                let id = instance.id.clone();
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (released_tx, released_rx) = std::sync::mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    let held: Box<dyn std::any::Any> = match layer {
+                        "root-exclusive" => {
+                            Box::new(crate::session::storage::acquire_ownership_lock().unwrap())
+                        }
+                        "root-shared" => {
+                            Box::new(crate::session::storage::acquire_ownership_read().unwrap())
+                        }
+                        "identity" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &namespace,
+                                ".title-mutation.lock",
+                            )
+                            .unwrap(),
+                        ),
+                        "title" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &namespace,
+                                &format!(".session-title-{id}.lock"),
+                            )
+                            .unwrap(),
+                        ),
+                        "lifecycle" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &source_dir,
+                                &format!(".instance-lifecycle-{id}.lock"),
+                            )
+                            .unwrap(),
+                        ),
+                        "transition" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &namespace,
+                                crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                            )
+                            .unwrap(),
+                        ),
+                        "storage" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &source_dir,
+                                ".storage.lock",
+                            )
+                            .unwrap(),
+                        ),
+                        "target-storage" => Box::new(
+                            crate::session::storage::acquire_storage_flock(
+                                &target_dir,
+                                ".storage.lock",
+                            )
+                            .unwrap(),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    ready_tx.send(()).unwrap();
+                    let requested = release_rx
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .is_ok();
+                    drop(held);
+                    released_tx.send(requested).unwrap();
+                });
+                ready_rx.recv().unwrap();
+                let before = std::fs::read(source.sessions_path()).unwrap();
+                let invoke = |view: &mut HomeView| match action {
+                    "restart-move" => {
+                        view.restart_selected_session(Some("target"), None, None, None)
+                    }
+                    "group-move" => {
+                        view.group_rename_context = Some(super::super::GroupRenameContext {
+                            old_path: "work".into(),
+                            old_profile: "owner".into(),
+                        });
+                        view.rename_selected_group(None, Some("target"))
+                    }
+                    "trash" => {
+                        view.trash_session_by_id(&instance.id);
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                };
+                let result = invoke(&mut view);
+                let no_enqueue = !view.restart_in_flight.contains(&instance.id)
+                    && !view.trash_poller.is_pending(&instance.id);
+                let _ = release_tx.send(());
+                let returned_while_held = released_rx.recv().unwrap();
+                holder.join().unwrap();
+                // Trash does not need title or target-store ownership.
+                let contended = !(action == "trash" && matches!(layer, "title" | "target-storage"));
+                if contended {
+                    assert!(
+                        returned_while_held,
+                        "{action}/{layer}: input waited for a lock"
+                    );
+                    assert!(no_enqueue, "{action}/{layer}: contended action was queued");
+                    assert_eq!(
+                        std::fs::read(source.sessions_path()).unwrap(),
+                        before,
+                        "{action}/{layer}"
+                    );
+                    if action == "trash" {
+                        assert!(view.info_dialog.is_some());
+                    } else {
+                        assert!(result.is_err());
+                    }
+                    view.info_dialog = None;
+                    invoke(&mut view).unwrap();
+                } else {
+                    result.unwrap();
+                }
+                match action {
+                    "trash" => assert!(source.load().unwrap()[0].is_trashed()),
+                    _ => assert!(target
+                        .load()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.id == instance.id)),
+                }
+                drop(view);
+                drop(app);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn owning_test_view_drains_profile_openers_before_namespace_restoration() {
+        use crate::session::test_support::isolate_app_dir_at;
+        let outer = tempfile::tempdir().unwrap();
+        let _outer = isolate_app_dir_at(outer.path());
+        let outer_app = crate::session::get_app_dir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+        let inner_guard = isolate_app_dir_at(inner.path());
+        Storage::new_unwatched("inner").unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("inner".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        view.drop_poller = crate::tui::worker::TrackedWorker::spawn(
+            "aoe-test-owned-profile-opener",
+            move |request: DropRequest| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                let result = (|| -> anyhow::Result<bool> {
+                    let storage = Storage::new_unwatched("late-worker")?;
+                    storage.update(|rows, _| {
+                        rows.push(request.instance.clone());
+                        Ok(())
+                    })?;
+                    written_tx
+                        .send(storage.sessions_path().to_path_buf())
+                        .unwrap();
+                    Ok(true)
+                })();
+                DropResult {
+                    instance: request.instance,
+                    dropped: result,
+                }
+            },
+        );
+        let finishing = view.drop_poller.observe_finish_for_test();
+        let instance = Instance::new("worker", inner.path().to_str().unwrap());
+        view.drop_poller
+            .request(instance.id.clone(), DropRequest { instance });
+        entered_rx.recv().unwrap();
+        let release = std::thread::spawn(move || {
+            let drain_started = finishing
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            drain_started
+        });
+        drop(view);
+        drop(inner_guard);
+        let drain_started = release.join().unwrap();
+        let written = written_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(drain_started, "fixture did not drain the managed worker");
+        assert!(written.starts_with(inner.path()));
+        assert!(!outer_app.join(".workspace-claim.lock").exists());
+        assert!(!outer_app.join("profiles").exists());
+    }
 
     /// Construct a real trash lifecycle with a deterministic clock value.
     fn trashed_instance(trashed_at: chrono::DateTime<chrono::Utc>) -> Instance {

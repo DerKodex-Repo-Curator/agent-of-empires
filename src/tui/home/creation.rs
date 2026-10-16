@@ -12,6 +12,13 @@ pub(super) struct CancelledCreation {
     pub(super) profile: String,
     pub(super) provisional: std::sync::Arc<crate::session::builder::ProvisionalCreation>,
     groups: HashSet<String>,
+    finished: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProvisionalRetirement {
+    Settled,
+    Deferred,
 }
 
 fn retire_provisional_stub(
@@ -19,29 +26,43 @@ fn retire_provisional_stub(
     id: &str,
     provisional: &crate::session::builder::ProvisionalCreation,
     provisional_groups: &HashSet<String>,
-) -> anyhow::Result<()> {
-    let ownership = crate::session::storage::acquire_ownership_lock()?;
+) -> anyhow::Result<ProvisionalRetirement> {
+    let ownership = crate::session::storage::try_acquire_ownership_lock()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Session operation in progress; cancellation cleanup will retry after the worker stops"
+        )
+    })?;
     let _identity =
-        crate::session::storage::acquire_session_identity_lock_with_ownership(&ownership)?;
+        crate::session::storage::try_acquire_session_identity_lock_with_ownership(&ownership)?
+            .ok_or_else(|| anyhow::anyhow!("Session operation in progress"))?;
+    let _title =
+        crate::session::storage::try_acquire_session_title_lock_with_ownership(&ownership, id)?
+            .ok_or_else(|| anyhow::anyhow!("Session operation in progress"))?;
     let storage = Storage::open_unwatched_with_ownership(profile, &ownership)?;
-    let _lifecycle = storage.acquire_instance_lifecycle_lock_with_ownership(&ownership, id)?;
+    let _lifecycle = storage
+        .try_acquire_instance_lifecycle_lock_with_ownership(&ownership, id)?
+        .ok_or_else(|| anyhow::anyhow!("Session operation in progress"))?;
     provisional.verify_profile(&storage)?;
-    storage.update_with_ownership(&ownership, |rows, groups| {
-        if let Some(index) = rows.iter().position(|row| row.id == id) {
-            if !provisional.matches_instance(&rows[index])?
-                || rows[index]
+    storage
+        .try_update_with_ownership(&ownership, |rows, groups| {
+            if let Some(index) = rows.iter().position(|row| row.id == id) {
+                if !provisional.matches_instance(&rows[index])? {
+                    return Ok(ProvisionalRetirement::Settled);
+                }
+                if rows[index]
                     .lifecycle_reservation
                     .as_ref()
                     .is_some_and(|lease| lease.resource_intent.is_some())
-            {
-                return Ok(());
+                {
+                    return Ok(ProvisionalRetirement::Deferred);
+                }
+                rows.remove(index);
             }
-            rows.remove(index);
-        }
-        groups.retain(|group| !provisional_groups.contains(&group.path));
-        *groups = GroupTree::new_with_groups(rows, groups).get_all_groups();
-        Ok(())
-    })
+            groups.retain(|group| !provisional_groups.contains(&group.path));
+            *groups = GroupTree::new_with_groups(rows, groups).get_all_groups();
+            Ok(ProvisionalRetirement::Settled)
+        })?
+        .ok_or_else(|| anyhow::anyhow!("Session operation in progress"))
 }
 
 impl HomeView {
@@ -293,24 +314,27 @@ impl HomeView {
                 .map(|row| row.source_profile.clone());
             self.forget_creation_stub(&stub_id, provisional.as_deref());
             if let (Some(provisional), Some(profile)) = (provisional, profile) {
-                if let Err(error) =
-                    retire_provisional_stub(&profile, &stub_id, &provisional, &groups)
-                {
+                self.cancelled_creations.insert(
+                    stub_id.clone(),
+                    CancelledCreation {
+                        profile,
+                        provisional,
+                        groups,
+                        finished: false,
+                    },
+                );
+                let cancelled = self.cancelled_creations.get(&stub_id).unwrap();
+                if let Err(error) = retire_provisional_stub(
+                    &cancelled.profile,
+                    &stub_id,
+                    &cancelled.provisional,
+                    &cancelled.groups,
+                ) {
                     self.info_dialog = Some(InfoDialog::sized_to_fit(
                         "Cancellation cleanup failed",
                         &format!("{error:#}"),
                     ));
-                } else {
-                    self.cancelled_creations.insert(
-                        stub_id.clone(),
-                        CancelledCreation {
-                            profile,
-                            provisional,
-                            groups,
-                        },
-                    );
-                }
-                if let Err(error) = self.reload() {
+                } else if let Err(error) = self.reload() {
                     self.info_dialog = Some(InfoDialog::sized_to_fit(
                         "Cancellation reload failed",
                         &format!("{error:#}"),
@@ -325,10 +349,49 @@ impl HomeView {
         self.new_dialog = None;
     }
 
+    fn retire_finished_cancelled_creations(&mut self) {
+        if self.cancelled_creations.is_empty() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .cancelled_creations
+            .iter()
+            .filter(|(_, cancelled)| cancelled.finished)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let cancelled = self.cancelled_creations.get(&id).unwrap();
+            match retire_provisional_stub(
+                &cancelled.profile,
+                &id,
+                &cancelled.provisional,
+                &cancelled.groups,
+            ) {
+                Ok(ProvisionalRetirement::Settled) => {
+                    self.cancelled_creations.remove(&id);
+                    if let Err(error) = self.reload() {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Cancellation reload failed",
+                            &format!("{error:#}"),
+                        ));
+                    }
+                }
+                Ok(ProvisionalRetirement::Deferred) => {}
+                Err(error) => {
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Cancellation cleanup pending",
+                        &format!("{error:#}"),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Apply any pending creation results from the background poller.
     /// Returns Some(session_id) if creation succeeded and we should attach.
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use crate::tui::creation_poller::CreationResult;
+        self.retire_finished_cancelled_creations();
 
         let outcome = match self.creation_poller.try_recv_result() {
             Ok(outcome) => outcome,
@@ -377,24 +440,8 @@ impl HomeView {
                 if self.cancelled_creations.get(id).is_some_and(|cancelled| {
                     std::sync::Arc::ptr_eq(&cancelled.provisional, &provisional)
                 }) {
-                    let cancelled = self.cancelled_creations.remove(id).unwrap();
-                    if let Err(error) = retire_provisional_stub(
-                        &cancelled.profile,
-                        id,
-                        &cancelled.provisional,
-                        &cancelled.groups,
-                    ) {
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Cancellation cleanup failed",
-                            &format!("{error:#}"),
-                        ));
-                    }
-                    if let Err(error) = self.reload() {
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Cancellation reload failed",
-                            &format!("{error:#}"),
-                        ));
-                    }
+                    self.cancelled_creations.get_mut(id).unwrap().finished = true;
+                    self.retire_finished_cancelled_creations();
                 }
             }
             return None;
@@ -422,17 +469,32 @@ impl HomeView {
                         error = error
                             .context(format!("Creation rollback could not finish: {cleanup:#}"));
                     }
-                    if let (Some(id), Some(provisional)) =
-                        (stub_id.as_deref(), provisional.as_deref())
-                    {
-                        if let Err(cleanup) = retire_provisional_stub(
-                            build_result.profile_storage.profile(),
-                            id,
-                            provisional,
-                            &provisional_group_paths,
+                    if let (Some(id), Some(provisional)) = (stub_id, provisional) {
+                        self.forget_creation_stub(&id, Some(&provisional));
+                        self.cancelled_creations.insert(
+                            id.clone(),
+                            CancelledCreation {
+                                profile: build_result.profile_storage.profile().to_owned(),
+                                provisional,
+                                groups: provisional_group_paths,
+                                finished: true,
+                            },
+                        );
+                        let cancelled = self.cancelled_creations.get(&id).unwrap();
+                        match retire_provisional_stub(
+                            &cancelled.profile,
+                            &id,
+                            &cancelled.provisional,
+                            &cancelled.groups,
                         ) {
-                            error =
-                                error.context(format!("Placeholder cleanup failed: {cleanup:#}"));
+                            Ok(ProvisionalRetirement::Settled) => {
+                                self.cancelled_creations.remove(&id);
+                            }
+                            Ok(ProvisionalRetirement::Deferred) => {}
+                            Err(cleanup) => {
+                                error = error
+                                    .context(format!("Placeholder cleanup failed: {cleanup:#}"));
+                            }
                         }
                     }
                     if let Err(reload) = self.reload() {
@@ -485,32 +547,49 @@ impl HomeView {
                 Some(session_id)
             }
             CreationResult::Error(mut error) => {
-                if let Some(id) = &stub_id {
+                if let Some(id) = stub_id {
                     let profile = self
-                        .get_instance(id)
+                        .get_instance(&id)
                         .map(|instance| instance.source_profile.clone());
-                    self.forget_creation_stub(id, provisional.as_deref());
+                    let had_provisional = provisional.is_some();
+                    self.forget_creation_stub(&id, provisional.as_deref());
                     if let Some(profile) = profile {
-                        if let Some(provisional) = provisional.as_deref() {
-                            if let Err(retire_error) = retire_provisional_stub(
-                                &profile,
-                                id,
-                                provisional,
-                                &provisional_group_paths,
-                            ) {
-                                error.push_str(&format!(
-                                    "\nFailed to retire creation placeholder: {retire_error:#}"
-                                ));
-                            }
-                        }
                         let instances = self.cloned_instances_for_profile(&profile);
                         if let Some(tree) = self.group_trees.get_mut(&profile) {
                             let mut groups = tree.get_all_groups();
                             groups.retain(|group| !provisional_group_paths.contains(&group.path));
                             *tree = GroupTree::new_with_groups(&instances, &groups);
                         }
+                        if let Some(provisional) = provisional {
+                            self.cancelled_creations.insert(
+                                id.clone(),
+                                CancelledCreation {
+                                    profile,
+                                    provisional,
+                                    groups: provisional_group_paths,
+                                    finished: true,
+                                },
+                            );
+                            let cancelled = self.cancelled_creations.get(&id).unwrap();
+                            match retire_provisional_stub(
+                                &cancelled.profile,
+                                &id,
+                                &cancelled.provisional,
+                                &cancelled.groups,
+                            ) {
+                                Ok(ProvisionalRetirement::Settled) => {
+                                    self.cancelled_creations.remove(&id);
+                                }
+                                Ok(ProvisionalRetirement::Deferred) => {}
+                                Err(retire_error) => {
+                                    error.push_str(&format!(
+                                        "\nFailed to retire creation placeholder: {retire_error:#}"
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    if provisional.is_some() {
+                    if had_provisional && !self.cancelled_creations.contains_key(&id) {
                         if let Err(reload_error) = self.reload() {
                             error.push_str(&format!(
                                 "\nFailed to reload authoritative state: {reload_error:#}"
@@ -519,8 +598,6 @@ impl HomeView {
                     }
                     self.rebuild_flat_items();
                     self.update_selected();
-                    // Hook failures carry multi-line output; size to fit so
-                    // the actual error isn't clipped at the default 50x9.
                     self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
                 } else if let Some(dialog) = &mut self.new_dialog {
                     dialog.set_loading(false);
@@ -632,6 +709,205 @@ impl HomeView {
                     tracing::error!(target: "tui.home", "Cancelled creation exit cleanup failed: {error:#}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Status;
+
+    #[test]
+    #[serial_test::serial]
+    fn finished_cancelled_creation_stays_hidden_until_its_intent_settles() {
+        use crate::session::move_journal::{
+            IntentOwner, ProfileAuthority, ResourceEffect, ResourceIntent,
+        };
+        let _app = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("owner").unwrap();
+        let mut row = Instance::new("creating", "/creating");
+        row.source_profile = "owner".into();
+        row.status = Status::Creating;
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Create,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let provisional = std::sync::Arc::new(
+            crate::session::builder::ProvisionalCreation::capture(&storage, &row).unwrap(),
+        );
+        let admitted = {
+            let root = crate::session::storage::acquire_ownership_lock().unwrap();
+            let _identity =
+                crate::session::storage::acquire_session_identity_lock_with_ownership(&root)
+                    .unwrap();
+            let _lifecycle = storage
+                .acquire_instance_lifecycle_lock_with_ownership(&root, &row.id)
+                .unwrap();
+            let profile = ProfileAuthority::capture(&storage).unwrap();
+            let intent = ResourceIntent::new(
+                IntentOwner {
+                    profile: profile.clone(),
+                    id: row.id.clone(),
+                    created_at: row.created_at,
+                    generation: row.lifecycle_generation,
+                },
+                profile,
+                crate::session::LifecycleOperation::Create,
+                Some(row.clone()),
+                Some(row.clone()),
+                vec![ResourceEffect::Callback {
+                    name: "creation-callbacks".into(),
+                    directory: row.project_path.clone().into(),
+                    checkouts: Vec::new(),
+                }],
+                Vec::new(),
+            )
+            .unwrap();
+            crate::session::claim::ResourceReservation::admit_with_ownership(
+                &storage,
+                &root,
+                intent,
+                row.clone(),
+            )
+            .unwrap()
+        };
+        let mut view = HomeView::new_for_test(
+            Some("owner".into()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.forget_creation_stub(&row.id, Some(&provisional));
+        view.cancelled_creations.insert(
+            row.id.clone(),
+            CancelledCreation {
+                profile: "owner".into(),
+                provisional,
+                groups: HashSet::new(),
+                finished: true,
+            },
+        );
+        view.retire_finished_cancelled_creations();
+        assert!(view.cancelled_creations.contains_key(&row.id));
+        view.reload().unwrap();
+        assert!(view.get_instance(&row.id).is_none());
+        assert_eq!(
+            storage.load().unwrap()[0].lifecycle_reservation,
+            admitted.instance.lifecycle_reservation
+        );
+        admitted.transaction.rollback().unwrap();
+        view.retire_finished_cancelled_creations();
+        assert!(!view.cancelled_creations.contains_key(&row.id));
+        assert!(storage.load().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn provisional_retirement_returns_before_root_and_nested_locks_are_released() {
+        for layer in [
+            "root",
+            "identity",
+            "title",
+            "lifecycle",
+            "transition",
+            "storage",
+        ] {
+            let _app = crate::session::test_support::isolate_app_dir();
+            let storage = Storage::new_unwatched("owner").unwrap();
+            let mut row = Instance::new("creating", "/creating");
+            row.source_profile = "owner".into();
+            row.status = Status::Creating;
+            row.try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Create,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let provisional =
+                crate::session::builder::ProvisionalCreation::capture(&storage, &row).unwrap();
+            let namespace = crate::session::get_app_dir().unwrap();
+            let profile = storage.sessions_path().parent().unwrap().to_path_buf();
+            let id = row.id.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (released_tx, released_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let held: Box<dyn std::any::Any> = match layer {
+                    "root" => Box::new(crate::session::storage::acquire_ownership_lock().unwrap()),
+                    "identity" => Box::new(
+                        crate::session::storage::acquire_storage_flock(
+                            &namespace,
+                            ".title-mutation.lock",
+                        )
+                        .unwrap(),
+                    ),
+                    "title" => Box::new(
+                        crate::session::storage::acquire_storage_flock(
+                            &namespace,
+                            &format!(".session-title-{id}.lock"),
+                        )
+                        .unwrap(),
+                    ),
+                    "lifecycle" => Box::new(
+                        crate::session::storage::acquire_storage_flock(
+                            &profile,
+                            &format!(".instance-lifecycle-{id}.lock"),
+                        )
+                        .unwrap(),
+                    ),
+                    "transition" => Box::new(
+                        crate::session::storage::acquire_storage_flock(
+                            &namespace,
+                            crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                        )
+                        .unwrap(),
+                    ),
+                    "storage" => Box::new(
+                        crate::session::storage::acquire_storage_flock(&profile, ".storage.lock")
+                            .unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                ready_tx.send(()).unwrap();
+                let requested = release_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .is_ok();
+                drop(held);
+                released_tx.send(requested).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let result = retire_provisional_stub("owner", &row.id, &provisional, &HashSet::new());
+            let _ = release_tx.send(());
+            let returned_while_held = released_rx.recv().unwrap();
+            holder.join().unwrap();
+            assert!(
+                returned_while_held,
+                "{layer}: cancellation waited for the holder"
+            );
+            assert!(result.is_err(), "{layer}");
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                before,
+                "{layer}"
+            );
+            retire_provisional_stub("owner", &row.id, &provisional, &HashSet::new()).unwrap();
+            assert!(storage.load().unwrap().is_empty());
         }
     }
 }

@@ -386,7 +386,7 @@ pub async fn update_session_archive(
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Option<Json<TrashSessionBody>>,
+    body: Result<Option<Json<TrashSessionBody>>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(response) = cityhall_block_non_structured(&state, &id).await {
         return response;
@@ -394,7 +394,10 @@ pub async fn trash_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
 
     let Some(_submission) = state
         .session_service

@@ -1209,13 +1209,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "persist-none-sid";
-        let storage = Storage::new_for_test_path(
-            profile,
-            temp.path()
-                .join("profiles")
-                .join(profile)
-                .join("sessions.json"),
-        );
+        let storage = Storage::new_for_test_profile(profile);
         let mut inst = make_inst(profile, "title");
         let on_disk = inst.clone();
         storage
