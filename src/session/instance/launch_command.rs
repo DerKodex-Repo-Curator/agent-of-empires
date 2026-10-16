@@ -168,24 +168,20 @@ fn apply_first_launch_agent_name(
 }
 
 /// Keep a host agent's app server in its own process so its hooks run under this pane's env.
+/// Withheld unless the launch's own executable and environment can be probed.
 fn apply_no_daemon_flag(
     cmd: &mut String,
     agent: Option<&crate::agents::AgentDef>,
     inst: &Instance,
+    execution: Option<&super::execution::NativeExecution>,
 ) {
     let Some(agent) = agent else {
         return;
     };
-    // A wrapper or custom command is not the binary the probe describes.
-    if shell_words::split(inst.get_tool_command())
-        .ok()
-        .and_then(|words| words.into_iter().next())
-        .as_deref()
-        != Some(agent.binary)
-    {
+    let Some(command) = inst.host_agent_command(agent, execution) else {
         return;
-    }
-    let Some(flag) = agent.supported_no_daemon_flag() else {
+    };
+    let Some(flag) = agent.supported_no_daemon_flag(&command) else {
         return;
     };
     let already = shell_words::split(cmd).is_ok_and(|words| words.iter().any(|w| w == flag));
@@ -1345,7 +1341,7 @@ impl Instance {
                         }
                     }
                     apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-                    apply_no_daemon_flag(&mut cmd, agent, self);
+                    apply_no_daemon_flag(&mut cmd, agent, self, execution);
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!(
                         "{}{}",
@@ -1439,7 +1435,7 @@ impl Instance {
                 }
             }
             apply_first_launch_agent_name(&mut cmd, agent, self, execution, is_existing);
-            apply_no_daemon_flag(&mut cmd, agent, self);
+            apply_no_daemon_flag(&mut cmd, agent, self, execution);
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!(
                 "{}{}",
@@ -3076,39 +3072,77 @@ mod tests {
     }
 
     /// A shared Codex daemon runs hooks under its spawner's env, so every session's status would
-    /// land on one pane's id.
+    /// land on one pane's id. The flag must follow the Codex the session launches, not AoE's own.
     #[test]
     #[serial_test::serial]
-    fn codex_runs_its_own_app_server_only_where_the_install_has_the_flag() {
+    fn codex_runs_its_own_app_server_only_where_the_selected_install_has_the_flag() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_home(temp_home.path());
         let project = temp_home.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
-        let install = |help: &str| {
-            crate::agents::forget_agent_help_for_test();
-            crate::session::test_support::install_login_shell_path_command(
-                temp_home.path(),
-                "codex",
-                &format!(
-                    "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; esac\nexit 0\n",
-                    shell_escape(help),
-                ),
+        let stub = |help: &str| {
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --help) printf '%s\\n' {};; esac\nexit 0\n",
+                shell_escape(help),
             )
         };
+        let install_at = |dir: &std::path::Path, help: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join("codex");
+            std::fs::write(&path, stub(help)).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let with_flag = "      --no-daemon  Run without the shared background server";
+        let without_flag = "      --model <MODEL>";
+        let ambient = temp_home.path().join("ambient");
+        let profile = temp_home.path().join("profile");
+        let _path = crate::session::test_support::EnvGuard::set(&[(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ambient.display()),
+        )]);
         let mut codex = tool_instance("codex", project.to_str().unwrap());
+        let select_profile_path = |codex: &Instance| {
+            let mut config = crate::session::config::profile_config::ProfileConfig::default();
+            config.overrides.insert(
+                "environment".to_string(),
+                serde_json::json!([format!("PATH={}:/usr/bin:/bin", profile.display())]),
+            );
+            crate::session::config::profile_config::save_profile_config(
+                &codex.effective_profile(),
+                &config,
+            )
+            .unwrap();
+        };
 
-        let _current = install("      --no-daemon  Run without the shared background server");
+        install_at(&ambient, with_flag);
+        crate::agents::forget_agent_help_for_test();
         let command = host_command(&mut codex);
         assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
 
         codex.extra_args = "--no-daemon".into();
         let command = host_command(&mut codex);
         assert_eq!(command.matches("--no-daemon").count(), 1, "{command}");
-
         codex.extra_args = String::new();
-        let _older = install("      --model <MODEL>");
+
+        install_at(&profile, without_flag);
+        select_profile_path(&codex);
+        crate::agents::forget_agent_help_for_test();
         let command = host_command(&mut codex);
-        assert!(!command.contains("--no-daemon"), "{command}");
+        assert!(
+            !command.contains("--no-daemon"),
+            "the profile selects an older install: {command}"
+        );
+
+        install_at(&ambient, without_flag);
+        install_at(&profile, with_flag);
+        crate::agents::forget_agent_help_for_test();
+        let command = host_command(&mut codex);
+        assert_eq!(
+            command.matches("--no-daemon").count(),
+            1,
+            "the profile selects a newer install: {command}"
+        );
     }
 
     /// Each case starts from a launch that is named, then changes one thing that must keep the
