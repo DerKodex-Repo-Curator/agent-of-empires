@@ -189,7 +189,7 @@ export function useLiveTerminal(
           return;
         }
         if (msg.type === "size_owner") {
-          const owner = msg.is_owner ?? true;
+          const owner = msg.is_owner;
           ownerKnownRef.current = true;
           setState((prev) =>
             prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
@@ -203,7 +203,7 @@ export function useLiveTerminal(
           return;
         }
         if (msg.type === "clipboard") {
-          if (typeof msg.text !== "string" || msg.text.length === 0) return;
+          if (msg.text.length === 0) return;
           handleClipboard(msg.text);
           return;
         }
@@ -224,28 +224,28 @@ export function useLiveTerminal(
             }
             return;
           }
-          lines = applyPatch(prev.lines, msg.shift ?? 0, msg.lines ?? []);
+          lines = applyPatch(prev.lines, msg.shift, msg.lines);
           content = lines.join("\n") + "\n";
           stats.patches += 1;
         } else {
-          content = msg.content ?? "";
+          content = msg.content;
           lines = frameLines(content);
           resyncPending = false;
           stats.frames += 1;
         }
-        lastSeq = msg.seq ?? null;
+        lastSeq = msg.seq;
         const incoming: LiveFrame = {
           content,
           lines,
           seq: msg.seq,
           receivedAt: performance.now(),
-          rows: msg.rows ?? 0,
-          history: msg.history ?? 0,
-          cursor: msg.cursor ?? null,
-          altScreen: msg.altScreen ?? false,
-          mouse: msg.mouse ?? false,
-          mouseSgr: msg.mouseSgr ?? false,
-          pane0: msg.pane0 ?? null,
+          rows: msg.rows,
+          history: msg.history,
+          cursor: msg.cursor,
+          altScreen: msg.altScreen,
+          mouse: msg.mouse,
+          mouseSgr: msg.mouseSgr,
+          pane0: msg.pane0,
         };
         // Keep the capture window covering the full history while reading, or old lines fall out.
         if (readingRef.current) {

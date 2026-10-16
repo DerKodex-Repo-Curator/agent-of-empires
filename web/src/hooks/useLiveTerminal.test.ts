@@ -59,15 +59,15 @@ function mount(openSocket = true) {
   return { ...hook, ws };
 }
 
-const frame = (seq: number, content: string) => ({ type: "frame", seq, content, rows: 3, history: 5, cursor: null });
+const meta = { rows: 3, history: 5, cursor: null, altScreen: false, mouse: false, mouseSgr: false, pane0: null };
+const frame = (seq: number, content: string) => ({ type: "frame", seq, content, ...meta });
 const patch = (seq: number, base: number, lines: [number, string][], shift = 0) => ({
   type: "patch",
   seq,
   base,
   shift,
   lines,
-  rows: 3,
-  history: 5,
+  ...meta,
 });
 
 describe("row patches", () => {
