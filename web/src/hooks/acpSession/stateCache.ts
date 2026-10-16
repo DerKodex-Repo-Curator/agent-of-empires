@@ -87,6 +87,14 @@ export function persistState(sessionId: string, state: AcpState): void {
   }
 }
 
+// Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
+function reopenState(state: AcpState): AcpState {
+  if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) {
+    return { ...emptyAcpState(), queuedPrompts: state.queuedPrompts };
+  }
+  return state;
+}
+
 export function loadPersistedState(sessionId: string): AcpState | undefined {
   if (typeof window === "undefined") return undefined;
   try {
@@ -103,12 +111,7 @@ export function loadPersistedState(sessionId: string): AcpState | undefined {
       return undefined;
     }
     // Merge over defaults so entries from an older bundle gain newly added fields.
-    const loaded = normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) });
-    // Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
-    if (loaded.oldestSeq > 1 && lastUserBoundaryIndex(loaded.activity) < 0) {
-      return { ...emptyAcpState(), queuedPrompts: loaded.queuedPrompts };
-    }
-    return loaded;
+    return reopenState(normaliseTurnState({ ...emptyAcpState(), ...(state as AcpState) }));
   } catch {
     return undefined;
   }
@@ -147,9 +150,10 @@ function lruInsert(sessionId: string, value: AcpState): void {
 }
 
 export function cacheGet(sessionId: string): AcpState | undefined {
-  const value = stateCache.get(sessionId) ?? loadPersistedState(sessionId);
+  const memory = stateCache.get(sessionId);
+  const value = memory ? reopenState(memory) : loadPersistedState(sessionId);
   if (value === undefined) return undefined;
-  const fromStorage = !stateCache.has(sessionId);
+  const fromStorage = memory === undefined;
   lruInsert(sessionId, value);
   // Wake subscribers that rendered before the cache was primed; deferred so it never fires mid-render.
   if (fromStorage) queueMicrotask(() => notifyStateListeners(sessionId));

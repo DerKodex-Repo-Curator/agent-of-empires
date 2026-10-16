@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyAcpState, type AcpState, type ActivityRow, type BackgroundAgent } from "../../lib/acpTypes";
 import { STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
 import {
+  cacheGet,
   cacheSet,
   clearAcpCache,
   evictOldestPersistedAcpState,
@@ -68,6 +69,15 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
     expect(loaded.queuedPrompts).toEqual(queued);
     if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
     else expect(loaded).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [] });
+  });
+});
+
+describe("cacheGet mid-turn in-memory entry (#4530)", () => {
+  it("resets an in-memory entry without a prompt but keeps queued prompts", () => {
+    const queued = [{ id: "q1", text: "next", queuedAt: "2026-01-01T00:00:00Z" }];
+    const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }] as ActivityRow[];
+    cacheSet("mem", { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity, queuedPrompts: queued });
+    expect(cacheGet("mem")).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [], queuedPrompts: queued });
   });
 });
 
