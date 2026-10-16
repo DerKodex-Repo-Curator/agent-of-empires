@@ -215,7 +215,10 @@ describe("McpServers add / edit / delete", () => {
     const dialog = await screen.findByRole("dialog");
     fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "fs" } });
     fireEvent.change(within(dialog).getByLabelText("Command"), { target: { value: "mcp-fs" } });
-    fireEvent.change(within(dialog).getByLabelText("Arguments"), { target: { value: "--root\n." } });
+    fireEvent.click(within(dialog).getByText("Add argument"));
+    fireEvent.change(within(dialog).getByLabelText("argument 1"), { target: { value: "--root" } });
+    fireEvent.click(within(dialog).getByText("Add argument"));
+    fireEvent.change(within(dialog).getByLabelText("argument 2"), { target: { value: "." } });
     fireEvent.click(within(dialog).getByText("Add env"));
     fireEvent.change(within(dialog).getByLabelText("env name 1"), { target: { value: "TOKEN" } });
     fireEvent.change(within(dialog).getByLabelText("env value 1"), { target: { value: "s3cret" } });
@@ -247,6 +250,24 @@ describe("McpServers add / edit / delete", () => {
         command: "mcp-fs",
         args: ["--root", "."],
         env: [{ name: "KEEP" }, { name: "SWAP", value: "new" }],
+      }),
+    );
+  });
+
+  it("saves empty and multiline arguments unchanged", async () => {
+    const args = ["--label", "", "--root", ".", "line1\nline2"];
+    fetchMcpServers.mockResolvedValue(response({ effective: [{ ...OWNED, args, envNames: [] }] }));
+    updateMcpServer.mockResolvedValue({ ok: true, status: 200 });
+    render(<McpServers />);
+    fireEvent.click(await screen.findByLabelText("edit fs"));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Save"));
+    await waitFor(() =>
+      expect(updateMcpServer).toHaveBeenCalledWith("fs", {
+        transport: "stdio",
+        command: "mcp-fs",
+        args,
+        env: [],
       }),
     );
   });

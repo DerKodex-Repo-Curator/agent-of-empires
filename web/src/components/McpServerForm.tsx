@@ -72,6 +72,41 @@ function SecretRows({
   );
 }
 
+/** One editor per argument, so empty and multiline arguments survive an unchanged save. */
+function ArgRows({ rows, onChange }: { rows: string[]; onChange: (rows: string[]) => void }) {
+  return (
+    <div className="space-y-1">
+      <span className="font-mono text-[11px] text-text-muted">Arguments</span>
+      {rows.map((a, i) => (
+        <div key={i} className="flex gap-2">
+          <textarea
+            aria-label={`argument ${i + 1}`}
+            className={inputClass}
+            rows={1}
+            value={a}
+            onChange={(e) => onChange(rows.map((r, idx) => (idx === i ? e.target.value : r)))}
+          />
+          <button
+            type="button"
+            aria-label={`remove argument ${i + 1}`}
+            onClick={() => onChange(rows.filter((_, idx) => idx !== i))}
+            className="px-2 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => onChange([...rows, ""])}
+        className="px-2 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
+      >
+        Add argument
+      </button>
+    </div>
+  );
+}
+
 export function McpServerForm({
   initial,
   busy,
@@ -88,7 +123,7 @@ export function McpServerForm({
   const [name, setName] = useState(initial?.name ?? "");
   const [transport, setTransport] = useState<Transport>((initial?.transport as Transport | undefined) ?? "stdio");
   const [command, setCommand] = useState(initial?.command ?? "");
-  const [args, setArgs] = useState((initial?.args ?? []).join("\n"));
+  const [args, setArgs] = useState<string[]>(initial?.args ?? []);
   const [url, setUrl] = useState(initial?.url ?? "");
   const storedRows = (names?: string[]): SecretRow[] =>
     (names ?? []).map((n) => ({ name: n, value: "", stored: true }));
@@ -98,7 +133,7 @@ export function McpServerForm({
   const submit = () => {
     const input: McpServerInput =
       transport === "stdio"
-        ? { transport, command, args: args.split("\n").filter((a) => a !== ""), env: toEntries(env) }
+        ? { transport, command, args, env: toEntries(env) }
         : { transport, url, headers: toEntries(headers) };
     onSubmit(name, input);
   };
@@ -152,16 +187,7 @@ export function McpServerForm({
                   onChange={(e) => setCommand(e.target.value)}
                 />
               </label>
-              <label className="block">
-                <span className="font-mono text-[11px] text-text-muted">Arguments (one per line)</span>
-                <textarea
-                  aria-label="Arguments"
-                  className={inputClass}
-                  rows={3}
-                  value={args}
-                  onChange={(e) => setArgs(e.target.value)}
-                />
-              </label>
+              <ArgRows rows={args} onChange={setArgs} />
               <SecretRows label="env" rows={env} onChange={setEnv} />
             </>
           ) : (
