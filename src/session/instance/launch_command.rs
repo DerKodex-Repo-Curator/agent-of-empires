@@ -3228,6 +3228,8 @@ mod tests {
             ("--remote ws://localhost:9000", false),
             ("--remote=ws://localhost:9000", false),
             ("cloud-tasks list", false),
+            ("execpolicy check x", false),
+            ("tcp-tunnel", false),
             ("exec 'fix the build'", false),
             ("-m o3 exec 'fix the build'", false),
             ("agents", false),
