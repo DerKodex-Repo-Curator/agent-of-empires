@@ -2706,6 +2706,35 @@ pub struct SandboxConfig {
     )]
     pub extra_volumes: Vec<String>,
 
+    /// Extra files copied from the host agent config dir into each sandbox,
+    /// refreshed on every start. `path` applies to every agent whose config dir
+    /// has it; `agent:path` (e.g. `claude:agents/review.md`) to one agent.
+    /// Native state and credential paths are refused.
+    #[serde(default)]
+    #[setting(
+        label = "Sync Extra Files",
+        widget = "list",
+        validate = "sync_path_list",
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
+        advanced
+    )]
+    pub sync_extra_files: Vec<String>,
+
+    /// Extra directories copied from the host agent config dir into each
+    /// sandbox, seeded only while absent. Same entry format and limits as
+    /// Sync Extra Files.
+    #[serde(default)]
+    #[setting(
+        label = "Sync Extra Dirs",
+        widget = "list",
+        validate = "sync_path_list",
+        web = "elevation:sandbox config affects host isolation",
+        repo = "deny",
+        advanced
+    )]
+    pub sync_extra_dirs: Vec<String>,
+
     /// Env vars injected into the container: KEY=value (literal, appears in
     /// argv), KEY=$VAR (passthrough from host, hidden from argv), KEY=$$literal
     /// (escape a leading $), or bare KEY (passthrough). For host (non-sandboxed)
@@ -2977,6 +3006,8 @@ impl Default for SandboxConfig {
             enabled_by_default: false,
             default_image: default_sandbox_image(),
             extra_volumes: Vec::new(),
+            sync_extra_files: Vec::new(),
+            sync_extra_dirs: Vec::new(),
             environment: default_sandbox_environment(),
             auto_cleanup: true,
             cpu_limit: None,
