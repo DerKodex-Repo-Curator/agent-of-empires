@@ -90,7 +90,8 @@ export function persistState(sessionId: string, state: AcpState): void {
 // Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
 function reopenState(state: AcpState): AcpState {
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) {
-    return { ...emptyAcpState(), queuedPrompts: state.queuedPrompts };
+    // Cold replay cannot rebuild these: queued prompts are client-held, config options may predate the replayed tail.
+    return { ...emptyAcpState(), queuedPrompts: state.queuedPrompts, configOptions: state.configOptions };
   }
   return state;
 }
