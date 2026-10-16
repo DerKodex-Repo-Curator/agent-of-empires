@@ -1447,6 +1447,8 @@ impl ExtraSync {
         let select = |entries: &[String]| -> Result<Vec<String>> {
             let mut out = Vec::new();
             for entry in entries {
+                super::profile_config::validate_sync_path_format(entry)
+                    .map_err(|reason| anyhow::anyhow!("sandbox sync entry '{entry}': {reason}"))?;
                 let (agent, path) = super::profile_config::split_sync_entry(entry);
                 if agent.is_some_and(|agent| agent != mount.tool_name) {
                     continue;
@@ -3931,6 +3933,13 @@ mod tests {
             assert!(
                 ExtraSync::for_mount(mount, &sandbox(&[], &[entry])).is_err(),
                 "{tool}: {entry} dirs"
+            );
+        }
+        // Hand-edited config skips schema validation, so malformed entries fail here.
+        for entry in ["a/../projects", "/etc/passwd", "nope:agents", "../x"] {
+            assert!(
+                ExtraSync::for_mount(mount_for("claude"), &sandbox(&[entry], &[])).is_err(),
+                "{entry}"
             );
         }
         // Another agent's scope is never evaluated against this mount.
