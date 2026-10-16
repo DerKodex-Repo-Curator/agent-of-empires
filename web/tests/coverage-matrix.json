@@ -1220,6 +1220,13 @@
       ]
     },
     {
+      "id": "wizard.profile-agent-defaults",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/__tests__/SessionWizard.test.tsx"],
+      "components": ["web/src/components/session-wizard/profileDefaults.ts"]
+    },
+    {
       "id": "wizard.agent-allowlist",
       "kind": "vitest",
       "risk": "high",
@@ -3475,6 +3482,13 @@
       "risk": "medium",
       "specs": ["tests/sidebar-reorder.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "story.sidebar-keyboard-row-navigation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-keyboard-navigation.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
     },
     {
       "id": "story.sidebar-plan-progress",

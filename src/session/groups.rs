@@ -1530,6 +1530,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn attention_group_key_cases() {
         let now = Utc::now();
         let mut fresh = with_status("f", "fresh", Status::Idle);
