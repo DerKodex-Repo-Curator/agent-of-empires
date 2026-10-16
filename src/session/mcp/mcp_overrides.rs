@@ -245,27 +245,6 @@ fn stored_server(servers: &Map<String, Value>, name: &str) -> Option<ProjectMcpS
     convert_standard(name.to_string(), raw).ok()
 }
 
-/// The named global entry, parsed on its own so malformed neighbours do not matter.
-/// `None` if the file or entry is absent; an error if that entry is malformed.
-pub fn read_global_server(name: &str) -> Result<Option<ProjectMcpServer>> {
-    let path = crate::session::get_app_dir()?.join("mcp.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let Some(entry) = parse_root(&text)?
-        .get("mcpServers")
-        .and_then(|v| v.get(name))
-        .cloned()
-    else {
-        return Ok(None);
-    };
-    let raw = serde_json::from_value(entry)
-        .with_context(|| format!("MCP server \"{name}\" in global mcp.json is malformed"))?;
-    convert_standard(name.to_string(), raw).map(Some)
-}
-
 /// Adds a global server. The name may shadow a lower layer but not another global entry.
 pub fn create_global_server(
     name: &str,
@@ -287,11 +266,22 @@ pub fn update_global_server(
     name: &str,
     input: &McpServerInput,
 ) -> std::result::Result<ProjectMcpServer, McpWriteError> {
+    update_global_server_with(name, |_| Ok(input.clone()))
+}
+
+/// Like `update_global_server`, but `input` sees the stored server (`None` if unparseable)
+/// under the file lock, so a read-modify-write cannot lose a concurrent edit.
+pub fn update_global_server_with(
+    name: &str,
+    input: impl FnOnce(Option<&ProjectMcpServer>) -> std::result::Result<McpServerInput, McpWriteError>,
+) -> std::result::Result<ProjectMcpServer, McpWriteError> {
     with_global_servers(|servers| {
         if !servers.contains_key(name) {
             return Err(missing(name));
         }
-        let server = build_server(name, input, stored_server(servers, name).as_ref())?;
+        let stored = stored_server(servers, name);
+        let input = input(stored.as_ref())?;
+        let server = build_server(name, &input, stored.as_ref())?;
         let Value::Object(fresh) = server_to_entry(&server) else {
             unreachable!("server_to_entry returns an object")
         };
@@ -414,7 +404,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn update_keeps_unknown_entry_keys_and_reads_one_entry() {
+    fn update_keeps_unknown_entry_keys_and_ignores_malformed_neighbours() {
         let _home = crate::session::test_support::isolate_app_dir();
         let app_dir = crate::session::get_app_dir().unwrap();
         std::fs::create_dir_all(&app_dir).unwrap();
@@ -425,10 +415,6 @@ mod tests {
                 "broken": { "args": [] } } }"#,
         )
         .unwrap();
-
-        assert_eq!(read_global_server("fs").unwrap().unwrap().name, "fs");
-        assert!(read_global_server("broken").is_err());
-        assert!(read_global_server("nope").unwrap().is_none());
 
         let remote = McpServerInput::Http {
             url: "https://e/mcp".into(),

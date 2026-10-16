@@ -7,7 +7,7 @@ use crate::session::mcp::mcp_model::{resolve_surface, McpSurfaceView};
 use crate::session::mcp::mcp_overrides::{
     self, classify_missing, McpServerInput, McpWriteError, SecretEntry,
 };
-use crate::session::mcp::project_mcp::ProjectMcpTransport;
+use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommands {
@@ -230,11 +230,21 @@ fn merged_secrets(
 }
 
 fn edit(profile: &str, args: McpEditArgs) -> Result<()> {
-    let Some(stored) = mcp_overrides::read_global_server(&args.name)? else {
-        return Err(write_failure(McpWriteError::NotFound(args.name), profile));
-    };
+    let server = mcp_overrides::update_global_server_with(&args.name, |stored| {
+        let stored = stored.ok_or_else(|| {
+            McpWriteError::Invalid(format!("\"{}\" in global mcp.json is malformed", args.name))
+        })?;
+        edit_input(stored, &args).map_err(|e| McpWriteError::Invalid(e.to_string()))
+    })
+    .map_err(|e| write_failure(e, profile))?;
+    println!("Updated {}", server.redacted_summary());
+    Ok(())
+}
+
+/// The edited definition: unset flags keep the stored value, secrets merge by name.
+fn edit_input(stored: &ProjectMcpServer, args: &McpEditArgs) -> Result<McpServerInput> {
     let is_http = stored.kind() == "http";
-    let input = match stored.transport {
+    Ok(match stored.transport.clone() {
         ProjectMcpTransport::Stdio {
             command,
             args: old_args,
@@ -249,13 +259,13 @@ fn edit(profile: &str, args: McpEditArgs) -> Result<()> {
                 ],
             )?;
             McpServerInput::Stdio {
-                command: args.command.unwrap_or(command),
+                command: args.command.clone().unwrap_or(command),
                 args: if args.args.is_empty() {
                     old_args
                 } else {
-                    args.args
+                    args.args.clone()
                 },
-                env: merged_secrets(&env, &args.unset_env, args.env),
+                env: merged_secrets(&env, &args.unset_env, args.env.clone()),
             }
         }
         ProjectMcpTransport::Http { url, headers } | ProjectMcpTransport::Sse { url, headers } => {
@@ -268,19 +278,15 @@ fn edit(profile: &str, args: McpEditArgs) -> Result<()> {
                     ("--unset-env", !args.unset_env.is_empty()),
                 ],
             )?;
-            let url = args.url.unwrap_or(url);
-            let headers = merged_secrets(&headers, &args.unset_header, args.header);
+            let url = args.url.clone().unwrap_or(url);
+            let headers = merged_secrets(&headers, &args.unset_header, args.header.clone());
             if is_http {
                 McpServerInput::Http { url, headers }
             } else {
                 McpServerInput::Sse { url, headers }
             }
         }
-    };
-    let server = mcp_overrides::update_global_server(&args.name, &input)
-        .map_err(|e| write_failure(e, profile))?;
-    println!("Updated {}", server.redacted_summary());
-    Ok(())
+    })
 }
 
 fn remove(profile: &str, args: McpRemoveArgs) -> Result<()> {
