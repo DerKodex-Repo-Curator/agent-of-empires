@@ -1052,6 +1052,9 @@ impl AgentDef {
             "codex" => "--no-daemon",
             _ => return None,
         };
+        // The first positional word selects the mode; later ones are its operands (a session id
+        // or prompt) and may spell a subcommand name.
+        let mut mode_known = false;
         let mut words = options.iter();
         while let Some(word) = words.next() {
             // A remote TUI has no local app server, and Codex rejects the combination.
@@ -1059,8 +1062,11 @@ impl AgentDef {
                 return None;
             } else if CODEX_VALUE_OPTIONS.contains(&word.as_str()) {
                 words.next();
-            } else if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
-                return None;
+            } else if !word.starts_with('-') && !mode_known {
+                mode_known = true;
+                if CODEX_NON_TUI_SUBCOMMANDS.contains(&word.as_str()) {
+                    return None;
+                }
             }
         }
         agent_help_advertises(command, flag).then_some(flag)

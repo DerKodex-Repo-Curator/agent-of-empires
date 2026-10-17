@@ -185,12 +185,16 @@ fn apply_no_daemon_flag(
     let Ok(mut words) = shell_words::split(cmd) else {
         return;
     };
+    if words.is_empty() {
+        return;
+    }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
-    let Some(flag) = agent.supported_no_daemon_flag(&command, &words[..options_end]) else {
+    let options = &words[1..options_end];
+    let Some(flag) = agent.supported_no_daemon_flag(&command, options) else {
         return;
     };
-    if words[..options_end].iter().any(|w| w == flag) {
+    if options.iter().any(|w| w == flag) {
         return;
     }
     // The pane runs this through a login shell whose startup files may change PATH, so name the
@@ -3220,6 +3224,10 @@ mod tests {
             ("-m o3", true),
             ("resume --last", true),
             ("fork --last", true),
+            ("resume 019a1b2c-0000-7000-8000-000000000000 review", true),
+            ("resume review", true),
+            ("fork --last exec", true),
+            ("resume --last --remote ws://localhost:9000", false),
             ("-- 'review'", true),
             ("-C agents", true),
             ("--cd review", true),
