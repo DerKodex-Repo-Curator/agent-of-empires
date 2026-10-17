@@ -83,7 +83,7 @@ describe("loadPersistedState mid-turn cache (#4530)", () => {
     expect(loaded.configOptions).toEqual(configOptions);
     expect(loaded.backgroundAgents).toEqual(backgroundAgents);
     if (kept) expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq, activity });
-    else expect(loaded).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [] });
+    else expect(loaded).toMatchObject({ lastSeq: 900, oldestSeq: 0, activity: [] });
   });
 });
 
@@ -91,28 +91,30 @@ describe("mid-turn reset keeps usage accounting (#4530)", () => {
   const usage = (amount: number): AcpEvent => ({
     UsageUpdated: { usage: { used: 1, size: 200_000, cost: { amount, currency: "USD" } } },
   });
-  const replay = (state: AcpState, ...events: AcpEvent[]) =>
-    events.reduce((s, event, i) => applyEvent(s, { session_id: "s", seq: i + 1, event }), state);
+  const frame = (seq: number, event: AcpEvent) => ({ session_id: "s", seq, event });
   const reopened = () => {
     const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
     const sessionUsage = { used: 1, size: 200_000, cost: { amount: 2, currency: "USD" } };
-    writeEntry("usage", {
+    const state = {
       ...emptyAcpState(),
       lastSeq: 900,
       oldestSeq: 40,
       activity,
       sessionUsage,
       usageBaseline: { cost: 10 },
-    });
+    };
+    writeEntry("usage", state);
     return loadPersistedState("usage")!;
   };
 
-  it("rebases replayed lifetime cost by the cached baseline", () => {
-    expect(replay(reopened(), usage(12)).sessionUsage?.cost?.amount).toBe(2);
+  it("folds a boundary after the cached cursor into the cached usage", () => {
+    const state = [frame(901, "ConversationCompacted"), frame(902, usage(13))].reduce(applyEvent, reopened());
+    expect(state.sessionUsage?.cost?.amount).toBeCloseTo(1, 6);
   });
 
-  it("does not double-count a boundary that replays from the tail", () => {
-    expect(replay(reopened(), usage(10), "ConversationCompacted").usageBaseline?.cost).toBe(10);
+  it("drops a boundary the cache already accounted for", () => {
+    const state = [frame(800, "ConversationCompacted"), frame(801, usage(12))].reduce(applyEvent, reopened());
+    expect(state).toMatchObject({ usageBaseline: { cost: 10 }, sessionUsage: { cost: { amount: 2 } } });
   });
 });
 
@@ -121,7 +123,7 @@ describe("cacheGet mid-turn in-memory entry (#4530)", () => {
     const queued = [{ id: "q1", text: "next", queuedAt: "2026-01-01T00:00:00Z" }];
     const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }] as ActivityRow[];
     cacheSet("mem", { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity, queuedPrompts: queued });
-    expect(cacheGet("mem")).toMatchObject({ lastSeq: 0, oldestSeq: 0, activity: [], queuedPrompts: queued });
+    expect(cacheGet("mem")).toMatchObject({ lastSeq: 900, oldestSeq: 0, activity: [], queuedPrompts: queued });
   });
 });
 

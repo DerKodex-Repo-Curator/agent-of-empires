@@ -87,20 +87,10 @@ export function persistState(sessionId: string, state: AcpState): void {
   }
 }
 
-// Rows with no user prompt and older history pending would open mid-turn; reload through the cold open.
+// Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
+// reloads the transcript from the tail; folded control state keeps its own cursor and is untouched.
 function reopenState(state: AcpState): AcpState {
-  if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) {
-    // Cold replay cannot rebuild these: queued prompts are client-held; config options and background
-    // agents may predate the replayed tail. Agent events merge idempotently into the kept records. The usage
-    // baseline rebases replayed lifetime cost; sessionUsage is dropped so a replayed boundary cannot double-count.
-    return {
-      ...emptyAcpState(),
-      queuedPrompts: state.queuedPrompts,
-      configOptions: state.configOptions,
-      backgroundAgents: state.backgroundAgents,
-      usageBaseline: state.usageBaseline,
-    };
-  }
+  if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) return { ...state, activity: [], oldestSeq: 0 };
   return state;
 }
 
